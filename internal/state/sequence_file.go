@@ -115,11 +115,13 @@ func (f *SequenceFile) CloseAll() error {
 
 // Flush сброс накопленных на буфер данных в файл.
 func (f *SequenceFile) Flush() (err error) {
+	f.lock.Lock()
+
 	if err := f.checkWriteState(); err != nil {
+		f.lock.Unlock()
 		return errors.Wrap(err, "check write state")
 	}
 
-	f.lock.Lock()
 	defer func() {
 		f.handleError(err)
 		f.lock.Unlock()

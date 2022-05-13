@@ -137,7 +137,7 @@ func (l *SnapshotLog) RotateOvergrown(logSizeLimit int) error {
 	}
 
 	if err := temp.Sync(); err != nil {
-		return errors.Wrap(err, "sync written data into the temporary file")
+		return errors.Wrap(err, "nobuf written data into the temporary file")
 	}
 
 	old := l.file

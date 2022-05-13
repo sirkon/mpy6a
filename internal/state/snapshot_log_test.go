@@ -109,7 +109,7 @@ func TestSnapshotLog(t *testing.T) {
 		}
 
 		if err := l.file.Sync(); err != nil {
-			t.Error(errors.Wrap(err, "sync snapshot entries"))
+			t.Error(errors.Wrap(err, "nobuf snapshot entries"))
 			return
 		}
 
