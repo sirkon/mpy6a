@@ -16,3 +16,7 @@
 # vendor/
 
 tmpdata/
+
+internal/state/testdata
+internal/logio/testdata
+.DS_Store
