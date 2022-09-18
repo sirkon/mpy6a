@@ -1,4 +1,4 @@
-package types_test
+package storage
 
 import (
 	"bytes"
@@ -10,9 +10,9 @@ import (
 	"github.com/sirkon/mpy6a/internal/byteop"
 	"github.com/sirkon/mpy6a/internal/errors"
 	"github.com/sirkon/mpy6a/internal/mpio"
+	"github.com/sirkon/mpy6a/internal/storage/internal/mocks"
 	"github.com/sirkon/mpy6a/internal/testlog"
 	"github.com/sirkon/mpy6a/internal/types"
-	"github.com/sirkon/mpy6a/internal/types/internal/mocks"
 )
 
 func TestSessionEncoding(t *testing.T) {
@@ -22,7 +22,7 @@ func TestSessionEncoding(t *testing.T) {
 		name    string
 		sess    types.Session
 		repeat  uint64
-		modify  func(t *testing.T, b []byte) types.SessionReader
+		modify  func(t *testing.T, b []byte) SessionReader
 		wantErr bool
 		err     error
 	}{
@@ -37,7 +37,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "invalid encoded data",
 			sess:   session,
 			repeat: 15,
-			modify: func(_ *testing.T, b []byte) types.SessionReader {
+			modify: func(_ *testing.T, b []byte) SessionReader {
 				return bytes.NewReader(b[:15])
 			},
 			wantErr: true,
@@ -46,7 +46,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "end of reader",
 			sess:   session,
 			repeat: 15,
-			modify: func(_ *testing.T, b []byte) types.SessionReader {
+			modify: func(_ *testing.T, b []byte) SessionReader {
 				return bytes.NewReader(nil)
 			},
 			wantErr: true,
@@ -56,7 +56,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "no data",
 			sess:   session,
 			repeat: 15,
-			modify: func(t *testing.T, b []byte) types.SessionReader {
+			modify: func(t *testing.T, b []byte) SessionReader {
 				ctrl := gomock.NewController(t)
 				m := mocks.NewSessionReaderMock(ctrl)
 				m.EXPECT().Read(gomock.Len(8)).Return(0, nil)
@@ -70,7 +70,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "error on repeat read",
 			sess:   session,
 			repeat: 15,
-			modify: func(t *testing.T, b []byte) types.SessionReader {
+			modify: func(t *testing.T, b []byte) SessionReader {
 				ctrl := gomock.NewController(t)
 				m := mocks.NewSessionReaderMock(ctrl)
 				m.EXPECT().Read(gomock.Any()).Return(0, errors.New("failed to read"))
@@ -83,7 +83,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "EOF on read length",
 			sess:   session,
 			repeat: 15,
-			modify: func(t *testing.T, b []byte) types.SessionReader {
+			modify: func(t *testing.T, b []byte) SessionReader {
 				ctrl := gomock.NewController(t)
 				m := mocks.NewSessionReaderMock(ctrl)
 				gomock.InOrder(
@@ -105,7 +105,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "EOD on read length",
 			sess:   session,
 			repeat: 15,
-			modify: func(t *testing.T, b []byte) types.SessionReader {
+			modify: func(t *testing.T, b []byte) SessionReader {
 				ctrl := gomock.NewController(t)
 				m := mocks.NewSessionReaderMock(ctrl)
 				gomock.InOrder(
@@ -127,7 +127,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "other read length error",
 			sess:   session,
 			repeat: 15,
-			modify: func(t *testing.T, b []byte) types.SessionReader {
+			modify: func(t *testing.T, b []byte) SessionReader {
 				ctrl := gomock.NewController(t)
 				m := mocks.NewSessionReaderMock(ctrl)
 				gomock.InOrder(
@@ -148,7 +148,7 @@ func TestSessionEncoding(t *testing.T) {
 			name:   "broken session payload",
 			sess:   session,
 			repeat: 15,
-			modify: func(t *testing.T, b []byte) types.SessionReader {
+			modify: func(t *testing.T, b []byte) SessionReader {
 				return bytes.NewReader(b[:50])
 			},
 			wantErr: true,
@@ -159,14 +159,14 @@ func TestSessionEncoding(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf byteop.Buffer
-			types.SessionEncodeRepeat(&buf, tt.sess, tt.repeat)
+			sessionEncodeRepeat(&buf, tt.sess, tt.repeat)
 
-			var encoded types.SessionReader = &buf
+			var encoded SessionReader = &buf
 			if tt.modify != nil {
 				encoded = tt.modify(t, buf.Bytes())
 			}
 
-			repeat, session, err := types.SessionDecodeRepeat(encoded)
+			repeat, session, err := sessionDecodeRepeat(encoded)
 			switch {
 			case tt.wantErr && err != nil:
 				if tt.err != nil && tt.err != err {

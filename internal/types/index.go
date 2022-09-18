@@ -1,9 +1,6 @@
 package types
 
-import (
-	"encoding/binary"
-	"fmt"
-)
+import "fmt"
 
 // NewIndex конструктор нового индекса состояния.
 func NewIndex(term uint64, index uint64) Index {
@@ -45,20 +42,6 @@ func IndexLess(a, b Index) bool {
 	return a.Index < b.Index
 }
 
-// IndexEncode сериализация индекса.
-func IndexEncode(buf []byte, id Index) {
-	binary.LittleEndian.PutUint64(buf, id.Term)
-	binary.LittleEndian.PutUint64(buf[8:], id.Index)
-}
-
-// IndexDecode десериализация индекса.
-func IndexDecode(buf []byte) Index {
-	return Index{
-		Term:  binary.LittleEndian.Uint64(buf),
-		Index: binary.LittleEndian.Uint64(buf[8:]),
-	}
-}
-
 func (id Index) String() string {
-	return fmt.Sprintf("%08x", id.Term) + "-" + fmt.Sprintf("%08x", id.Index)
+	return fmt.Sprintf("%016x", id.Term) + "-" + fmt.Sprintf("%016x", id.Index)
 }
