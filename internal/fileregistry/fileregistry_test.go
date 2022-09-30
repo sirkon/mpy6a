@@ -341,7 +341,17 @@ func TestRegistryOps(t *testing.T) {
 	}
 }
 
-func TestFileInfos(t *testing.T) {
+func TestFileInfosAndStats(t *testing.T) {
+	t.Run("stats", func(t *testing.T) {
+		r := sampleRegistry()
+		stats := r.Stats()
+
+		if !deepequal.Equal(r.stats, stats) {
+			t.Error("stats mismatch")
+			deepequal.SideBySide(t, "stats", r.stats, stats)
+		}
+	})
+
 	t.Run("log info", func(t *testing.T) {
 		r := sampleRegistry()
 		id, read, write := r.Logs()[0].Info()

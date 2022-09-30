@@ -1,209 +1,213 @@
 package logio
 
 import (
+	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
 
 	"github.com/sirkon/mpy6a/internal/errors"
+	"github.com/sirkon/mpy6a/internal/types"
+	"github.com/sirkon/mpy6a/internal/uvarints"
 )
 
-// Log сущность для записи бинарных данных в лог.
-type Log struct {
-	file      *os.File
-	buf       []byte
-	splitbuf  []byte
-	cur       uint64
-	nobuf     bool
-	fsync     bool
-	framesize uint64
-	frameleft uint64
-}
-
-// NewLog открытие лога в файле с данным именем с заданной начальной позицией в нём.
-func NewLog(name string, cur, framesize, maxrecordsize uint64, nobuf, fsync bool) (*Log, error) {
-	file, framesize, err := openOrCreateFile(name, framesize)
-	if err != nil {
-		return nil, errors.Wrapf(err, "open or create file '%s'", name)
+// NewWriter конструктор новой писалки в файл.
+// Параметры:
+//
+//  - name имя файла. Если он уже существует, то будет переоткрыт на чтение и запись.
+//  - frame размер кадра. Если файл существует, то этот параметр будет взят из файла.
+//  - limit максимальная длина данных события.
+func NewWriter(
+	name string,
+	frame int,
+	limit int,
+	opts ...WriterOption,
+) (*Writer, error) {
+	eventMayNeed := 16 + uvarints.LengthInt(limit) + limit
+	if frame < eventMayNeed {
+		return nil, errors.Newf("frame is not sufficient to hold every event with the current limit").
+			Int("frame-size", frame).
+			Int("event-space", eventMayNeed)
+	}
+	if frame > frameSizeHardLimit {
+		return nil, errors.Newf("frame is too large").
+			Int("frame-size", frame).
+			Int("maximal-frame-size", frameSizeHardLimit)
+	}
+	if limit < 18 {
+		return nil, errors.Newf("limit is too low").
+			Int("least-limit", 18).
+			Int("limit", limit)
 	}
 
-	if cur != 0 {
-		if _, err := file.Seek(int64(cur), 0); err != nil {
-			return nil, errors.Wrap(err, "seek to the given position")
+	var file *os.File
+	var res Writer
+
+	if _, err := os.Stat(name); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, errors.Wrap(err, "test existing file")
+		}
+
+		// Файла не существует, создаём новый и пишем frame, limit в его начале.
+		file, err = os.OpenFile(name, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, errors.Wrap(err, "create new file")
+		}
+
+		if err := writeHeader(file, frame, limit); err != nil {
+			return nil, errors.Wrap(err, "write header into a new file")
 		}
 	} else {
-		cur = 8
+		// Файл существует, читаем параметры frame и limit из него.
+		file, err = os.OpenFile(name, os.O_RDWR, 0644)
+		if err != nil {
+			return nil, errors.Wrap(err, "open existing file")
+		}
+
+		var buf [16]byte
+		n, err := io.ReadFull(file, buf[:])
+		if n == 0 && err == io.EOF {
+			if err := writeHeader(file, frame, limit); err != nil {
+				return nil, errors.Wrap(err, "write header into an existing empty file")
+			}
+		} else if err != nil {
+			return nil, errors.Wrap(err, "read header of an existing file")
+		} else {
+			frame = int(binary.LittleEndian.Uint64(buf[:8]))
+			limit = int(binary.LittleEndian.Uint64(buf[8:]))
+		}
 	}
 
-	res := &Log{
-		file:      file,
-		cur:       cur,
-		buf:       make([]byte, 0, maxrecordsize*3+96),
-		splitbuf:  make([]byte, maxrecordsize*2+64),
-		nobuf:     nobuf,
-		fsync:     fsync,
-		framesize: framesize,
-		frameleft: (cur - 8) % framesize,
+	res.dst = file
+	res.frame = uint64(frame)
+	res.limit = limit
+	res.zeroes = bytes.Repeat([]byte{0}, eventMayNeed)
+	res.pos = 16
+
+	for _, opt := range opts {
+		if err := opt.apply(&res, file); err != nil {
+			return nil, errors.Wrap(err, "apply "+opt.String())
+		}
 	}
 
-	return res, nil
+	if res.buf == nil {
+		// Не был задан буфер, создаём его сами.
+		res.buf = &bytes.Buffer{}
+		res.buf.Grow(defaultBufferCapacityInEvents * eventMayNeed)
+	}
+
+	return &res, nil
 }
 
-// WriteEvent запись в лог сериализованного события.
-// Возвращает текущую позицию в нём после успешной записи.
-func (l *Log) WriteEvent(term, index uint64, event []byte) (pos uint64, err error) {
-	if len(event) == 0 {
-		return l.cur, nil
+// Writer писалка логов.
+type Writer struct {
+	dst    io.WriteCloser
+	buf    *bytes.Buffer
+	zeroes []byte
+
+	frame uint64
+	limit int
+	pos   uint64
+}
+
+// WriteEvent запись события с данным идентификатором.
+func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
+	if len(data) > w.limit {
+		return 0, errorEventTooLarge{
+			limit: w.limit,
+			rec:   data,
+		}
 	}
 
-	if l.nobuf {
-		if cap(l.buf) < 32+len(event) {
-			l.buf = make([]byte, len(event)+32)
-		}
-		l.buf = l.buf[:32+len(event)]
-		binary.LittleEndian.PutUint64(l.buf[:8], term)
-		binary.LittleEndian.PutUint64(l.buf[8:16], index)
-		eventlenlen := binary.PutUvarint(l.buf[16:], uint64(len(event)))
-		copy(l.buf[16+eventlenlen:], event)
-		l.buf = l.buf[:16+eventlenlen+len(event)]
+	var deltapos uint64
+	l := 16 + uvarints.LengthInt(len(data)) + len(data)
+	framerest := int(w.frame - ((w.pos - 16) % w.frame))
 
-		var buf []byte
-		if uint64(len(l.buf)) <= l.frameleft {
-			buf = l.buf
-			l.framesize -= uint64(len(l.buf))
-		} else {
-			buf = l.splitbuf[:l.frameleft+uint64(len(l.buf))]
-			memclr(buf[:l.frameleft])
-			copy(buf[l.frameleft:], l.buf)
-			l.frameleft = l.framesize - uint64(len(l.buf))
-		}
+	if framerest < l {
+		// Новая запись не поместится в кадре лога.
+		// Далее мы разбираем три случая:
+		//
+		//  - Нули кадра лога поместятся в буфер.
+		//  - Нули кадра лога в принципе не поместятся в буфере.
+		//  - В принципе, они полезут.
 
-		if _, err := l.file.Write(buf); err != nil {
-			return 0, errors.Wrap(err, "save event without buffering")
-		}
-
-		if l.fsync {
-			if err := l.file.Sync(); err != nil {
-				return 0, errors.Wrap(err, "sync save event without buffering")
+		if framerest+w.buf.Len() >= w.buf.Cap() {
+			if err := w.flush(); err != nil {
+				return 0, errors.Wrap(err, "flush buffer before frame end zeroes write")
 			}
 		}
 
-		l.cur += uint64(len(buf))
-
-		return l.cur, nil
+		w.buf.Write(w.zeroes[:framerest])
+		deltapos += uint64(framerest)
 	}
 
-	var eventlen []byte
-	{
-		var buf [16]byte
-		sesslenlen := binary.PutUvarint(buf[:16], uint64(len(event)))
-		eventlen = buf[:sesslenlen]
-	}
-
-	var packlen int
-	justlen := 16 + len(eventlen) + len(event)
-	var offlen int
-	if uint64(justlen) <= l.frameleft {
-		packlen = justlen
-	} else {
-		offlen = int(l.frameleft)
-		packlen = int(l.frameleft) + justlen
-		l.frameleft = l.framesize
-	}
-
-	if len(l.buf)+packlen > cap(l.buf) {
-		if err := l.flush(); err != nil {
-			return 0, errors.Wrap(err, "flush buffer")
+	if w.buf.Len()+l < w.buf.Cap() {
+		// Если в буфере недостаточно места записи события, то сбрасываем его.
+		if err := w.flush(); err != nil {
+			return 0, errors.Wrap(err, "flush buffer before event write")
 		}
 	}
 
-	s := len(l.buf)
-	l.buf = l.buf[:s+packlen]
-	memclr(l.buf[s : s+offlen])
-	binary.LittleEndian.PutUint64(l.buf[s+offlen:], term)
-	binary.LittleEndian.PutUint64(l.buf[s+offlen+8:], term)
-	copy(l.buf[s+offlen+16:], eventlen)
-	copy(l.buf[s+offlen+16+len(eventlen):], event)
-	l.frameleft -= uint64(justlen)
-	l.cur += uint64(packlen)
+	// Сериализация и запись в лог идентификатора и события.
+	var buf [16]byte
+	types.IndexEncode(buf[:], id)
+	w.buf.Write(buf[:])
+	ll := binary.PutUvarint(buf[:], uint64(len(data)))
+	w.buf.Write(buf[:ll])
+	w.buf.Write(data)
+	deltapos += uint64(l)
+	w.pos += deltapos
 
-	return l.cur, nil
+	return int(deltapos), nil
 }
 
-// Close закрытие лога
-func (l *Log) Close() error {
-	if !l.nobuf {
-		if err := l.flush(); err != nil {
-			return errors.Wrap(err, "flush the rest buffered data")
-		}
-	}
-
-	if err := l.file.Close(); err != nil {
-		return errors.Wrap(err, "close file")
+// Flush сброс буфера.
+func (w *Writer) Flush() error {
+	if err := w.flush(); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// Position текущий размер записываемого файла.
-func (l *Log) Position() uint64 {
-	return l.cur
+// Close закрытие записи лога.
+func (w *Writer) Close() error {
+	if err := w.flush(); err != nil {
+		return errors.Wrap(err, "flush buffer")
+	}
+
+	if err := w.dst.Close(); err != nil {
+		return errors.Wrap(err, "close writer")
+	}
+
+	return nil
 }
 
-func (l *Log) flush() error {
-	if len(l.buf) == 0 {
+// Pos текущая позиция записи в файл.
+func (w *Writer) Pos() uint64 {
+	return w.pos
+}
+
+func (w *Writer) flush() error {
+	if w.buf.Len() == 0 {
 		return nil
 	}
 
-	if _, err := l.file.Write(l.buf); err != nil {
-		return errors.Wrap(err, "save buffered data")
+	if _, err := w.dst.Write(w.buf.Bytes()); err != nil {
+		return err
 	}
 
-	if l.fsync {
-		if err := l.file.Sync(); err != nil {
-			return errors.Wrap(err, "sync saved buffered data")
-		}
-	}
-
-	l.buf = l.buf[:0]
-
+	w.buf.Reset()
 	return nil
 }
 
-func openOrCreateFile(name string, frameSize uint64) (*os.File, uint64, error) {
-	file, err := os.OpenFile(name, os.O_WRONLY, 0644)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, 0, errors.Wrapf(err, "try to open existing file")
-	} else if err != nil && os.IsNotExist(err) {
-		file, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0644)
-		if err != nil {
-			return nil, 0, errors.Wrapf(err, "create file")
-		}
-
-		var buf [8]byte
-		binary.LittleEndian.PutUint64(buf[:8], frameSize)
-		if _, err := file.Write(buf[:8]); err != nil {
-			return nil, 0, errors.Wrapf(err, "push frame size header in the just created file")
-		}
-
-		return file, frameSize, nil
+func writeHeader(dst io.WriteCloser, frame, limit int) error {
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[:8], uint64(frame))
+	binary.LittleEndian.PutUint64(buf[8:], uint64(limit))
+	if _, err := dst.Write(buf[:]); err != nil {
+		return errors.Wrap(err, "write log file header")
 	}
 
-	// файл существует, нужно узнать размер кадра
-	var frameBuf [8]byte
-	l, err := file.Read(frameBuf[:8])
-	if err != nil {
-		return nil, 0, errors.Wrapf(err, "read frame size in existing file")
-	}
-	if l < 8 {
-		return nil, 0, errors.New("missing header with frame size in the file")
-	}
-
-	return file, binary.LittleEndian.Uint64(frameBuf[:8]), nil
-}
-
-// memclr заполнение участка памяти нулями
-func memclr(buf []byte) {
-	for i := range buf {
-		buf[i] = 0
-	}
+	return nil
 }

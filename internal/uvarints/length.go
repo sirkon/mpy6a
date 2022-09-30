@@ -1,6 +1,10 @@
 package uvarints
 
-import "math/bits"
+import (
+	"math/bits"
+
+	"golang.org/x/exp/constraints"
+)
 
 // Length возвращает длину в uvarint для длинны данного слайса.
 func Length(v []byte) int {
@@ -8,6 +12,6 @@ func Length(v []byte) int {
 }
 
 // LengthInt возвращает длину в uvarint для данного целого числа.
-func LengthInt(v uint64) int {
-	return (bits.Len64(v) + 6) / 7
+func LengthInt[T constraints.Integer](v T) int {
+	return (bits.Len64(uint64(v)) + 6) / 7
 }

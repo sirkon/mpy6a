@@ -3,8 +3,6 @@ package mpio
 import (
 	"bufio"
 	"io"
-
-	"github.com/sirkon/mpy6a/internal/errors"
 )
 
 // BufReader буферизованная читалка с функцией получения
@@ -13,29 +11,23 @@ type BufReader struct {
 	rdr *bufio.Reader
 	pos int64
 	lim int64
-
-	bufsize int
 }
 
-// NewBufReader конструктор BufReader. Паникует при попытке установки
-// начальной позиции чтения выше ограничения.
-func NewBufReader(src io.Reader, opts ...Option[*BufReader]) *BufReader {
+// NewBufReader конструктор BufReader.
+func NewBufReader(src io.Reader, opts BufReaderOptions) *BufReader {
 	res := &BufReader{
 		lim: -1,
 	}
 
-	for _, opt := range opts {
-		opt(res, prohibitCustomOpts{})
-	}
-
 	var reader *bufio.Reader
-	if res.bufsize != 0 {
-		reader = bufio.NewReaderSize(src, res.bufsize)
+	if opts.BufferSize != 0 {
+		reader = bufio.NewReaderSize(src, opts.BufferSize)
 	} else {
 		reader = bufio.NewReader(src)
 	}
 
 	res.rdr = reader
+	res.pos = int64(opts.ReadPosition)
 	return res
 }
 
@@ -65,25 +57,7 @@ func (b *BufReader) ReadByte() (c byte, err error) {
 	return c, err
 }
 
-// PosRead возврат позиции чтения.
-func (b *BufReader) PosRead() int64 {
+// Pos возврат позиции чтения.
+func (b *BufReader) Pos() int64 {
 	return b.pos
-}
-
-func (b *BufReader) setBufferSize(n int) {
-	b.bufsize = n
-}
-
-func (b *BufReader) setReadPosition(pos int64) {
-	if pos < b.lim {
-		panic(errors.Newf("start read position must not be lower than a read limit"))
-	}
-	b.pos = pos
-}
-
-func (b *BufReader) setReadLimitPosition(lim int64) {
-	if b.pos > lim {
-		panic(errors.Newf("read limit must not be lower than a start read position"))
-	}
-	b.lim = lim
 }

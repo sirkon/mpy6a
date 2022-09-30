@@ -4,212 +4,241 @@ import (
 	"bufio"
 	"encoding/binary"
 	"io"
+	"os"
 
 	"github.com/sirkon/mpy6a/internal/errors"
+	"github.com/sirkon/mpy6a/internal/types"
+	"github.com/sirkon/mpy6a/internal/uvarints"
 )
 
-// LogReader сущность для чтения бинарных данных из логов,
-// предоставляющая интерфейс итератора, чтения начинается с заданной
-// позиции в первом файле, продолжается по всем файлам и заканчивается
-// на заданной позиции в последнем файле.
-type LogReader struct {
-	sources []LogReadSource
-	curFile namedReadCloser
-	reader  *bufio.Reader
-
-	term    uint64
-	index   uint64
-	event   []byte
-	zerobuf []byte
-
-	framesize uint64
-	frameleft uint64
-
-	err error
-}
-
-// NewLogReader конструктор итератора по записям лога.
-func NewLogReader(sources []LogReadSource) (*LogReader, error) {
-	if len(sources) == 0 {
-		return &LogReader{}, nil
-	}
-
-	file, framesize, frameleft, err := sources[0](logFileProviderProtector{})
+// NewReader создаёт итератор для чтения записанных в файл событий из лога.
+// Читать можно только до определённой позиции.
+func NewReader(name string, limit uint64) (_ *ReadIterator, err error) {
+	file, err := os.Open(name)
 	if err != nil {
-		return nil, errors.Wrap(err, "open first file")
+		return nil, errors.Wrap(err, "open log file")
 	}
 
-	res := &LogReader{
-		sources:   sources[1:],
-		curFile:   file,
-		reader:    bufio.NewReader(file),
-		err:       nil,
-		framesize: framesize,
-		frameleft: frameleft,
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		if cErr := file.Close(); cErr != nil {
+			panic(errors.Wrap(err, "close file after processing failure"))
+		}
+	}()
+
+	buf := bufio.NewReader(io.LimitReader(file, int64(limit)))
+
+	frame, limit, err := readMetadata(buf)
+	if err != nil {
+		return nil, errors.Wrap(err, "load file metadata")
 	}
 
-	return res, nil
+	return &ReadIterator{
+		src: &fileBuf{
+			buf: buf,
+			src: file,
+		},
+		frame: int(frame),
+		limit: int(limit),
+		pos:   16,
+	}, nil
 }
 
-// Next попытка вычитки следующего куска данных
-func (r *LogReader) Next() bool {
-	if r.err != nil {
+// NewReaderOffset создаёт итератор для чтения событий начиная с позиции off.
+func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error) {
+	if off < 16 {
+		return nil, errors.Newf("invalid offset value %d", off)
+	}
+
+	if off > limit {
+		return nil, errors.Wrap(err, "limit cannot be lower than offset")
+	}
+
+	file, err := os.Open(name)
+	if err != nil {
+		return nil, errors.Wrap(err, "open log file")
+	}
+
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		if cErr := file.Close(); cErr != nil {
+			panic(errors.Wrap(err, "close file after processing failure"))
+		}
+	}()
+
+	frame, limit, err := readMetadata(file)
+	if err != nil {
+		return nil, errors.Wrap(err, "load file metadata")
+	}
+
+	buf := bufio.NewReader(io.LimitReader(file, int64(limit)))
+	if _, err := file.Seek(int64(off), 0); err != nil {
+		return nil, errors.Wrap(err, "seek to the given offset")
+	}
+
+	return &ReadIterator{
+		src: &fileBuf{
+			buf: buf,
+			src: file,
+		},
+		frame: int(frame),
+		limit: int(limit),
+		pos:   off,
+	}, nil
+}
+
+type logReader interface {
+	io.ByteReader
+	io.ReadCloser
+}
+
+// ReadIterator итератор по файлу с данными лога.
+type ReadIterator struct {
+	src   logReader
+	frame int
+	limit int
+	pos   uint64
+
+	id    types.Index
+	data  []byte
+	delta int
+	err   error
+}
+
+// Next вычитка следующего события.
+func (it *ReadIterator) Next() bool {
+	if it.err != nil {
 		return false
 	}
+	it.delta = 0
 
-start:
+	var passed bool
+	if it.frameRest() < 18 {
+		passed = true
+		it.delta += it.frameRest()
+		if err := it.passFrameRest(it.frameRest()); err != nil {
+			it.err = errors.Wrap(err, "pass frame rest which is too small to hold an event")
+			return false
+		}
+	}
+
 	var buf [16]byte
-	bufread, err := r.reader.Read(buf[:16])
-	if err != nil {
-		if err == io.EOF && bufread == 0 {
-			switched, err := r.switchFile()
-			if err != nil {
-				r.err = errors.Wrapf(err, "switch to the next file after state index read")
-				return false
-			}
-
-			if !switched {
-				r.err = io.EOF
-				return false
-			}
-
-			goto start
-		}
-
-		r.err = errors.Wrapf(err, "read state index of the next event")
+	if n, err := io.ReadFull(it.src, buf[:]); err != nil {
+		it.err = errors.Wrap(err, "read event index").Int("unexpected-data-length", n)
 		return false
 	}
-
-	if bufread < 16 {
-		r.err = errors.Newf(
-			"read malformed state index in the %s: 16 bytes expected, got %d",
-			r.curFile.Name(),
-			bufread,
-		)
-		return false
-	}
-	r.term = binary.LittleEndian.Uint64(buf[:8])
-	if r.term == 0 {
-		// кадр завершён, нужно перескочить на следующий
-		delta := int(r.frameleft) - 16
-		if cap(r.zerobuf) < delta {
-			r.zerobuf = make([]byte, delta)
-		} else {
-			r.zerobuf = r.zerobuf[:delta]
+	it.id = types.IndexDecode(buf[:])
+	if it.id.Term == 0 {
+		if passed {
+			it.err = errors.New("got zero term just after a small frame rest pass")
+			return false
 		}
-
-		if _, err := io.ReadFull(r.reader, r.zerobuf); err != nil {
-			r.err = errors.Wrapf(err, "read end of frame at %d in %s", r.curFile.Name())
-		}
-
-		r.frameleft = r.framesize
-		goto start
-	}
-	r.index = binary.LittleEndian.Uint64(buf[8:16])
-
-	eventlen, err := binary.ReadUvarint(r.reader)
-	if err != nil {
-		r.err = errors.Wrapf(err, "read malformed event length in the %s", r.curFile.Name())
-		return false
-	}
-
-	if cap(r.event) >= int(eventlen) {
-		r.event = r.event[:eventlen]
-	} else {
-		r.event = make([]byte, eventlen)
-	}
-
-	gotlen, err := r.reader.Read(r.event)
-	if err != nil {
-		if err == io.EOF {
-			if int(eventlen) == gotlen {
-				switched, err := r.switchFile()
-				if err != nil {
-					r.err = errors.Wrap(err, "switch to the next file after event read")
-					return false
-				}
-
-				if !switched {
-					r.err = io.EOF
-				}
-
-				return true
-			}
-
-			r.err = errors.Wrapf(
-				err,
-				"read malformed event in the end of %s: %d bytes expected, got %d",
-				r.curFile.Name(),
-				eventlen,
-				gotlen,
-			)
+		it.delta += it.frameRest()
+		if err := it.passFrameRest(it.frameRest() - 16); err != nil {
+			it.err = errors.Wrap(err, "pass frame rest where event with zero term was detected")
 			return false
 		}
 
-		r.err = errors.Newf("read event data length %d from %s", eventlen, r.curFile.Name())
-		return false
-	}
+		if _, err := io.ReadFull(it.src, buf[:]); err != nil {
+			it.err = errors.Wrap(err, "read event index after a frame rest pass")
+			return false
+		}
 
-	return true
-}
-
-// Event возвращает срок, индекс в сроке и бинарные данные вычитанного события.
-// Внимание: возвращаемый слайс байтов может быть перезаписан
-//           в ходе последующих итераций, копируйте его если
-//           используете именно слайс байтов без конвертаций.
-func (r *LogReader) Event() (term uint64, index uint64, event []byte) {
-	return r.term, r.index, r.event
-}
-
-// Err диагностирует ошибку
-func (r *LogReader) Err() error {
-	if r.err != io.EOF {
-		return r.err
-	}
-
-	return nil
-}
-
-// Close закрывает текущие ресурсы и останавливает итерацию
-func (r *LogReader) Close() error {
-	if r.curFile != nil {
-		if err := r.curFile.Close(); err != nil {
-			return errors.Wrap(err, "close "+r.curFile.Name())
+		it.id = types.IndexDecode(buf[:])
+		if it.id.Term == 0 {
+			it.err = errors.New("got zero term just after frame rest pass")
+			return false
 		}
 	}
 
-	if r.err == nil {
-		r.err = io.EOF
+	uvarint, err := binary.ReadUvarint(it.src)
+	if err != nil {
+		it.err = errors.Wrap(err, "read event data length")
+		return false
+	}
+	l := int(uvarint)
+	if cap(it.data) < l {
+		it.data = make([]byte, l)
+	}
+	it.data = it.data[:l]
+	if _, err := io.ReadFull(it.src, it.data); err != nil {
+		it.err = errors.Wrap(err, "read event data")
+		return false
+	}
+
+	it.delta += 16 + uvarints.LengthInt(l) + l
+	it.pos += uint64(it.delta)
+	return true
+}
+
+// Event получить событие. Кроме данных события возвращается так же
+// длина данных из файла, которые пришлось вычитать.
+func (it *ReadIterator) Event() (id types.Index, data []byte, size int) {
+	return it.id, it.data, it.delta
+}
+
+func (it *ReadIterator) Err() error {
+	if it.err == nil {
+		return nil
+	}
+
+	if errors.Is(it.err, io.EOF) {
+		return nil
+	}
+
+	return it.err
+}
+
+// Close закрытие источника итерирования.
+func (it *ReadIterator) Close() error {
+	return it.src.Close()
+}
+
+func (it *ReadIterator) passFrameRest(l int) error {
+	if len(it.data) < l {
+		it.data = make([]byte, l)
+	}
+	if _, err := io.ReadFull(it.src, it.data[:l]); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// switchFile попытка переключения на следующий файл.
-// Возвращает err == io.EOF если файлов больше не осталось.
-func (r *LogReader) switchFile() (bool, error) {
-	if err := r.curFile.Close(); err != nil {
-		return false, errors.Wrap(err, "close "+r.curFile.Name())
+func (it *ReadIterator) frameRest() int {
+	v := it.frame - int((it.pos-16)%uint64(it.frame))
+	return v
+}
+
+func readMetadata(buf io.Reader) (uint64, uint64, error) {
+	var tmp [16]byte
+	if _, err := io.ReadFull(buf, tmp[:]); err != nil {
+		return 0, 0, errors.Wrap(err, "read metadata")
 	}
 
-	r.curFile = nil
+	frame := binary.LittleEndian.Uint64(tmp[:8])
+	limit := binary.LittleEndian.Uint64(tmp[8:])
 
-	if len(r.sources) == 0 {
-		return false, nil
+	if frame > frameSizeHardLimit {
+		return 0, 0, errors.New("invalid frame size").
+			Uint64("invalid-frame-size", frame)
+	}
+	if frame < limit {
+		return 0, 0, errors.New("frame cannot be smaller than a limit").
+			Uint64("frame-size", frame).
+			Uint64("limit-size", limit)
+	}
+	if limit < 18 {
+		return 0, 0, errors.New("limit is too small").
+			Uint64("invalid-limit", limit).
+			Int("least-limit", 18)
 	}
 
-	head, rest := r.sources[0], r.sources[1:]
-	r.sources = rest
-
-	file, framsize, frameleft, err := head(logFileProviderProtector{})
-	if err != nil {
-		return false, errors.Wrap(err, "open next file")
-	}
-
-	r.curFile = file
-	r.framesize = framsize
-	r.frameleft = frameleft
-	r.reader.Reset(file)
-
-	return true, nil
+	return frame, limit, nil
 }
