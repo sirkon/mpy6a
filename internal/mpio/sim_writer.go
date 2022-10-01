@@ -57,6 +57,20 @@ func NewSimWriter(name string, opts SimWriterOptionsType) (res *SimWriter, err e
 	return res, nil
 }
 
+// NewSimWriterFile альтернативный конструктор с использованием готового файлового объекта.
+// Необходимо ручное задание позиции. Позиция заданная через опцию игнорируется.
+func NewSimWriterFile(file *os.File, pos uint64, opts SimWriterOptionsType) *SimWriter {
+	res := &SimWriter{
+		file: file,
+		lock: &sync.RWMutex{},
+	}
+	opts.apply(res)
+	res.size = int64(pos)
+	res.total = int64(pos)
+
+	return res
+}
+
 // Write запись данных.
 // Гарантируется, что переданные в данном вызове данные отправятся
 // на диск в рамках одной записи. Т.е. не будет так, что "голова" p
@@ -111,6 +125,14 @@ func (w *SimWriter) Close() error {
 	w.done.Store(true)
 
 	return nil
+}
+
+// Flush принудительный сброс буферизованных данных на диск.
+func (w *SimWriter) Flush() error {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	return w.flush()
 }
 
 // Size возврат текущего размера файла.
