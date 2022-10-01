@@ -32,11 +32,18 @@ func NewSimReader(w *SimWriter, opts SimReaderOptionsType) (_ *SimReader, err er
 		}
 	}()
 
-	if res.fpos != 0 {
+	switch {
+	case res.fpos != 0 && res.fpos < atomic.LoadInt64(&w.size):
 		if _, err := file.Seek(res.fpos, 0); err != nil {
 			errStep = "seek failure"
 			return nil, errors.Wrap(err, "seek to the given read position").
 				Int64("invalid-position", res.fpos)
+		}
+	case res.fpos != 0:
+		if _, err := file.Seek(atomic.LoadInt64(&w.size), 0); err != nil {
+			errStep = "seek failure"
+			res.needseek = true
+			return nil, errors.Wrap(err, "seek to the end of writing file")
 		}
 	}
 
@@ -226,7 +233,9 @@ func (r *SimReader) getDataSize(wsize int64) int {
 }
 
 func (r *SimReader) setBufferSize(v int) {
-	r.buf = make([]byte, 0, v)
+	if v > 0 {
+		r.buf = make([]byte, 0, v)
+	}
 }
 
 func (r *SimReader) setReadPosition(v uint64) {

@@ -62,11 +62,11 @@ func NewSimWriter(name string, opts SimWriterOptionsType) (res *SimWriter, err e
 // на диск в рамках одной записи. Т.е. не будет так, что "голова" p
 // будет на диске, а "хвост" — в буфере. Либо на диске целиком, либо
 // полностью в буфере.
-func (s *SimWriter) Write(p []byte) (n int, err error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+func (w *SimWriter) Write(p []byte) (n int, err error) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
 
-	if s.failed.Load() {
+	if w.failed.Load() {
 		return 0, errInternal{}
 	}
 
@@ -75,73 +75,75 @@ func (s *SimWriter) Write(p []byte) (n int, err error) {
 			return
 		}
 
-		s.failed.Store(true)
+		w.failed.Store(true)
 	}()
 
-	if len(s.buf)+len(p) > cap(p) {
-		if err := s.flush(); err != nil {
+	if len(w.buf)+len(p) > cap(p) {
+		if err := w.flush(); err != nil {
 			return 0, errors.Wrap(err, "flush buffered data to release buffer")
 		}
 	}
 
-	if len(p) > cap(s.buf) {
-		return 0, errWriteDataOvergrowsBuffer(len(p), cap(s.buf))
+	if len(p) > cap(w.buf) {
+		return 0, errWriteDataOvergrowsBuffer(len(p), cap(w.buf))
 	}
 
-	rest := s.buf[len(s.buf):]
+	rest := w.buf[len(w.buf):]
 	copy(rest[:len(p)], p)
-	s.buf = s.buf[:len(s.buf)+len(p)]
-	atomic.AddInt64(&s.total, int64(len(p)))
+	w.buf = w.buf[:len(w.buf)+len(p)]
+	atomic.AddInt64(&w.total, int64(len(p)))
 	return len(p), nil
 }
 
 // Close закрывает файл после сброса буфера.
-func (s *SimWriter) Close() error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+func (w *SimWriter) Close() error {
+	w.lock.Lock()
+	defer w.lock.Unlock()
 
-	if err := s.flush(); err != nil {
+	if err := w.flush(); err != nil {
 		return errors.Wrap(err, "flush buffer")
 	}
 
-	if err := s.file.Close(); err != nil {
+	if err := w.file.Close(); err != nil {
 		return errors.Wrap(err, "close file")
 	}
 
-	s.done.Store(true)
+	w.done.Store(true)
 
 	return nil
 }
 
 // Size возврат текущего размера файла.
-func (s *SimWriter) Size() int64 {
-	return s.total
+func (w *SimWriter) Size() int64 {
+	return w.total
 }
 
-func (s *SimWriter) flush() error {
-	if len(s.buf) == 0 {
+func (w *SimWriter) flush() error {
+	if len(w.buf) == 0 {
 		return nil
 	}
 
-	if _, err := s.file.Write(s.buf); err != nil {
-		s.failed.Store(true)
+	if _, err := w.file.Write(w.buf); err != nil {
+		w.failed.Store(true)
 		return err
 	}
 
-	atomic.AddInt64(&s.size, int64(len(s.buf)))
-	s.buf = s.buf[:0]
+	atomic.AddInt64(&w.size, int64(len(w.buf)))
+	w.buf = w.buf[:0]
 
 	return nil
 }
 
-func (s *SimWriter) setBufferSize(v int) {
-	s.buf = make([]byte, 0, v)
+func (w *SimWriter) setBufferSize(v int) {
+	if v > 0 {
+		w.buf = make([]byte, 0, v)
+	}
 }
 
-func (s *SimWriter) setWritePosition(v uint64) {
-	s.total = int64(v)
+func (w *SimWriter) setWritePosition(v uint64) {
+	w.total = int64(v)
 }
 
-func (s *SimWriter) setLogger(v func(err error)) {
-	s.errlog = v
+func (w *SimWriter) setLogger(v func(err error)) {
+	w.errlog = v
 }

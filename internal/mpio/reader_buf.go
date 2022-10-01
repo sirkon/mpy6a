@@ -73,7 +73,9 @@ func (b *BufReader) Pos() int64 {
 }
 
 func (b *BufReader) setBufferSize(v int) {
-	b.bufsize = v
+	if v > 0 {
+		b.bufsize = v
+	}
 }
 
 func (b *BufReader) setReadPosition(v uint64) {
