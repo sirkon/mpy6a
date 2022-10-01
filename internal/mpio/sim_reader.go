@@ -9,19 +9,11 @@ import (
 )
 
 // NewSimReader конструктор SimReader.
-func NewSimReader(w *SimWriter, opts SimReaderOptions) (_ *SimReader, err error) {
-	if opts.BufferSize < 0 {
-		return nil, errors.New("buffer size must not be positive").
-			Int("invalid-buffer-size", opts.BufferSize)
-	}
-
-	if opts.BufferSize == 0 {
-		opts.BufferSize = defaultBufferSize
-	}
+func NewSimReader(w *SimWriter, opts SimReaderOptionsType) (_ *SimReader, err error) {
 	res := &SimReader{
-		w:   w,
-		buf: make([]byte, opts.BufferSize),
+		w: w,
 	}
+	opts.apply(res)
 
 	file, err := os.Open(w.file.Name())
 	if err != nil {
@@ -40,14 +32,13 @@ func NewSimReader(w *SimWriter, opts SimReaderOptions) (_ *SimReader, err error)
 		}
 	}()
 
-	if opts.ReadPosition != 0 {
-		if _, err := file.Seek(int64(opts.ReadPosition), 0); err != nil {
+	if res.fpos != 0 {
+		if _, err := file.Seek(res.fpos, 0); err != nil {
 			errStep = "seek failure"
 			return nil, errors.Wrap(err, "seek to the given read position").
 				Int64("invalid-position", res.fpos)
 		}
 	}
-	res.fpos = int64(opts.ReadPosition)
 
 	return res, nil
 }
@@ -232,4 +223,12 @@ func (r *SimReader) getDataSize(wsize int64) int {
 		lim = int(wsize - r.fpos)
 	}
 	return lim
+}
+
+func (r *SimReader) setBufferSize(v int) {
+	r.buf = make([]byte, 0, v)
+}
+
+func (r *SimReader) setReadPosition(v uint64) {
+	r.fpos = int64(v)
 }

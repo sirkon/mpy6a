@@ -1,16 +1,11 @@
 package mpio
 
 import (
-	"log"
 	"os"
 	"sync"
 	"sync/atomic"
 
 	"github.com/sirkon/mpy6a/internal/errors"
-)
-
-const (
-	defaultBufferSize = 4096
 )
 
 // SimWriter примитив для записи в файл.
@@ -29,26 +24,11 @@ type SimWriter struct {
 }
 
 // NewSimWriter конструктор SimWriter.
-func NewSimWriter(name string, opts SimWriterOptions) (res *SimWriter, err error) {
-	res = &SimWriter{}
-	if opts.BufferSize < 0 {
-		return nil, errors.New("buffer size must not be negative").
-			Int("invalid-buffer-size", opts.BufferSize)
+func NewSimWriter(name string, opts SimWriterOptionsType) (res *SimWriter, err error) {
+	res = &SimWriter{
+		lock: &sync.RWMutex{},
 	}
-
-	res.errlog = opts.Logger
-	if res.errlog == nil {
-		res.errlog = func(err error) {
-			log.Println(err)
-		}
-	}
-
-	if opts.BufferSize == 0 {
-		opts.BufferSize = defaultBufferSize
-	}
-	res.buf = make([]byte, 0, opts.BufferSize)
-
-	res.lock = &sync.RWMutex{}
+	opts.apply(res)
 
 	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
@@ -66,7 +46,6 @@ func NewSimWriter(name string, opts SimWriterOptions) (res *SimWriter, err error
 		}
 	}()
 
-	res.total = int64(opts.WritePosition)
 	if res.total != 0 {
 		if _, err := file.Seek(res.total, 0); err != nil {
 			errStep = "seek failure"
@@ -105,14 +84,14 @@ func (s *SimWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	if len(p) > cap(p) {
+	if len(p) > cap(s.buf) {
 		return 0, errWriteDataOvergrowsBuffer(len(p), cap(s.buf))
 	}
 
 	rest := s.buf[len(s.buf):]
 	copy(rest[:len(p)], p)
 	s.buf = s.buf[:len(s.buf)+len(p)]
-	s.total += int64(len(p))
+	atomic.AddInt64(&s.total, int64(len(p)))
 	return len(p), nil
 }
 
@@ -153,4 +132,16 @@ func (s *SimWriter) flush() error {
 	s.buf = s.buf[:0]
 
 	return nil
+}
+
+func (s *SimWriter) setBufferSize(v int) {
+	s.buf = make([]byte, 0, v)
+}
+
+func (s *SimWriter) setWritePosition(v uint64) {
+	s.total = int64(v)
+}
+
+func (s *SimWriter) setLogger(v func(err error)) {
+	s.errlog = v
 }
