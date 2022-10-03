@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/sirkon/mpy6a/internal/errors"
+	"github.com/sirkon/mpy6a/internal/mpio"
 	"github.com/sirkon/mpy6a/internal/types"
 	"github.com/sirkon/mpy6a/internal/uvarints"
 )
@@ -78,7 +79,6 @@ func NewWriter(
 		}
 	}
 
-	res.dst = file
 	res.frame = uint64(frame)
 	res.limit = limit
 	res.zeroes = bytes.Repeat([]byte{0}, eventMayNeed)
@@ -90,24 +90,28 @@ func NewWriter(
 		}
 	}
 
-	if res.buf == nil {
-		// Не был задан буфер, создаём его сами.
-		res.buf = &bytes.Buffer{}
-		res.buf.Grow(defaultBufferCapacityInEvents * eventMayNeed)
+	if res.bufsize == 0 {
+		res.bufsize = defaultBufferCapacityInEvents * eventMayNeed
 	}
+
+	res.dst = mpio.NewSimWriterFile(
+		file,
+		res.pos,
+		mpio.SimWriterOptions().BufferSize(res.bufsize).WritePosition(res.pos),
+	)
 
 	return &res, nil
 }
 
 // Writer писалка логов.
 type Writer struct {
-	dst    io.WriteCloser
-	buf    *bytes.Buffer
+	dst    *mpio.SimWriter
 	zeroes []byte
 
-	frame uint64
-	limit int
-	pos   uint64
+	frame   uint64
+	limit   int
+	pos     uint64
+	bufsize int
 }
 
 // WriteEvent запись события с данным идентификатором.
@@ -124,37 +128,34 @@ func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 	framerest := int(w.frame - ((w.pos - 16) % w.frame))
 
 	if framerest < l {
-		// Новая запись не поместится в кадре лога.
-		// Далее мы разбираем три случая:
-		//
-		//  - Нули кадра лога поместятся в буфер.
-		//  - Нули кадра лога в принципе не поместятся в буфере.
-		//  - В принципе, они полезут.
-
-		if framerest+w.buf.Len() >= w.buf.Cap() {
-			if err := w.flush(); err != nil {
-				return 0, errors.Wrap(err, "flush buffer before frame end zeroes write")
-			}
+		if framerest > len(w.zeroes) {
+			w.zeroes = make([]byte, framerest)
 		}
 
-		w.buf.Write(w.zeroes[:framerest])
-		deltapos += uint64(framerest)
+		if _, err := w.dst.Write(w.zeroes); err != nil {
+			return 0, errors.Wrapf(err, "push zeroes at the end of a frame")
+		}
 	}
 
-	if w.buf.Len()+l < w.buf.Cap() {
-		// Если в буфере недостаточно места записи события, то сбрасываем его.
-		if err := w.flush(); err != nil {
-			return 0, errors.Wrap(err, "flush buffer before event write")
-		}
+	// Удостоверяемся, что в буфере хватит места для события целиком,
+	// чтобы избежать его частичной записи.
+	if err := mpio.EnsureBufferSpace(w.dst, l); err != nil {
+		return 0, errors.Wrap(err, "make sure the event will be buffered in a single piece")
 	}
 
 	// Сериализация и запись в лог идентификатора и события.
 	var buf [16]byte
 	types.IndexEncode(buf[:], id)
-	w.buf.Write(buf[:])
+	if _, err := w.dst.Write(buf[:]); err != nil {
+		return 0, errors.Wrap(err, "push encoded id")
+	}
 	ll := binary.PutUvarint(buf[:], uint64(len(data)))
-	w.buf.Write(buf[:ll])
-	w.buf.Write(data)
+	if _, err := w.dst.Write(buf[:ll]); err != nil {
+		return 0, errors.Wrap(err, "push data length")
+	}
+	if _, err := w.dst.Write(data); err != nil {
+		return 0, errors.Wrap(err, "push data")
+	}
 	deltapos += uint64(l)
 	w.pos += deltapos
 
@@ -189,16 +190,7 @@ func (w *Writer) Pos() uint64 {
 }
 
 func (w *Writer) flush() error {
-	if w.buf.Len() == 0 {
-		return nil
-	}
-
-	if _, err := w.dst.Write(w.buf.Bytes()); err != nil {
-		return err
-	}
-
-	w.buf.Reset()
-	return nil
+	return w.dst.Flush()
 }
 
 func writeHeader(dst io.WriteCloser, frame, limit int) error {

@@ -1,7 +1,6 @@
 package logio
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"strconv"
@@ -43,8 +42,7 @@ func (o writerBufferSize) apply(w *Writer, _ *os.File) error {
 		)
 	}
 
-	w.buf = &bytes.Buffer{}
-	w.buf.Grow(int(o))
+	w.bufsize = int(o)
 	return nil
 }
 

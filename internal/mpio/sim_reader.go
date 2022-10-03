@@ -2,8 +2,10 @@ package mpio
 
 import (
 	"io"
+	"io/fs"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/sirkon/mpy6a/internal/errors"
 )
@@ -32,6 +34,7 @@ func NewSimReader(w *SimWriter, opts SimReaderOptionsType) (_ *SimReader, err er
 		}
 	}()
 
+	wtotal := atomic.LoadInt64(&w.total)
 	switch {
 	case res.fpos != 0 && res.fpos < atomic.LoadInt64(&w.size):
 		if _, err := file.Seek(res.fpos, 0); err != nil {
@@ -39,12 +42,13 @@ func NewSimReader(w *SimWriter, opts SimReaderOptionsType) (_ *SimReader, err er
 			return nil, errors.Wrap(err, "seek to the given read position").
 				Int64("invalid-position", res.fpos)
 		}
+	case res.fpos != 0 && res.fpos <= wtotal:
+		res.needseek = true
 	case res.fpos != 0:
-		if _, err := file.Seek(atomic.LoadInt64(&w.size), 0); err != nil {
-			errStep = "seek failure"
-			res.needseek = true
-			return nil, errors.Wrap(err, "seek to the end of writing file")
-		}
+		errStep = "seek failure"
+		return nil, errors.New("the start read position is out of file size").
+			Int64("start-read", res.fpos).
+			Int64("file-size", wtotal)
 	}
 
 	return res, nil
@@ -185,6 +189,41 @@ func (r *SimReader) Close() error {
 	return nil
 }
 
+// Stat возвращает статистику аналогично файлам. Только часть её, разумеется.
+func (r *SimReader) Stat() (os.FileInfo, error) {
+	return simReaderFileInfo{r: r}, nil
+}
+
+// Seek перемещает чтение на новую позицию исходного файла.
+// Приводит к сбросу буфера.
+func (r *SimReader) Seek(offset int64, whence int) (ret int64, err error) {
+	total := atomic.LoadInt64(&r.w.total)
+	switch whence {
+	case 0:
+	case 1:
+		offset = r.fpos + offset
+	case 2:
+		offset = total - offset
+	default:
+		return 0, errors.Newf("unsupported whence value %d", whence)
+	}
+
+	if offset < 0 {
+		return 0, errors.Newf("invalid final offset %d", offset)
+	}
+	if offset > total {
+		return 0, errors.Newf("final offset is out of range").
+			Int64("final-offset", offset).
+			Int64("file-size", total)
+	}
+
+	r.buf = r.buf[:0]
+	r.fpos = offset
+	r.needseek = true
+
+	return offset, nil
+}
+
 // Pos позиция вычитки из файла.
 func (r *SimReader) Pos() int64 {
 	return r.fpos
@@ -241,3 +280,39 @@ func (r *SimReader) setBufferSize(v int) {
 func (r *SimReader) setReadPosition(v uint64) {
 	r.fpos = int64(v)
 }
+
+type simReaderFileInfo struct {
+	r *SimReader
+}
+
+// Name для реализации os.FileInfo
+func (s simReaderFileInfo) Name() string {
+	return s.r.src.Name()
+}
+
+// Size для реализации os.FileInfo
+func (s simReaderFileInfo) Size() int64 {
+	return s.r.w.total
+}
+
+// Mode для реализации os.FileInfo
+func (s simReaderFileInfo) Mode() fs.FileMode {
+	return 0
+}
+
+// ModTime для реализации os.FileInfo
+func (s simReaderFileInfo) ModTime() time.Time {
+	return time.Now()
+}
+
+// IsDir для реализации os.FileInfo
+func (s simReaderFileInfo) IsDir() bool {
+	return false
+}
+
+// Sys для реализации os.FileInfo
+func (s simReaderFileInfo) Sys() any {
+	return nil
+}
+
+var _ os.FileInfo = simReaderFileInfo{}

@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/sirkon/mpy6a/internal/errors"
+	"github.com/sirkon/mpy6a/internal/mpio"
 	"github.com/sirkon/mpy6a/internal/types"
 	"github.com/sirkon/mpy6a/internal/uvarints"
 )
@@ -93,9 +94,39 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 	}, nil
 }
 
+// NewReaderInProcess вычитка файла с логом всё ещё используемого
+// системой.
+func NewReaderInProcess(w *mpio.SimWriter, start uint64) (*ReadIterator, error) {
+	r, err := mpio.NewSimReader(w, mpio.SimReaderOptions())
+	if err != nil {
+		return nil, errors.Wrap(err, "create log file reader")
+	}
+
+	frame, limit, err := readMetadata(r)
+	if err != nil {
+		return nil, errors.Wrap(err, "read log file metadata")
+	}
+
+	if _, err := r.Seek(int64(start), 0); err != nil {
+		return nil, errors.Wrap(err, "seek to the start position")
+	}
+
+	res := &ReadIterator{
+		src:   r,
+		frame: int(frame),
+		limit: int(limit),
+		pos:   start,
+	}
+	return res, nil
+}
+
+// logReader абстракция позволяющая единообразно работать с
+// источниками вычитки лога, как с простыми файлами, так и
+// с экземплярами SimReader
 type logReader interface {
+	io.Reader
 	io.ByteReader
-	io.ReadCloser
+	io.Closer
 }
 
 // ReadIterator итератор по файлу с данными лога.
@@ -216,14 +247,14 @@ func (it *ReadIterator) frameRest() int {
 	return v
 }
 
-func readMetadata(buf io.Reader) (uint64, uint64, error) {
+func readMetadata(buf io.Reader) (frame uint64, limit uint64, err error) {
 	var tmp [16]byte
 	if _, err := io.ReadFull(buf, tmp[:]); err != nil {
 		return 0, 0, errors.Wrap(err, "read metadata")
 	}
 
-	frame := binary.LittleEndian.Uint64(tmp[:8])
-	limit := binary.LittleEndian.Uint64(tmp[8:])
+	frame = binary.LittleEndian.Uint64(tmp[:8])
+	limit = binary.LittleEndian.Uint64(tmp[8:])
 
 	if frame > frameSizeHardLimit {
 		return 0, 0, errors.New("invalid frame size").

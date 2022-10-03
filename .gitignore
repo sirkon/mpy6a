@@ -19,4 +19,5 @@ tmpdata/
 
 internal/state/testdata
 internal/logio/testdata
+internal/mpio/testdata
 .DS_Store

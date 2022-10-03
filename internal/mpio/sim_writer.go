@@ -92,7 +92,7 @@ func (w *SimWriter) Write(p []byte) (n int, err error) {
 		w.failed.Store(true)
 	}()
 
-	if len(w.buf)+len(p) > cap(p) {
+	if len(w.buf)+len(p) > cap(w.buf) {
 		if err := w.flush(); err != nil {
 			return 0, errors.Wrap(err, "flush buffered data to release buffer")
 		}
@@ -163,9 +163,29 @@ func (w *SimWriter) setBufferSize(v int) {
 }
 
 func (w *SimWriter) setWritePosition(v uint64) {
+	w.size = int64(v)
 	w.total = int64(v)
 }
 
 func (w *SimWriter) setLogger(v func(err error)) {
 	w.errlog = v
+}
+
+// EnsureBufferSpace попытка высвободить достаточно места
+// в буфере для записи длинной n. Может возвратить ошибку
+// слишком короткого буфера или ошибку сброса данных на диск.
+func EnsureBufferSpace(w *SimWriter, n int) error {
+	if n+len(w.buf) < cap(w.buf) {
+		return nil
+	}
+
+	if n > cap(w.buf) {
+		return errWriteDataOvergrowsBuffer(n, cap(w.buf))
+	}
+
+	if err := w.Flush(); err != nil {
+		return errors.Wrap(err, "flush previously collected data")
+	}
+
+	return nil
 }
