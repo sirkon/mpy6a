@@ -78,10 +78,10 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 		return nil, errors.Wrap(err, "load file metadata")
 	}
 
-	buf := bufio.NewReader(io.LimitReader(file, int64(limit)))
 	if _, err := file.Seek(int64(off), 0); err != nil {
 		return nil, errors.Wrap(err, "seek to the given offset")
 	}
+	buf := bufio.NewReader(io.LimitReader(file, int64(limit-off)))
 
 	return &ReadIterator{
 		src: &fileBuf{
@@ -96,8 +96,8 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 
 // NewReaderInProcess вычитка файла с логом всё ещё используемого
 // системой.
-func NewReaderInProcess(w *mpio.SimWriter, start uint64) (*ReadIterator, error) {
-	r, err := mpio.NewSimReader(w, mpio.SimReaderOptions())
+func NewReaderInProcess(w *Writer, off uint64) (*ReadIterator, error) {
+	r, err := mpio.NewSimReader(w.dst, mpio.SimReaderOptions())
 	if err != nil {
 		return nil, errors.Wrap(err, "create log file reader")
 	}
@@ -107,15 +107,15 @@ func NewReaderInProcess(w *mpio.SimWriter, start uint64) (*ReadIterator, error) 
 		return nil, errors.Wrap(err, "read log file metadata")
 	}
 
-	if _, err := r.Seek(int64(start), 0); err != nil {
-		return nil, errors.Wrap(err, "seek to the start position")
+	if _, err := r.Seek(int64(off), 0); err != nil {
+		return nil, errors.Wrap(err, "seek to the offset")
 	}
 
 	res := &ReadIterator{
 		src:   r,
 		frame: int(frame),
 		limit: int(limit),
-		pos:   start,
+		pos:   off,
 	}
 	return res, nil
 }
@@ -152,32 +152,37 @@ func (it *ReadIterator) Next() bool {
 	var passed bool
 	if it.frameRest() < 18 {
 		passed = true
-		it.delta += it.frameRest()
-		if err := it.passFrameRest(it.frameRest()); err != nil {
+		it.delta = it.frameRest()
+		if err := it.passBytes(it.frameRest()); err != nil {
 			it.err = errors.Wrap(err, "pass frame rest which is too small to hold an event")
 			return false
 		}
 	}
 
 	var buf [16]byte
-	if n, err := io.ReadFull(it.src, buf[:]); err != nil {
+	if n, err := mpio.TryReadFull(it.src, buf[:]); err != nil {
 		it.err = errors.Wrap(err, "read event index").Int("unexpected-data-length", n)
 		return false
 	}
 	it.id = types.IndexDecode(buf[:])
 	if it.id.Term == 0 {
 		if passed {
-			it.err = errors.New("got zero term just after a small frame rest pass")
+			it.err = errors.New("got zero term just after a short frame rest pass").
+				Uint64("read-start-position", it.pos).
+				Int("read-position-shift", it.delta)
 			return false
 		}
 		it.delta += it.frameRest()
-		if err := it.passFrameRest(it.frameRest() - 16); err != nil {
+		if err := it.passBytes(it.frameRest() - 16); err != nil {
 			it.err = errors.Wrap(err, "pass frame rest where event with zero term was detected")
 			return false
 		}
 
-		if _, err := io.ReadFull(it.src, buf[:]); err != nil {
+		if n, err := mpio.TryReadFull(it.src, buf[:]); err != nil {
 			it.err = errors.Wrap(err, "read event index after a frame rest pass")
+			return false
+		} else if n < 16 {
+			it.err = errors.New("missing event index")
 			return false
 		}
 
@@ -198,9 +203,11 @@ func (it *ReadIterator) Next() bool {
 		it.data = make([]byte, l)
 	}
 	it.data = it.data[:l]
-	if _, err := io.ReadFull(it.src, it.data); err != nil {
+	if n, err := mpio.TryReadFull(it.src, it.data); err != nil {
 		it.err = errors.Wrap(err, "read event data")
 		return false
+	} else if n < l {
+		it.err = errors.New("missing event data").Int("expected-length", l).Int("actual-length", n)
 	}
 
 	it.delta += 16 + uvarints.LengthInt(l) + l
@@ -231,12 +238,18 @@ func (it *ReadIterator) Close() error {
 	return it.src.Close()
 }
 
-func (it *ReadIterator) passFrameRest(l int) error {
+func (it *ReadIterator) passBytes(l int) error {
 	if len(it.data) < l {
 		it.data = make([]byte, l)
 	}
-	if _, err := io.ReadFull(it.src, it.data[:l]); err != nil {
+
+	n, err := mpio.TryReadFull(it.src, it.data[:l])
+	if err != nil {
 		return err
+	}
+
+	if n == 0 {
+		return io.EOF
 	}
 
 	return nil
@@ -249,7 +262,7 @@ func (it *ReadIterator) frameRest() int {
 
 func readMetadata(buf io.Reader) (frame uint64, limit uint64, err error) {
 	var tmp [16]byte
-	if _, err := io.ReadFull(buf, tmp[:]); err != nil {
+	if _, err := mpio.TryReadFull(buf, tmp[:]); err != nil {
 		return 0, 0, errors.Wrap(err, "read metadata")
 	}
 

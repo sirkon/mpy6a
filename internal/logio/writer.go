@@ -123,24 +123,19 @@ func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 		}
 	}
 
-	var deltapos uint64
+	var deltapos int
 	l := 16 + uvarints.LengthInt(len(data)) + len(data)
-	framerest := int(w.frame - ((w.pos - 16) % w.frame))
+	framerest := int(w.frame - (w.pos-16)%w.frame)
 
 	if framerest < l {
 		if framerest > len(w.zeroes) {
 			w.zeroes = make([]byte, framerest)
 		}
 
-		if _, err := w.dst.Write(w.zeroes); err != nil {
+		deltapos = framerest
+		if _, err := w.dst.Write(w.zeroes[:framerest]); err != nil {
 			return 0, errors.Wrapf(err, "push zeroes at the end of a frame")
 		}
-	}
-
-	// Удостоверяемся, что в буфере хватит места для события целиком,
-	// чтобы избежать его частичной записи.
-	if err := mpio.EnsureBufferSpace(w.dst, l); err != nil {
-		return 0, errors.Wrap(err, "make sure the event will be buffered in a single piece")
 	}
 
 	// Сериализация и запись в лог идентификатора и события.
@@ -156,10 +151,10 @@ func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 	if _, err := w.dst.Write(data); err != nil {
 		return 0, errors.Wrap(err, "push data")
 	}
-	deltapos += uint64(l)
-	w.pos += deltapos
+	deltapos += l
+	w.pos += uint64(deltapos)
 
-	return int(deltapos), nil
+	return deltapos, nil
 }
 
 // Flush сброс буфера.

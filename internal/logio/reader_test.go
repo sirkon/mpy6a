@@ -2,6 +2,7 @@ package logio
 
 import (
 	"bytes"
+	"os"
 	"strconv"
 	"testing"
 
@@ -13,7 +14,10 @@ import (
 
 func TestReaderWithRawFile(t *testing.T) {
 	t.Run("new-log-write-read", func(t *testing.T) {
-		w, err := NewWriter("testdata/new-log", 512, 40, WriterBufferSize(324))
+		const name = "testdata/new-log"
+		_ = os.RemoveAll(name)
+
+		w, err := NewWriter(name, 512, 40, WriterBufferSize(324))
 		if err != nil {
 			testlog.Error(t, errors.Wrap(err, "create new writer"))
 			return
@@ -31,7 +35,7 @@ func TestReaderWithRawFile(t *testing.T) {
 			return
 		}
 
-		itr, err := NewReader("testdata/new-log", w.Pos())
+		itr, err := NewReader(name, w.Pos())
 		if err != nil {
 			testlog.Error(t, errors.Wrap(err, "open log reader"))
 		}
@@ -44,8 +48,8 @@ func TestReaderWithRawFile(t *testing.T) {
 		var i int
 		for itr.Next() {
 
-			id, data, _ := itr.Event()
-			t.Log(id, string(data))
+			id, data, size := itr.Event()
+			t.Log(id, string(data), size)
 
 			expectedID := types.NewIndex(1, uint64(i))
 			if !deepequal.Equal(id, expectedID) {
@@ -98,13 +102,13 @@ func TestReaderWithRawFile(t *testing.T) {
 			512,
 			40,
 			WriterBufferSize(324),
-			WriterPosition(prevPos),
+			WriterPosition(16+prevPos),
 		)
 		if err != nil {
 			testlog.Error(t, errors.Wrap(err, "open reader using existing file"))
 		}
 
-		if _, err := w.WriteEvent(types.NewIndex(2, 1), []byte("Hello")); err != nil {
+		if _, err := w.WriteEvent(types.NewIndex(2, 15), []byte("Hello")); err != nil {
 			testlog.Error(t, errors.Wrap(err, "write new event into the log"))
 		}
 
@@ -122,19 +126,47 @@ func TestReaderWithRawFile(t *testing.T) {
 			}
 		}()
 
-		var eventID types.Index
-		var eventData []byte
 		for itr.Next() {
-			eventID, eventData, _ = itr.Event()
-			t.Log(eventID, string(eventData))
+			eventID, eventData, size := itr.Event()
+			t.Log(eventID, string(eventData), size)
 		}
 
 		if err := itr.Err(); err != nil {
 			testlog.Error(t, errors.Wrap(err, "iterate over log entries"))
 			return
 		}
+	})
 
-		t.Log(eventID, string(eventData))
+	t.Run("read-active", func(t *testing.T) {
+		const name = "testdata/active-log"
+
+		w, err := NewWriter(name, 512, 40, WriterBufferSize(324))
+		if err != nil {
+			testlog.Error(t, errors.Wrap(err, "create new writer"))
+			return
+		}
+
+		for i := 0; i < 40; i++ {
+			if _, err := w.WriteEvent(types.NewIndex(1, uint64(i)), []byte(strconv.Itoa(i))); err != nil {
+				testlog.Error(t, errors.Wrap(err, "write event").Int("event", i))
+				return
+			}
+		}
+
+		itr, err := NewReaderInProcess(w, 16)
+		if err != nil {
+			testlog.Error(t, errors.Wrap(err, "init active log reader"))
+		}
+
+		for itr.Next() {
+			eventID, eventData, size := itr.Event()
+			t.Log(eventID, string(eventData), size)
+		}
+
+		if err := itr.Err(); err != nil {
+			testlog.Error(t, errors.Wrap(err, "iterate over log entries"))
+			return
+		}
 	})
 }
 
