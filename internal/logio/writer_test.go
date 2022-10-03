@@ -23,8 +23,8 @@ func TestNewWriter(t *testing.T) {
 			return
 		}
 
-		if writer.pos != 16 {
-			t.Errorf("expected pos 16, got %d", writer.pos)
+		if writer.pos != fileMetaInfoHeaderSize {
+			t.Errorf("expected pos %d, got %d", fileMetaInfoHeaderSize, writer.pos)
 		}
 
 		if err := writer.Close(); err != nil {
@@ -55,8 +55,8 @@ func TestNewWriter(t *testing.T) {
 			return
 		}
 
-		if writer.pos != 16 {
-			t.Errorf("expected pos 16, got %d", writer.pos)
+		if writer.pos != fileMetaInfoHeaderSize {
+			t.Errorf("expected pos %d, got %d", fileMetaInfoHeaderSize, writer.pos)
 		}
 
 		if err := writer.Close(); err != nil {
@@ -89,8 +89,8 @@ func TestNewWriter(t *testing.T) {
 			return
 		}
 
-		if writer.pos != 16 {
-			t.Errorf("expected pos 16, got %d", writer.pos)
+		if writer.pos != fileMetaInfoHeaderSize {
+			t.Errorf("expected pos %d, got %d", fileMetaInfoHeaderSize, writer.pos)
 		}
 
 		if writer.frame != 160 {

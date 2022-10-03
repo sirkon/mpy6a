@@ -102,7 +102,7 @@ func TestReaderWithRawFile(t *testing.T) {
 			512,
 			40,
 			WriterBufferSize(324),
-			WriterPosition(16+prevPos),
+			WriterPosition(fileMetaInfoHeaderSize+prevPos),
 		)
 		if err != nil {
 			testlog.Error(t, errors.Wrap(err, "open reader using existing file"))
@@ -153,7 +153,7 @@ func TestReaderWithRawFile(t *testing.T) {
 			}
 		}
 
-		itr, err := NewReaderInProcess(w, 16)
+		itr, err := NewReaderInProcess(w, fileMetaInfoHeaderSize)
 		if err != nil {
 			testlog.Error(t, errors.Wrap(err, "init active log reader"))
 		}

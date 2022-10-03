@@ -42,6 +42,11 @@ func IndexLess(a, b Index) bool {
 	return a.Index < b.Index
 }
 
+// IndexEqual проверка, что индексы равны.
+func IndexEqual(a, b Index) bool {
+	return a.Term == b.Term && a.Index == b.Index
+}
+
 func (id Index) String() string {
 	return fmt.Sprintf("%016x", id.Term) + "-" + fmt.Sprintf("%016x", id.Index)
 }

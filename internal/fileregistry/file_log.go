@@ -14,7 +14,11 @@ func (l *FileLog) NextRead(c int) {
 }
 
 // NextWrite произошла запись c байт.
-func (l *FileLog) NextWrite(c int) {
+func (l *FileLog) NextWrite(c int, firstID, lastID types.Index) {
+	if l.log.firstID.Term == 0 {
+		l.log.firstID = firstID
+	}
+	l.log.lastID = lastID
 	l.log.write += uint64(c)
 	l.r.stats.TotalSize += uint64(c)
 	l.r.stats.UsedSize += uint64(c)
@@ -28,6 +32,6 @@ func (l *FileLog) Remove(id types.Index) {
 }
 
 // Info возвращаем информацию о текущем файле лога.
-func (l *FileLog) Info() (id types.Index, read uint64, write uint64) {
-	return l.log.id, l.log.read, l.log.write
+func (l *FileLog) Info() (id types.Index, lastID types.Index, firstID types.Index, read uint64, write uint64) {
+	return l.log.id, l.log.firstID, l.log.lastID, l.log.read, l.log.write
 }

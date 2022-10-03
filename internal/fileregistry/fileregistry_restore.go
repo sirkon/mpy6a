@@ -243,6 +243,16 @@ func restoreLog(src Reader) (*logFile, error) {
 		return nil, errors.Wrap(err, "read file id")
 	}
 
+	firstID, err := restoreID(src)
+	if err != nil {
+		return nil, errors.Wrap(err, "read first file id")
+	}
+
+	lastID, err := restoreID(src)
+	if err != nil {
+		return nil, errors.Wrap(err, "read last file id")
+	}
+
 	read, err := restoreUint64(src)
 	if err != nil {
 		return nil, errors.Wrap(err, "read read position")
@@ -254,9 +264,11 @@ func restoreLog(src Reader) (*logFile, error) {
 	}
 
 	res := &logFile{
-		id:    id,
-		read:  read,
-		write: write,
+		id:      id,
+		firstID: firstID,
+		lastID:  lastID,
+		read:    read,
+		write:   write,
 	}
 	return res, nil
 }

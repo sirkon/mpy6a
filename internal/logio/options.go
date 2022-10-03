@@ -31,7 +31,7 @@ func (o writerBufferSize) apply(w *Writer, _ *os.File) error {
 		return errors.Newf("buffer capacity cannot be larger than %d", frameSizeHardLimit)
 	}
 
-	maxRecordLen := 16 + uvarints.LengthInt(w.limit) + w.limit
+	maxRecordLen := fileMetaInfoHeaderSize + uvarints.LengthInt(w.limit) + w.limit
 
 	if int(o) < maxRecordLen*reasonableBufferCapacityInEvents {
 		return errors.Newf(
@@ -58,8 +58,8 @@ func (o writerPos) String() string {
 }
 
 func (o writerPos) apply(w *Writer, file *os.File) error {
-	if uint64(o) < 16 {
-		return errors.Newf("write position cannot be lower than 16").
+	if uint64(o) < fileMetaInfoHeaderSize {
+		return errors.Newf("write position cannot be lower than %d", fileMetaInfoHeaderSize).
 			Uint64("invalid-write-position", uint64(o))
 	}
 

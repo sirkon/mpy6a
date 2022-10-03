@@ -42,7 +42,7 @@ func TestRegistryOps(t *testing.T) {
 					name: "add new log and write + read in it",
 					op: func(r *Registry) {
 						l := r.NewLog(nid)
-						l.NextWrite(5)
+						l.NextWrite(5, types.NewIndex(1, 2), types.NewIndex(1, 2))
 						l.NextRead(3)
 						log = r
 					},
@@ -55,9 +55,11 @@ func TestRegistryOps(t *testing.T) {
 						r.stats.Logs.Count++
 						r.stats.Logs.Size += 5
 						r.logs = append(r.logs, &logFile{
-							id:    nid,
-							read:  3,
-							write: 5,
+							id:      nid,
+							firstID: types.NewIndex(1, 2),
+							lastID:  types.NewIndex(1, 2),
+							read:    3,
+							write:   5,
 						})
 
 						return r
@@ -354,11 +356,13 @@ func TestFileInfosAndStats(t *testing.T) {
 
 	t.Run("log info", func(t *testing.T) {
 		r := sampleRegistry()
-		id, read, write := r.Logs()[0].Info()
+		id, firstID, lastID, read, write := r.Logs()[0].Info()
 
 		l := r.logs[0]
 		const of = "log[0]"
 		checkValue(t, "id", of, l.id, id)
+		checkValue(t, "first id", of, l.firstID, firstID)
+		checkValue(t, "last id", of, l.lastID, lastID)
 		checkValue(t, "read", of, l.read, read)
 		checkValue(t, "write", of, l.write, write)
 	})
@@ -515,9 +519,11 @@ func TestSampleRegistry(t *testing.T) {
 		},
 		logs: []*logFile{
 			{
-				id:    types.NewIndex(2, 1),
-				read:  1,
-				write: 2,
+				id:      types.NewIndex(2, 1),
+				firstID: types.NewIndex(2, 5),
+				lastID:  types.NewIndex(14, 20),
+				read:    1,
+				write:   2,
 			},
 		},
 		snaps: []*snapshotFile{
@@ -561,7 +567,7 @@ func sampleRegistry() *Registry {
 	r := New()
 
 	log := r.NewLog(types.NewIndex(2, 1))
-	log.NextWrite(2)
+	log.NextWrite(2, types.NewIndex(2, 5), types.NewIndex(14, 20))
 	log.NextRead(1)
 
 	snap := r.NewSnapshot(types.NewIndex(3, 1), 2, 3)

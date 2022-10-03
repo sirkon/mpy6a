@@ -44,14 +44,16 @@ func NewReader(name string, limit uint64) (_ *ReadIterator, err error) {
 		},
 		frame: int(frame),
 		limit: int(limit),
-		pos:   16,
+		pos:   fileMetaInfoHeaderSize,
 	}, nil
 }
 
 // NewReaderOffset создаёт итератор для чтения событий начиная с позиции off.
 func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error) {
-	if off < 16 {
-		return nil, errors.Newf("invalid offset value %d", off)
+	if off < fileMetaInfoHeaderSize {
+		return nil, errors.New("invalid offset value").
+			Uint64("invalid-offset-value", off).
+			Int("minimal-offset-value", fileMetaInfoHeaderSize)
 	}
 
 	if off > limit {

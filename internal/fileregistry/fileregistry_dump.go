@@ -182,6 +182,14 @@ func dumpLog(dst io.Writer, l *logFile) error {
 		return errors.Wrap(err, "dump id")
 	}
 
+	if err := dumpID(dst, l.firstID); err != nil {
+		return errors.Wrap(err, "dump first id")
+	}
+
+	if err := dumpID(dst, l.lastID); err != nil {
+		return errors.Wrap(err, "dump last id")
+	}
+
 	if err := dumpUint64(dst, l.read); err != nil {
 		return errors.Wrap(err, "dump read position")
 	}

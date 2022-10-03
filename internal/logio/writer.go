@@ -65,7 +65,7 @@ func NewWriter(
 			return nil, errors.Wrap(err, "open existing file")
 		}
 
-		var buf [16]byte
+		var buf [fileMetaInfoHeaderSize]byte
 		n, err := io.ReadFull(file, buf[:])
 		if n == 0 && err == io.EOF {
 			if err := writeHeader(file, frame, limit); err != nil {
@@ -82,7 +82,7 @@ func NewWriter(
 	res.frame = uint64(frame)
 	res.limit = limit
 	res.zeroes = bytes.Repeat([]byte{0}, eventMayNeed)
-	res.pos = 16
+	res.pos = fileMetaInfoHeaderSize
 
 	for _, opt := range opts {
 		if err := opt.apply(&res, file); err != nil {
@@ -124,8 +124,8 @@ func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 	}
 
 	var deltapos int
-	l := 16 + uvarints.LengthInt(len(data)) + len(data)
-	framerest := int(w.frame - (w.pos-16)%w.frame)
+	l := eventLength(data)
+	framerest := int(w.frame - (w.pos-fileMetaInfoHeaderSize)%w.frame)
 
 	if framerest < l {
 		if framerest > len(w.zeroes) {
@@ -155,6 +155,10 @@ func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 	w.pos += uint64(deltapos)
 
 	return deltapos, nil
+}
+
+func eventLength(data []byte) int {
+	return 16 + uvarints.LengthInt(len(data)) + len(data)
 }
 
 // Flush сброс буфера.
@@ -189,7 +193,7 @@ func (w *Writer) flush() error {
 }
 
 func writeHeader(dst io.WriteCloser, frame, limit int) error {
-	var buf [16]byte
+	var buf [fileMetaInfoHeaderSize]byte
 	binary.LittleEndian.PutUint64(buf[:8], uint64(frame))
 	binary.LittleEndian.PutUint64(buf[8:], uint64(limit))
 	if _, err := dst.Write(buf[:]); err != nil {

@@ -55,9 +55,11 @@ type unusedFile struct {
 }
 
 type logFile struct {
-	id    types.Index
-	read  uint64
-	write uint64
+	id      types.Index
+	lastID  types.Index
+	firstID types.Index
+	read    uint64
+	write   uint64
 }
 
 type snapshotFile struct {
