@@ -94,7 +94,7 @@ root:
 				continue root
 			}
 
-			ppos += uint64(size)
+			ppos += uint64(ssize)
 			if (it.pos-left) >= frame || (frame-ppos+left) < 18 {
 				break
 			}
@@ -104,7 +104,7 @@ root:
 			return types.Index{}, 0, 0, errors.Wrap(err, "iterate over frame")
 		}
 
-		// Все события были меньше, делаем начало центра левым краем
+		// Все события были меньше, делаем центр левым краем
 		left = c
 	}
 }

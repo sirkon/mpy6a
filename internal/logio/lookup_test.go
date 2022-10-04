@@ -51,6 +51,10 @@ func TestLookup(t *testing.T) {
 			eventID: types.NewIndex(1, 499),
 			wantID:  types.NewIndex(1, 498),
 		},
+		{
+			eventID: types.NewIndex(1, 997),
+			wantID:  types.NewIndex(1, 996),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("look for %s", tt.eventID), func(t *testing.T) {

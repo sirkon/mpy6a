@@ -1,5 +1,7 @@
 package storage
 
+import "github.com/sirkon/mpy6a/internal/types"
+
 func newRBTree() *rbTree {
 	return &rbTree{}
 }
@@ -9,12 +11,10 @@ type rbTree struct {
 	size int
 }
 
-type sessionData []byte
-
 // savedSessionsData структура данных сохранённых сессий с повтором в заданное время
 type savedSessionsData struct {
 	Repeat   uint64
-	Sessions []sessionData
+	Sessions []types.Session
 }
 
 // Iter отдача итератора по дереву.
@@ -194,12 +194,12 @@ func (t *rbTree) DeleteSessions(repeat uint64) (deleted bool) {
 }
 
 // SaveSession сохранение сессии.
-func (t *rbTree) SaveSession(repeat uint64, data sessionData) {
+func (t *rbTree) SaveSession(repeat uint64, sess types.Session) {
 	if t.root == nil {
 		t.root = &rbTreeNode{
 			value: &savedSessionsData{
 				Repeat:   repeat,
-				Sessions: []sessionData{data},
+				Sessions: []types.Session{sess},
 			},
 		}
 		t.size = 1
@@ -208,7 +208,7 @@ func (t *rbTree) SaveSession(repeat uint64, data sessionData) {
 
 	p, isRight, alreadyExist := rbTreeLookupForFreeValueParent(t.root, repeat)
 	if alreadyExist {
-		p.value.Sessions = append(p.value.Sessions, data)
+		p.value.Sessions = append(p.value.Sessions, sess)
 		return
 	}
 
@@ -216,7 +216,7 @@ func (t *rbTree) SaveSession(repeat uint64, data sessionData) {
 	n := &rbTreeNode{
 		value: &savedSessionsData{
 			Repeat:   repeat,
-			Sessions: []sessionData{data},
+			Sessions: []types.Session{sess},
 		},
 		parent: p,
 		red:    true,
@@ -365,8 +365,8 @@ func (t *rbTree) deleteFix(p *rbTreeNode, isRight bool) {
 	// Метка поставлена для того, чтобы избежать рекурсивных вызовов.
 	// Можно было бы использовать цикл "пока x != nil", но это порождает
 	// неудобную вложенность, без которой хотелось бы обойтись для лучшей
-	// читаемости случаев, которыми здесь и так всё перегружено, поэтому
-	// просто устанавливаем новые значения x и isRight и переходим на start.
+	// читаемости случаев. Поэтому просто устанавливаем новые значения
+	// x и isRight и переходим на start.
 start:
 
 	if p == nil {
@@ -527,8 +527,8 @@ start:
 
 func (t *rbTree) rebalanceInserted(p *rbTreeNode, n *rbTreeNode) bool {
 	for p.red {
-		// если родитель красный, то это означает, что он не является корнем
-		// дерева, т.к. тот — чёрный, т.е. у него имеется родитель, которого назовём "дедушкой"
+		// Если родитель красный, то это означает, что он не является корнем
+		// дерева, т.к. тот — чёрный, т.е. у него имеется родитель, которого назовём "дедушкой".
 		g, u := p.olderRelatives()
 		if g == nil {
 			// родитель является корнем дерева, снова красим его в чёрный и выходим
@@ -543,7 +543,7 @@ func (t *rbTree) rebalanceInserted(p *rbTreeNode, n *rbTreeNode) bool {
 			p.red = false
 			g.red = true
 
-			// после перекраски дедушки в красный может случиться проблема несоответствия его цвета
+			// После перекраски дедушки в красный может случиться проблема несоответствия его цвета
 			// и цвета его родителя.
 			p = g.parent
 			n = g
