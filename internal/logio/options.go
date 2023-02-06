@@ -3,7 +3,6 @@ package logio
 import (
 	"fmt"
 	"os"
-	"strconv"
 
 	"github.com/sirkon/mpy6a/internal/errors"
 	"github.com/sirkon/mpy6a/internal/uvarints"
@@ -15,9 +14,14 @@ type WriterOption interface {
 	apply(w *Writer, file *os.File) error
 }
 
-// WriterBufferSize задаёт размер буфера в числе .
+// WriterBufferSize задаёт размер буфера в числе.
 func WriterBufferSize(size int) WriterOption {
 	return writerBufferSize(size)
+}
+
+// WriterFileSize задаёт физический размер файла.
+func WriterFileSize(size uint64) WriterOption {
+	return writerFileSize(size)
 }
 
 type writerBufferSize int
@@ -46,26 +50,15 @@ func (o writerBufferSize) apply(w *Writer, _ *os.File) error {
 	return nil
 }
 
-// WriterPosition задаёт позицию записи в файле.
-func WriterPosition(pos uint64) WriterOption {
-	return writerPos(pos)
+type writerFileSize uint64
+
+func (s writerFileSize) String() string {
+	return fmt.Sprintf("force file size to %d", s)
 }
 
-type writerPos uint64
-
-func (o writerPos) String() string {
-	return "set write position to " + strconv.Itoa(int(o))
-}
-
-func (o writerPos) apply(w *Writer, file *os.File) error {
-	if uint64(o) < fileMetaInfoHeaderSize {
-		return errors.Newf("write position cannot be lower than %d", fileMetaInfoHeaderSize).
-			Uint64("invalid-write-position", uint64(o))
-	}
-
-	w.pos = uint64(o)
-	if _, err := file.Seek(int64(o), 0); err != nil {
-		return errors.Wrap(err, "seek to the write position").Uint64("write-position", uint64(o))
+func (s writerFileSize) apply(w *Writer, file *os.File) error {
+	if err := file.Truncate(int64(s)); err != nil {
+		return err
 	}
 
 	return nil

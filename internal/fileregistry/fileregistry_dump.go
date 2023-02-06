@@ -19,262 +19,292 @@ import (
 //  6. Данные файлов слепков.
 //  7. Количество файлов с фиксацией (интервала задержки повтора).
 //  8. Данные файлов с фиксацией.
-func (r *Registry) Dump(dst io.Writer) error {
-	if err := r.dumpUnused(dst); err != nil {
-		return errors.Wrap(err, "dump unused files")
+func (r *Registry) Dump(dst io.Writer) (int, error) {
+	uc, err := r.dumpUnused(dst)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump unused files")
 	}
 
-	if err := r.dumpLogs(dst); err != nil {
-		return errors.Wrap(err, "dump log files")
+	lc, err := r.dumpLogs(dst)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump log files")
 	}
 
-	if err := r.dumpSnapshots(dst); err != nil {
-		return errors.Wrap(err, "dump snapshot files")
+	sc, err := r.dumpSnapshots(dst)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump snapshot files")
 	}
 
-	if err := r.dumpMerges(dst); err != nil {
-		return errors.Wrap(err, "dump merge files")
+	mc, err := r.dumpMerges(dst)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump merge files")
 	}
 
-	if err := r.dumpFixeds(dst); err != nil {
-		return errors.Wrap(err, "dump fixed repeat timeout files")
+	fc, err := r.dumpFixeds(dst)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump fixed repeat timeout files")
 	}
 
-	if err := r.dumpTemporaries(dst); err != nil {
-		return errors.Wrap(err, "dump temporary files")
+	tc, err := r.dumpTemporaries(dst)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump temporary files")
 	}
 
-	return nil
+	return uc + lc + sc + mc + fc + tc, nil
 }
 
-func (r *Registry) dumpUnused(dst io.Writer) error {
+func (r *Registry) dumpUnused(dst io.Writer) (int, error) {
 	l := len(r.unused)
-	if err := dumpCount(dst, l); err != nil {
-		return errors.Wrap(err, "dump files count")
+	res, err := dumpCount(dst, l)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump files count")
 	}
 
 	for i, file := range r.unused {
-		if err := dumpUnusedFile(dst, file); err != nil {
-			return errors.Wrap(err, "dump file descriptor").
+		uc, err := dumpUnusedFile(dst, file)
+		if err != nil {
+			return 0, errors.Wrap(err, "dump file descriptor").
 				Int("unused-file-index", i).
 				Any("unused-file-value", file)
 		}
+		res += uc
 	}
 
-	return nil
+	return res, nil
 }
 
-func (r *Registry) dumpLogs(dst io.Writer) error {
+func (r *Registry) dumpLogs(dst io.Writer) (int, error) {
+
 	l := len(r.logs)
-	if err := dumpCount(dst, l); err != nil {
-		return errors.Wrap(err, "dump files count")
+	res, err := dumpCount(dst, l)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump files count")
 	}
 
 	for i, log := range r.logs {
-		if err := dumpLog(dst, log); err != nil {
-			return errors.Wrap(err, "dump log descriptor").
+		lc, err := dumpLog(dst, log)
+		if err != nil {
+			return 0, errors.Wrap(err, "dump log descriptor").
 				Int("log-file-index", i).
 				Any("log-file-value", log)
 		}
+
+		res += lc
 	}
 
-	return nil
+	return res, nil
 }
 
-func (r *Registry) dumpSnapshots(dst io.Writer) error {
+func (r *Registry) dumpSnapshots(dst io.Writer) (int, error) {
 	l := len(r.snaps)
-	if err := dumpCount(dst, l); err != nil {
-		return errors.Wrap(err, "dump files count")
+	res, err := dumpCount(dst, l)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump files count")
 	}
 
 	for i, snap := range r.snaps {
-		if err := dumpSnapshot(dst, snap); err != nil {
-			return errors.Wrap(err, "dump snapshot descriptor").
+		dc, err := dumpSnapshot(dst, snap)
+		if err != nil {
+			return 0, errors.Wrap(err, "dump snapshot descriptor").
 				Int("snapshot-file-index", i).
 				Any("snapshot-file-value", snap)
 		}
+		res += dc
 	}
 
-	return nil
+	return res, nil
 }
 
-func (r *Registry) dumpMerges(dst io.Writer) error {
+func (r *Registry) dumpMerges(dst io.Writer) (int, error) {
+
 	l := len(r.merges)
-	if err := dumpCount(dst, l); err != nil {
-		return errors.Wrap(err, "dump files count")
+	res, err := dumpCount(dst, l)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump files count")
 	}
 
 	for i, merge := range r.merges {
-		if err := dumpMerge(dst, merge); err != nil {
-			return errors.Wrap(err, "dump merge descriptor").
+		mc, err := dumpMerge(dst, merge)
+		if err != nil {
+			return 0, errors.Wrap(err, "dump merge descriptor").
 				Int("merge-file-index", i).
 				Any("merge-file-value", merge)
 		}
+		res += mc
 	}
 
-	return nil
+	return res, nil
 }
 
-func (r *Registry) dumpFixeds(dst io.Writer) error {
+func (r *Registry) dumpFixeds(dst io.Writer) (int, error) {
 	l := len(r.fixeds)
 
-	if err := dumpCount(dst, l); err != nil {
-		return errors.Wrap(err, "dump files count")
+	res, err := dumpCount(dst, l)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump files count")
 	}
 
 	for i, fixed := range r.fixeds {
-		if err := dumpFixed(dst, fixed); err != nil {
-			return errors.Wrap(err, "dump fixed descriptor").
+		fc, err := dumpFixed(dst, fixed)
+		if err != nil {
+			return 0, errors.Wrap(err, "dump fixed descriptor").
 				Int("fixed-file-index", i).
 				Any("fixed-file-value", fixed)
 		}
+		res += fc
 	}
 
-	return nil
+	return res, nil
 }
 
-func (r *Registry) dumpTemporaries(dst io.Writer) error {
+func (r *Registry) dumpTemporaries(dst io.Writer) (int, error) {
 	l := len(r.tmps)
 
-	if err := dumpCount(dst, l); err != nil {
-		return errors.Wrap(err, "dump files count")
+	res, err := dumpCount(dst, l)
+	if err != nil {
+		return 0, errors.Wrap(err, "dump files count")
 	}
 
 	for i, tmp := range r.tmps {
-		if err := dumpTemporary(dst, tmp); err != nil {
-			return errors.Wrap(err, "dump temporary descriptor").
+		tc, err := dumpTemporary(dst, tmp)
+		if err != nil {
+			return 0, errors.Wrap(err, "dump temporary descriptor").
 				Int("temporary-file-index", i).
 				Any("temporary-file-value", tmp)
 		}
+		res += tc
 	}
 
-	return nil
+	return res, nil
 }
 
-func dumpUnusedFile(dst io.Writer, f unusedFile) error {
+func dumpUnusedFile(dst io.Writer, f unusedFile) (int, error) {
 	if err := dumpInt32(dst, int32(f.typ)); err != nil {
-		return errors.Wrap(err, "dump file type")
+		return 0, errors.Wrap(err, "dump file type")
 	}
 
 	if err := dumpID(dst, f.id); err != nil {
-		return errors.Wrap(err, "dump id")
+		return 0, errors.Wrap(err, "dump id")
 	}
 
 	if err := dumpID(dst, f.lastUsed); err != nil {
-		return errors.Wrap(err, "dump id of removal")
+		return 0, errors.Wrap(err, "dump id of removal")
 	}
 
 	if err := dumpUint64(dst, f.size); err != nil {
-		return errors.Wrap(err, "dump file size")
+		return 0, errors.Wrap(err, "dump file size")
 	}
 
+	res := 44
+
 	if f.typ == fileRegistryUnusedFileTypeFixed {
+		res = 48
 		if err := dumpInt32(dst, f.delay); err != nil {
-			return errors.Wrap(err, "size repeat delay")
+			return 0, errors.Wrap(err, "size repeat delay")
 		}
 	}
 
-	return nil
+	return res, nil
 }
 
-func dumpLog(dst io.Writer, l *logFile) error {
+func dumpLog(dst io.Writer, l *logFile) (int, error) {
 	if err := dumpID(dst, l.id); err != nil {
-		return errors.Wrap(err, "dump id")
+		return 0, errors.Wrap(err, "dump id")
 	}
 
 	if err := dumpID(dst, l.firstID); err != nil {
-		return errors.Wrap(err, "dump first id")
+		return 0, errors.Wrap(err, "dump first id")
 	}
 
 	if err := dumpID(dst, l.lastID); err != nil {
-		return errors.Wrap(err, "dump last id")
+		return 0, errors.Wrap(err, "dump last id")
 	}
 
 	if err := dumpUint64(dst, l.read); err != nil {
-		return errors.Wrap(err, "dump read position")
+		return 0, errors.Wrap(err, "dump read position")
 	}
 
 	if err := dumpUint64(dst, l.write); err != nil {
-		return errors.Wrap(err, "dump size position")
+		return 0, errors.Wrap(err, "dump size position")
 	}
 
-	return nil
+	return 64, nil
 }
 
-func dumpSnapshot(dst io.Writer, s *snapshotFile) error {
+func dumpSnapshot(dst io.Writer, s *snapshotFile) (int, error) {
 	if err := dumpID(dst, s.id); err != nil {
-		return errors.Wrap(err, "dump id")
+		return 0, errors.Wrap(err, "dump id")
 	}
 
 	if err := dumpUint64(dst, s.read); err != nil {
-		return errors.Wrap(err, "dump read position")
+		return 0, errors.Wrap(err, "dump read position")
 	}
 
 	if err := dumpUint64(dst, s.readArea); err != nil {
-		return errors.Wrap(err, "dump total read size")
+		return 0, errors.Wrap(err, "dump total read size")
 	}
 
 	if err := dumpUint64(dst, s.size); err != nil {
-		return errors.Wrap(err, "dump total size")
+		return 0, errors.Wrap(err, "dump total size")
 	}
 
-	return nil
+	return 40, nil
 }
 
-func dumpMerge(dst io.Writer, s *mergeFile) error {
+func dumpMerge(dst io.Writer, s *mergeFile) (int, error) {
 	if err := dumpID(dst, s.id); err != nil {
-		return errors.Wrap(err, "dump id")
+		return 0, errors.Wrap(err, "dump id")
 	}
 
 	if err := dumpUint64(dst, s.read); err != nil {
-		return errors.Wrap(err, "dump read position")
+		return 0, errors.Wrap(err, "dump read position")
 	}
 
 	if err := dumpUint64(dst, s.size); err != nil {
-		return errors.Wrap(err, "dump size")
+		return 0, errors.Wrap(err, "dump size")
 	}
 
-	return nil
+	return 32, nil
 
 }
 
-func dumpFixed(dst io.Writer, f *fixedFile) error {
+func dumpFixed(dst io.Writer, f *fixedFile) (int, error) {
 	if err := dumpID(dst, f.id); err != nil {
-		return errors.Wrap(err, "dump id")
+		return 0, errors.Wrap(err, "dump id")
 	}
 
 	if err := dumpUint64(dst, f.read); err != nil {
-		return errors.Wrap(err, "dump read position")
+		return 0, errors.Wrap(err, "dump read position")
 	}
 
 	if err := dumpUint64(dst, f.write); err != nil {
-		return errors.Wrap(err, "dump size position")
+		return 0, errors.Wrap(err, "dump size position")
 	}
 
 	if err := dumpInt32(dst, f.delay); err != nil {
-		return errors.Wrap(err, "dump repeat delay")
+		return 0, errors.Wrap(err, "dump repeat delay")
 	}
 
-	return nil
+	return 36, nil
 }
 
-func dumpTemporary(dst io.Writer, r *tmpFile) error {
+func dumpTemporary(dst io.Writer, r *tmpFile) (int, error) {
 	if err := dumpID(dst, r.id); err != nil {
-		return errors.Wrap(err, "dump id")
+		return 0, errors.Wrap(err, "dump id")
 	}
 
-	return nil
+	return 16, nil
 }
 
-func dumpCount(dst io.Writer, count int) error {
+func dumpCount(dst io.Writer, count int) (int, error) {
 	var buf [16]byte
 	l := binary.PutUvarint(buf[:], uint64(count))
 
 	if _, err := dst.Write(buf[:l]); err != nil {
-		return err
+		return 0, err
 	}
 
-	return nil
+	return l, nil
 }
 
 func dumpID(dst io.Writer, id types.Index) error {

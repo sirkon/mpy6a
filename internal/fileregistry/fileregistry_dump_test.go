@@ -14,9 +14,13 @@ func TestRegistryDump(t *testing.T) {
 
 	r := sampleRegistry()
 	var buf bytes.Buffer
-	if err := r.Dump(&buf); err != nil {
+	dc, err := r.Dump(&buf)
+	if err != nil {
 		testlog.Error(t, errors.Wrap(err, "dump file registry"))
 		return
+	}
+	if dc != buf.Len() {
+		t.Errorf("expected %d dump length got %d", buf.Len(), dc)
 	}
 
 	for i := 0; i < buf.Len()-1; i++ {
@@ -24,7 +28,7 @@ func TestRegistryDump(t *testing.T) {
 			count: 0,
 			limit: i,
 		}
-		err := r.Dump(&w)
+		_, err := r.Dump(&w)
 		if err == nil {
 			t.Errorf("error was expected on %d bytes write limit with out of %d bytes required", i, buf.Len())
 			return

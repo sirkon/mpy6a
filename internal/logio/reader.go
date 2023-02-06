@@ -13,8 +13,7 @@ import (
 )
 
 // NewReader создаёт итератор для чтения записанных в файл событий из лога.
-// Читать можно только до определённой позиции.
-func NewReader(name string, limit uint64) (_ *ReadIterator, err error) {
+func NewReader(name string) (_ *ReadIterator, err error) {
 	file, err := os.Open(name)
 	if err != nil {
 		return nil, errors.Wrap(err, "open log file")
@@ -30,7 +29,7 @@ func NewReader(name string, limit uint64) (_ *ReadIterator, err error) {
 		}
 	}()
 
-	buf := bufio.NewReader(io.LimitReader(file, int64(limit)))
+	buf := bufio.NewReader(file)
 
 	frame, limit, err := readMetadata(buf)
 	if err != nil {

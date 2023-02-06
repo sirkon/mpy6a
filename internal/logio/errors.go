@@ -10,3 +10,11 @@ type errorEventTooLarge struct {
 func (e errorEventTooLarge) Error() string {
 	return fmt.Sprintf("the event length %d is out of limit of %d bytes", len(e.rec), e.limit)
 }
+
+// ErrorLogIntegrityCompromised возвращается, если в логе найдена какая-то ерунда
+// противоречащая предположениям об его устройстве.
+type ErrorLogIntegrityCompromised struct{}
+
+func (e ErrorLogIntegrityCompromised) Error() string {
+	return "log integrity compromised"
+}

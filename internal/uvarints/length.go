@@ -6,7 +6,7 @@ import (
 	"golang.org/x/exp/constraints"
 )
 
-// Length возвращает длину в uvarint для длинны данного слайса.
+// Length возвращает длину в uvarint для длины данного слайса.
 func Length(v []byte) int {
 	return (bits.Len64(uint64(len(v))) + 6) / 7
 }

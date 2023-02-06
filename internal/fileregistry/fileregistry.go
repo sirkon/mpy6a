@@ -16,13 +16,21 @@ type Registry struct {
 // при первом запуске системы, ну или при запусках когда не было
 // процессов создания слепков.
 func New() *Registry {
-	return &Registry{}
+	return &Registry{
+		stats:  Stats{},
+		unused: []unusedFile{},
+		logs:   []*logFile{},
+		snaps:  []*snapshotFile{},
+		merges: []*mergeFile{},
+		fixeds: []*fixedFile{},
+		tmps:   []*tmpFile{},
+	}
 }
 
 // Clone возвращает копию регистратора данных, которая нужна для создания
 // слепка его данных.
 //
-// WARNING: реализация функция полагается на то, что внутри структур
+// WARNING: реализация функции полагается на то, что внутри структур
 //  нет ссылочных типов и широко применяет копирование. Если в будущем
 //  будут появляться ссылочные типы, то придётся переписывать на ручную
 //  конвертацию.
@@ -50,6 +58,14 @@ func (r *Registry) Logs() []*FileLog {
 	}
 
 	return res
+}
+
+// Log возвращает последний, т.е. активный лог-файл.
+func (r *Registry) Log() *FileLog {
+	return &FileLog{
+		r:   r,
+		log: r.logs[len(r.logs)-1],
+	}
 }
 
 // Snapshots возвращает контроллеры файлов слепков.

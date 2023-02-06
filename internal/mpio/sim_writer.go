@@ -80,6 +80,10 @@ func (w *SimWriter) Write(p []byte) (n int, err error) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 
+	if len(p) > cap(w.buf) {
+		return 0, errWriteDataOvergrowsBuffer(len(p), cap(w.buf))
+	}
+
 	if w.failed.Load() {
 		return 0, errInternal{}
 	}
@@ -98,15 +102,40 @@ func (w *SimWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 
+	rest := w.buf[len(w.buf):]
+	copy(rest[:len(p)], p)
+	w.buf = w.buf[:len(w.buf)+len(p)]
+	atomic.AddInt64(&w.total, int64(len(p)))
+	return len(p), nil
+}
+
+// WriteFA запись данных с гарантиями целостности аналогичными Write.
+// Возвращает флаг того, был ли сделан сброс буфера при записи.
+func (w *SimWriter) WriteFA(p []byte) (flushed bool, err error) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
 	if len(p) > cap(w.buf) {
-		return 0, errWriteDataOvergrowsBuffer(len(p), cap(w.buf))
+		return false, errWriteDataOvergrowsBuffer(len(p), cap(w.buf))
+	}
+
+	if w.failed.Load() {
+		return false, errInternal{}
+	}
+
+	if len(w.buf)+len(p) > cap(w.buf) {
+		if err := w.flush(); err != nil {
+			return false, errors.Wrap(err, "flush buffered data to release buffer")
+		}
+
+		flushed = true
 	}
 
 	rest := w.buf[len(w.buf):]
 	copy(rest[:len(p)], p)
 	w.buf = w.buf[:len(w.buf)+len(p)]
 	atomic.AddInt64(&w.total, int64(len(p)))
-	return len(p), nil
+	return flushed, nil
 }
 
 // Close закрывает файл после сброса буфера.
@@ -135,9 +164,29 @@ func (w *SimWriter) Flush() error {
 	return w.flush()
 }
 
+// Name возврат имени файла.
+func (w *SimWriter) Name() string {
+	return w.file.Name()
+}
+
 // Size возврат текущего размера файла.
 func (w *SimWriter) Size() int64 {
 	return w.total
+}
+
+// Lock для реализации sync.Locker.
+func (w *SimWriter) Lock() {
+	w.lock.Lock()
+}
+
+// Unlock для реализации sync.Locker.
+func (w *SimWriter) Unlock() {
+	w.lock.Unlock()
+}
+
+// Buf возвращает текущий буфер.
+func (w *SimWriter) Buf() []byte {
+	return w.buf
 }
 
 func (w *SimWriter) flush() error {

@@ -154,13 +154,6 @@ func TestNewWriter(t *testing.T) {
 				opts:  nil,
 			},
 			{
-				name:  "invalid position",
-				file:  filename,
-				frame: 512,
-				limit: 40,
-				opts:  []WriterOption{WriterPosition(2)},
-			},
-			{
 				name:  "buffer size is too small",
 				file:  filename,
 				frame: 512,

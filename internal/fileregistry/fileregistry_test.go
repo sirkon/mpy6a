@@ -42,7 +42,7 @@ func TestRegistryOps(t *testing.T) {
 					name: "add new log and write + read in it",
 					op: func(r *Registry) {
 						l := r.NewLog(nid)
-						l.NextWrite(5, types.NewIndex(1, 2), types.NewIndex(1, 2))
+						l.NextWrite(5, types.NewIndex(1, 2))
 						l.NextRead(3)
 						log = r
 					},
@@ -460,7 +460,7 @@ func TestRegistryDumpRestore(t *testing.T) {
 
 	r := sampleRegistry()
 
-	if err := r.Dump(&buf); err != nil {
+	if _, err := r.Dump(&buf); err != nil {
 		testlog.Error(t, errors.Wrap(err, "dump file registry"))
 		return
 	}
@@ -567,7 +567,7 @@ func sampleRegistry() *Registry {
 	r := New()
 
 	log := r.NewLog(types.NewIndex(2, 1))
-	log.NextWrite(2, types.NewIndex(2, 5), types.NewIndex(14, 20))
+	log.NextWrite(2, types.NewIndex(14, 20))
 	log.NextRead(1)
 
 	snap := r.NewSnapshot(types.NewIndex(3, 1), 2, 3)

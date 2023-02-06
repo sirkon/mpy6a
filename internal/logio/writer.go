@@ -77,8 +77,18 @@ func NewWriter(
 			frame = int(binary.LittleEndian.Uint64(buf[:8]))
 			limit = int(binary.LittleEndian.Uint64(buf[8:]))
 		}
+
+		stat, err := file.Stat()
+		if err != nil {
+			return nil, errors.Wrap(err, "get existing file stats")
+		}
+
+		if _, err := file.Seek(stat.Size(), 0); err != nil {
+			return nil, errors.Wrap(err, "seek to the file end")
+		}
 	}
 
+	res.buf = &bytes.Buffer{}
 	res.frame = uint64(frame)
 	res.limit = limit
 	res.zeroes = bytes.Repeat([]byte{0}, eventMayNeed)
@@ -106,6 +116,7 @@ func NewWriter(
 // Writer писалка логов.
 type Writer struct {
 	dst    *mpio.SimWriter
+	buf    *bytes.Buffer
 	zeroes []byte
 
 	frame   uint64
@@ -115,6 +126,7 @@ type Writer struct {
 }
 
 // WriteEvent запись события с данным идентификатором.
+// Возвращает смещение в файле, которое было произведено во время записи.
 func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 	if len(data) > w.limit {
 		return 0, errorEventTooLarge{
@@ -141,15 +153,14 @@ func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 	// Сериализация и запись в лог идентификатора и события.
 	var buf [16]byte
 	types.IndexEncode(buf[:], id)
-	if _, err := w.dst.Write(buf[:]); err != nil {
-		return 0, errors.Wrap(err, "push encoded id")
-	}
+	w.buf.Reset()
+	w.buf.Write(buf[:])
 	ll := binary.PutUvarint(buf[:], uint64(len(data)))
-	if _, err := w.dst.Write(buf[:ll]); err != nil {
-		return 0, errors.Wrap(err, "push data length")
-	}
-	if _, err := w.dst.Write(data); err != nil {
-		return 0, errors.Wrap(err, "push data")
+	w.buf.Write(buf[:ll])
+	w.buf.Write(data)
+
+	if _, err := w.dst.WriteFA(w.buf.Bytes()); err != nil {
+		return 0, errors.Wrap(err, "push encoded event data")
 	}
 	deltapos += l
 	w.pos += uint64(deltapos)
@@ -170,17 +181,27 @@ func (w *Writer) Flush() error {
 	return nil
 }
 
+// LookupNext поиск события следующего за данным.
+func (w *Writer) LookupNext(id types.Index, logger func(err error)) (LookupResult, error) {
+	if err := w.dst.Flush(); err != nil {
+		// Так как искомые данные могут находиться не в файле, а в буфере.
+		// Пока полагаемся на то, что данная операция (поиска) не будет частой,
+		// особенно в случае сброса с синхронизацией, которая ну никак
+		// не блещет скоростью.
+		return nil, errors.Wrap(err, "flush existing data")
+	}
+
+	res, err := LookupNext(w.dst.Name(), id, logger)
+	if err != nil {
+		return nil, errors.Wrap(err, "look for the next event in the file")
+	}
+
+	return res, nil
+}
+
 // Close закрытие записи лога.
 func (w *Writer) Close() error {
-	if err := w.flush(); err != nil {
-		return errors.Wrap(err, "flush buffer")
-	}
-
-	if err := w.dst.Close(); err != nil {
-		return errors.Wrap(err, "close writer")
-	}
-
-	return nil
+	return w.dst.Close()
 }
 
 // Pos текущая позиция записи в файл.
@@ -189,7 +210,11 @@ func (w *Writer) Pos() uint64 {
 }
 
 func (w *Writer) flush() error {
-	return w.dst.Flush()
+	if err := w.dst.Flush(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func writeHeader(dst io.WriteCloser, frame, limit int) error {
