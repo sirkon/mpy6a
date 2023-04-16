@@ -91,6 +91,11 @@ func TestReaderWithRawFile(t *testing.T) {
 		if err != nil {
 			testlog.Error(t, errors.Wrap(err, "init active log reader"))
 		}
+		defer func() {
+			if err := itr.Close(); err != nil {
+				testlog.Error(t, err)
+			}
+		}()
 
 		for itr.Next() {
 			eventID, eventData, size := itr.Event()

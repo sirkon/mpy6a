@@ -34,7 +34,7 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 		return nil, errors.Wrap(ErrorLogIntegrityCompromised{}, "no events in the file")
 	}
 
-	frame, limit, err := readMmapedFileHeader(file)
+	frame, evlim, err := readMmapedFileHeader(file)
 	if err != nil {
 		return nil, errors.Wrap(err, "read file metadata")
 	}
@@ -72,7 +72,7 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 			// Искомое событие располагается прямо в начале кадра, нужно пропустить его.
 			// Читаем такое количество в байт, в которых гарантированно поместится как
 			// само событие, так и идентификатор следующего.
-			buf := make([]byte, uvarints.LengthInt(limit)+int(limit)+16)
+			buf := make([]byte, uvarints.LengthInt(evlim)+int(evlim)+16)
 			n, err := file.ReadAt(buf, int64(pos)+16)
 			if err != nil {
 				if err != io.EOF || n <= 0 {
@@ -210,14 +210,14 @@ func readMmapedFileHeader(file *mmap.ReaderAt) (frame uint64, limit uint64, err 
 			Uint64("invalid-frame-size", frame)
 	}
 	if frame < limit {
-		return 0, 0, errors.New("frame cannot be smaller than a limit").
+		return 0, 0, errors.New("frame cannot be smaller than a evlim").
 			Uint64("frame-size", frame).
-			Uint64("limit-size", limit)
+			Uint64("evlim-size", limit)
 	}
 	if limit < 18 {
-		return 0, 0, errors.New("event data limit is too small").
-			Uint64("invalid-limit", limit).
-			Int("least-limit", 18)
+		return 0, 0, errors.New("event data evlim is too small").
+			Uint64("invalid-evlim", limit).
+			Int("least-evlim", 18)
 	}
 
 	return frame, limit, nil

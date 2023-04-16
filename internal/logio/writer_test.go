@@ -97,8 +97,8 @@ func TestNewWriter(t *testing.T) {
 			t.Errorf("expected 160 frame len, got %d", writer.frame)
 		}
 
-		if writer.limit != 20 {
-			t.Errorf("expected 20 limit len, got %d", writer.limit)
+		if writer.evlim != 20 {
+			t.Errorf("expected 20 evlim len, got %d", writer.evlim)
 		}
 
 		if err := writer.Close(); err != nil {
@@ -133,14 +133,14 @@ func TestNewWriter(t *testing.T) {
 				opts:  nil,
 			},
 			{
-				name:  "limit is larger than a frame",
+				name:  "evlim is larger than a frame",
 				file:  filename,
 				frame: 512,
 				limit: 513,
 				opts:  nil,
 			},
 			{
-				name:  "limit is too small",
+				name:  "evlim is too small",
 				file:  filename,
 				frame: 512,
 				limit: 5,

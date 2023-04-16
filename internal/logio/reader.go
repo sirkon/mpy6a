@@ -31,7 +31,7 @@ func NewReader(name string) (_ *ReadIterator, err error) {
 
 	buf := bufio.NewReader(file)
 
-	frame, limit, err := readMetadata(buf)
+	frame, evlim, err := readMetadata(buf)
 	if err != nil {
 		return nil, errors.Wrap(err, "load file metadata")
 	}
@@ -42,7 +42,7 @@ func NewReader(name string) (_ *ReadIterator, err error) {
 			src: file,
 		},
 		frame: int(frame),
-		limit: int(limit),
+		evlim: int(evlim),
 		pos:   fileMetaInfoHeaderSize,
 	}, nil
 }
@@ -56,7 +56,7 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 	}
 
 	if off > limit {
-		return nil, errors.Wrap(err, "limit cannot be lower than offset")
+		return nil, errors.Wrap(err, "evlim cannot be lower than offset")
 	}
 
 	file, err := os.Open(name)
@@ -90,7 +90,7 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 			src: file,
 		},
 		frame: int(frame),
-		limit: int(limit),
+		evlim: int(limit),
 		pos:   off,
 	}, nil
 }
@@ -103,7 +103,7 @@ func NewReaderInProcess(w *Writer, off uint64) (*ReadIterator, error) {
 		return nil, errors.Wrap(err, "create log file reader")
 	}
 
-	frame, limit, err := readMetadata(r)
+	frame, evlim, err := readMetadata(r)
 	if err != nil {
 		return nil, errors.Wrap(err, "read log file metadata")
 	}
@@ -115,7 +115,7 @@ func NewReaderInProcess(w *Writer, off uint64) (*ReadIterator, error) {
 	res := &ReadIterator{
 		src:   r,
 		frame: int(frame),
-		limit: int(limit),
+		evlim: int(evlim),
 		pos:   off,
 	}
 	return res, nil
@@ -134,7 +134,7 @@ type logReader interface {
 type ReadIterator struct {
 	src   logReader
 	frame int
-	limit int
+	evlim int
 	pos   uint64
 
 	id    types.Index
@@ -261,29 +261,29 @@ func (it *ReadIterator) frameRest() int {
 	return v
 }
 
-func readMetadata(buf io.Reader) (frame uint64, limit uint64, err error) {
+func readMetadata(buf io.Reader) (frame uint64, evlim uint64, err error) {
 	var tmp [16]byte
 	if _, err := mpio.TryReadFull(buf, tmp[:]); err != nil {
 		return 0, 0, errors.Wrap(err, "read metadata")
 	}
 
 	frame = binary.LittleEndian.Uint64(tmp[:8])
-	limit = binary.LittleEndian.Uint64(tmp[8:])
+	evlim = binary.LittleEndian.Uint64(tmp[8:])
 
 	if frame > frameSizeHardLimit {
 		return 0, 0, errors.New("invalid frame size").
 			Uint64("invalid-frame-size", frame)
 	}
-	if frame < limit {
-		return 0, 0, errors.New("frame cannot be smaller than a limit").
+	if frame < evlim {
+		return 0, 0, errors.New("frame cannot be smaller than an event evlim").
 			Uint64("frame-size", frame).
-			Uint64("limit-size", limit)
+			Uint64("event-evlim-size", evlim)
 	}
-	if limit < 18 {
-		return 0, 0, errors.New("limit is too small").
-			Uint64("invalid-limit", limit).
-			Int("least-limit", 18)
+	if evlim < 18 {
+		return 0, 0, errors.New("event evlim is too small").
+			Uint64("invalid-evlim", evlim).
+			Int("least-event-evlim", 18)
 	}
 
-	return frame, limit, nil
+	return frame, evlim, nil
 }

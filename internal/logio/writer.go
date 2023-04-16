@@ -18,16 +18,16 @@ import (
 //
 //   - name имя файла. Если он уже существует, то будет переоткрыт на чтение и запись.
 //   - frame размер кадра. Если файл существует, то этот параметр будет взят из файла.
-//   - limit максимальная длина данных события.
+//   - evlim максимальная длина данных события.
 func NewWriter(
 	name string,
 	frame int,
-	limit int,
+	evlim int,
 	opts ...WriterOption,
 ) (*Writer, error) {
-	eventMayNeed := 16 + uvarints.LengthInt(limit) + limit
+	eventMayNeed := 16 + uvarints.LengthInt(evlim) + evlim
 	if frame < eventMayNeed {
-		return nil, errors.Newf("frame is not sufficient to hold every event with the current limit").
+		return nil, errors.Newf("frame is not sufficient to hold every event with the current evlim").
 			Int("frame-size", frame).
 			Int("event-space", eventMayNeed)
 	}
@@ -36,10 +36,10 @@ func NewWriter(
 			Int("frame-size", frame).
 			Int("maximal-frame-size", frameSizeHardLimit)
 	}
-	if limit < 18 {
-		return nil, errors.Newf("limit is too low").
-			Int("least-limit", 18).
-			Int("limit", limit)
+	if evlim < 18 {
+		return nil, errors.Newf("evlim is too low").
+			Int("least-evlim", 18).
+			Int("evlim", evlim)
 	}
 
 	var file *os.File
@@ -51,18 +51,18 @@ func NewWriter(
 			return nil, errors.Wrap(err, "test existing file")
 		}
 
-		// Файла не существует, создаём новый и пишем frame, limit в его начале.
+		// Файла не существует, создаём новый и пишем frame, evlim в его начале.
 		file, err = os.OpenFile(name, os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return nil, errors.Wrap(err, "create new file")
 		}
 
-		if err := writeHeader(file, frame, limit); err != nil {
+		if err := writeHeader(file, frame, evlim); err != nil {
 			return nil, errors.Wrap(err, "write header into a new file")
 		}
 
 	} else {
-		// Файл существует, читаем параметры frame и limit из него.
+		// Файл существует, читаем параметры frame и evlim из него.
 		file, err = os.OpenFile(name, os.O_RDWR, 0644)
 		if err != nil {
 			return nil, errors.Wrap(err, "open existing file")
@@ -71,14 +71,14 @@ func NewWriter(
 		var buf [fileMetaInfoHeaderSize]byte
 		n, err := io.ReadFull(file, buf[:])
 		if n == 0 && err == io.EOF {
-			if err := writeHeader(file, frame, limit); err != nil {
+			if err := writeHeader(file, frame, evlim); err != nil {
 				return nil, errors.Wrap(err, "write header into an existing empty file")
 			}
 		} else if err != nil {
 			return nil, errors.Wrap(err, "read header of an existing file")
 		} else {
 			frame = int(binary.LittleEndian.Uint64(buf[:8]))
-			limit = int(binary.LittleEndian.Uint64(buf[8:]))
+			evlim = int(binary.LittleEndian.Uint64(buf[8:]))
 		}
 
 		stat, err := file.Stat()
@@ -99,7 +99,7 @@ func NewWriter(
 
 	res.buf = &bytes.Buffer{}
 	res.frame = uint64(frame)
-	res.limit = limit
+	res.evlim = evlim
 	res.zeroes = bytes.Repeat([]byte{0}, eventMayNeed)
 	res.pos = fileMetaInfoHeaderSize
 
@@ -185,7 +185,7 @@ type Writer struct {
 	wtnid  types.IndexAtomic
 
 	frame   uint64
-	limit   int
+	evlim   int
 	pos     uint64
 	lastid  types.Index
 	bufsize int
@@ -194,9 +194,9 @@ type Writer struct {
 // WriteEvent запись события с данным идентификатором.
 // Возвращает смещение в файле, которое было произведено во время записи.
 func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
-	if len(data) > w.limit {
+	if len(data) > w.evlim {
 		return 0, errorEventTooLarge{
-			limit: w.limit,
+			evlim: w.evlim,
 			rec:   data,
 		}
 	}

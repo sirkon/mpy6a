@@ -35,7 +35,7 @@ func (o writerBufferSize) apply(w *Writer, _ *os.File) error {
 		return errors.Newf("buffer capacity cannot be larger than %d", frameSizeHardLimit)
 	}
 
-	maxRecordLen := fileMetaInfoHeaderSize + uvarints.LengthInt(w.limit) + w.limit
+	maxRecordLen := fileMetaInfoHeaderSize + uvarints.LengthInt(w.evlim) + w.evlim
 
 	if int(o) < maxRecordLen*reasonableBufferCapacityInEvents {
 		return errors.Newf(
@@ -58,7 +58,11 @@ func (s writerFileSize) String() string {
 
 func (s writerFileSize) apply(w *Writer, file *os.File) error {
 	if err := file.Truncate(int64(s)); err != nil {
-		return err
+		return errors.Wrapf(err, "force file size to %d", s)
+	}
+
+	if _, err := file.Seek(0, 2); err != nil {
+		return errors.Wrap(err, "seek to the end of file")
 	}
 
 	return nil
