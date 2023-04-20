@@ -56,7 +56,9 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 	}
 
 	if off > limit {
-		return nil, errors.Wrap(err, "evlim cannot be lower than offset")
+		return nil, errors.New("file size limit cannot be lower than the offset").
+			Uint64("offset", off).
+			Uint64("limit", limit)
 	}
 
 	file, err := os.Open(name)
@@ -74,7 +76,7 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 		}
 	}()
 
-	frame, limit, err := readMetadata(file)
+	frame, evlim, err := readMetadata(file)
 	if err != nil {
 		return nil, errors.Wrap(err, "load file metadata")
 	}
@@ -90,7 +92,7 @@ func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error
 			src: file,
 		},
 		frame: int(frame),
-		evlim: int(limit),
+		evlim: int(evlim),
 		pos:   off,
 	}, nil
 }

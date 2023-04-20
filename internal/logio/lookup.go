@@ -50,7 +50,7 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 
 	var higherFrameID types.Index
 	for rightFrame-left > 1 {
-		c := (rightFrame - left) / 2
+		c := left + (rightFrame-left)/2
 		pos := c*frame + fileMetaInfoHeaderSize
 
 		var buf [16]byte
@@ -142,7 +142,7 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 		switch types.IndexCmp(cid, id) {
 		case -1:
 			// Событие предшествует искомому, переходим к вычитке данных следующего.
-			eventLen, _, err := uvarints.Read(buf)
+			eventLen, _, err := uvarints.Read(buf[16:])
 			if err != nil {
 				return nil, errors.Wrap(err, "read event data length").
 					Uint64("frame-no", left).
@@ -158,7 +158,7 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 			continue
 		case 0:
 			// Событие найдено, нужно определить позицию следующего.
-			eventLen, _, err := uvarints.Read(buf)
+			eventLen, _, err := uvarints.Read(buf[16:])
 			if err != nil {
 				return nil, errors.Wrap(err, "read the event data length").
 					Uint64("frame-no", left).
@@ -170,7 +170,11 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 			cid := types.IndexDecodeSafe(buf)
 			if cid.Term == 0 {
 				// Т.е. мы дошли до последнего события в кадре. Следующее событие лежит
-				// в следующем кадре.
+				// в следующем кадре, либо его нет вообще.
+				pos := (left+1)*frame + fileMetaInfoHeaderSize
+				if pos >= uint64(file.Len()) {
+					return LookupResultFound(-1), nil
+				}
 				return LookupResultFound((left+1)*frame + fileMetaInfoHeaderSize), nil
 			}
 
@@ -223,33 +227,33 @@ func readMmapedFileHeader(file *mmap.ReaderAt) (frame uint64, limit uint64, err 
 	return frame, limit, nil
 }
 
-// LookupResult defines constraints for lookup result.
+// LookupResult обёртка для результата поиска.
 type LookupResult interface {
 	isLookupResult()
 }
 
-// LookupResultFound returned for the exact match.
-// The returned uint64 value points to the offset of the
-// next event data after the requested one. Will be
-// negative if the requested event is the last in the file.
-type LookupResultFound uint64
+// LookupResultFound возвращается когда искомое событие было найдено.
+// Значение содержит смещение в файле для следующего за данным событие,
+// кроме случая когда само событие является последним в файле – в этом
+// случае значение отрицательное.
+type LookupResultFound int64
 
-// Uint64 offset value.
-func (v LookupResultFound) Uint64() uint64 {
-	return uint64(v)
+// Int64 значение смещения.
+func (v LookupResultFound) Int64() int64 {
+	return int64(v)
 }
 
 func (LookupResultFound) isLookupResult() {}
 
-// LookupResultIsMissing returned when no element was
-// found yet there are elements having lower id than
-// requested.
+// LookupResultIsMissing возвращается когда событие найдено не было,
+// но имеются события предшествующие данному и, быть может,
+// события произошедшие после данного.
 type LookupResultIsMissing struct {
-	// LastBeforeID the index of the furthest event before the requested.
+	// LastBeforeID последнее событие перед данным.
 	LastBeforeID     types.Index
 	LastBeforeOffset uint64
 
-	// NextID the index of the first event after the "last before".
+	// NextID первое событие после данного.
 	NextID     types.Index
 	NextOffset uint64
 }

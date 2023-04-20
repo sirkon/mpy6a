@@ -192,7 +192,7 @@ type Writer struct {
 }
 
 // WriteEvent запись события с данным идентификатором.
-// Возвращает смещение в файле, которое было произведено во время записи.
+// Возвращает размер всех записанных данных.
 func (w *Writer) WriteEvent(id types.Index, data []byte) (int, error) {
 	if len(data) > w.evlim {
 		return 0, errorEventTooLarge{

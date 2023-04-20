@@ -2,6 +2,7 @@ package errors
 
 import (
 	"fmt"
+	"reflect"
 	"runtime"
 	"strconv"
 )
@@ -233,6 +234,19 @@ func (e Error) Any(name string, value interface{}) Error {
 		ctx: append(e.ctx, contextTuple{
 			name:  e.ctxPrefix + name,
 			value: value,
+		}),
+	}
+}
+
+// Type adds type name into the context
+func (e Error) Type(name string, v any) Error {
+	return Error{
+		msg:       e.msg,
+		err:       e.err,
+		ctxPrefix: e.ctxPrefix,
+		ctx: append(e.ctx, contextTuple{
+			name:  e.ctxPrefix + name,
+			value: reflect.TypeOf(v).String(),
 		}),
 	}
 }
