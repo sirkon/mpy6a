@@ -73,6 +73,7 @@ func TestReaderWithRawFile(t *testing.T) {
 
 	t.Run("read-active", func(t *testing.T) {
 		const name = "testdata/active-log"
+		_ = os.RemoveAll(name)
 
 		w, err := NewWriter(name, 512, 40, WriterBufferSize(324))
 		if err != nil {

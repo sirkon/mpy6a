@@ -65,5 +65,7 @@ func (s writerFileSize) apply(w *Writer, file *os.File) error {
 		return errors.Wrap(err, "seek to the end of file")
 	}
 
+	w.pos = uint64(s)
+
 	return nil
 }

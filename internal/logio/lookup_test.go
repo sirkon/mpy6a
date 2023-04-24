@@ -169,6 +169,20 @@ func TestLookup(t *testing.T) {
 				return
 
 			case *LookupResultIsMissing:
+				if err := checkNextEvent(t, v.LastBeforeOffset, &v.LastBeforeID); err != nil {
+					testlog.Error(t, errors.Wrap(err, "check previous event position"))
+					return
+				} else {
+					t.Log("previous event position checked out")
+				}
+				if v.NextID.Term != 0 {
+					if err := checkNextEvent(t, v.NextOffset, &v.NextID); err != nil {
+						testlog.Error(t, errors.Wrap(err, "check next event position"))
+						return
+					}
+					t.Log("next event position checked out")
+				}
+
 				if !types.IndexEqual(v.LastBeforeID, *tt.prev) {
 					testlog.Error(
 						t,

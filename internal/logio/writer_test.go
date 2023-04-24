@@ -2,10 +2,12 @@ package logio
 
 import (
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/sirkon/mpy6a/internal/errors"
 	"github.com/sirkon/mpy6a/internal/testlog"
+	"github.com/sirkon/mpy6a/internal/types"
 )
 
 // Три сценария открытия писалки:
@@ -104,6 +106,85 @@ func TestNewWriter(t *testing.T) {
 		if err := writer.Close(); err != nil {
 			testlog.Error(t, errors.Wrap(err, "close reopened writer"))
 			return
+		}
+	})
+
+	t.Run("reopen-writer", func(t *testing.T) {
+		const name = "testdata/active-log-reopen"
+		_ = os.RemoveAll(name)
+
+		w, err := NewWriter(name, 512, 40, WriterBufferSize(324))
+		if err != nil {
+			testlog.Error(t, errors.Wrap(err, "create first writer"))
+			return
+		}
+
+		for i := 0; i < 40; i++ {
+			if _, err := w.WriteEvent(types.NewIndex(1, uint64(i)), []byte(strconv.Itoa(i))); err != nil {
+				testlog.Error(t, errors.Wrap(err, "write event").Int("event", i))
+				return
+			}
+		}
+
+		if err := w.Close(); err != nil {
+			testlog.Error(t, errors.Wrap(err, "close first writer"))
+		}
+
+		w, err = NewWriter(name, 512, 40, WriterBufferSize(324))
+		if err != nil {
+			testlog.Error(t, errors.Wrap(err, "open the same writer second time"))
+			return
+		}
+
+		for i := 40; i < 50; i++ {
+			if _, err := w.WriteEvent(types.NewIndex(1, uint64(i)), []byte(strconv.Itoa(i))); err != nil {
+				testlog.Error(t, errors.Wrap(err, "write event of the second batch").Int("event", i))
+				return
+			}
+		}
+
+		r, err := NewReaderInProcess(w, 16)
+		if err != nil {
+			testlog.Error(t, errors.Wrap(err, "create reader over the write"))
+		}
+
+		var i int
+		for r.Next() {
+			id, data, _ := r.Event()
+			wantID := types.NewIndex(1, uint64(i))
+			if !types.IndexEqual(id, wantID) {
+				testlog.Error(
+					t,
+					errors.New("unexpected event id").
+						Stg("expected-id", wantID).
+						Stg("actual-id", id),
+				)
+			}
+			wantData := strconv.Itoa(i)
+			if string(data) != wantData {
+				testlog.Error(
+					t,
+					errors.New("unexpected event data").
+						Any("expected-data", []byte(wantData)).
+						Any("actual-data", data),
+				)
+			}
+			i++
+		}
+		if i != 50 {
+			testlog.Error(
+				t,
+				errors.New("not enough events on iteration").
+					Int("events-count-expected", 50).
+					Int("events-count-actual", i),
+			)
+		}
+		if err := r.Err(); err != nil {
+			testlog.Error(t, errors.Wrap(err, "iterate over events"))
+		}
+
+		if err := w.Close(); err != nil {
+			testlog.Error(t, errors.Wrap(err, "close second writer"))
 		}
 	})
 

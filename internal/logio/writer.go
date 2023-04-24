@@ -16,7 +16,7 @@ import (
 // NewWriter конструктор новой писалки в файл.
 // Параметры:
 //
-//   - name имя файла. Если он уже существует, то будет переоткрыт на чтение и запись.
+//   - name имя файла. Если он уже существует, то будет переоткрыт.
 //   - frame размер кадра. Если файл существует, то этот параметр будет взят из файла.
 //   - evlim максимальная длина данных события.
 func NewWriter(
@@ -60,6 +60,7 @@ func NewWriter(
 		if err := writeHeader(file, frame, evlim); err != nil {
 			return nil, errors.Wrap(err, "write header into a new file")
 		}
+		res.pos = fileMetaInfoHeaderSize
 
 	} else {
 		// Файл существует, читаем параметры frame и evlim из него.
@@ -95,13 +96,14 @@ func NewWriter(
 		if _, err := file.Seek(stat.Size(), 0); err != nil {
 			return nil, errors.Wrap(err, "seek to the file end")
 		}
+
+		res.pos = uint64(stat.Size())
 	}
 
 	res.buf = &bytes.Buffer{}
 	res.frame = uint64(frame)
 	res.evlim = evlim
 	res.zeroes = bytes.Repeat([]byte{0}, eventMayNeed)
-	res.pos = fileMetaInfoHeaderSize
 
 	for _, opt := range opts {
 		if err := opt.apply(&res, file); err != nil {
@@ -132,11 +134,14 @@ func readLastEventID(file *os.File, stat os.FileInfo, frame int) (id types.Index
 	// Нам нужно узнать индекс последней записи.
 
 	diff := stat.Size() - fileMetaInfoHeaderSize
-	if diff%int64(frame) == 0 {
+	if diff%int64(frame) == 0 && diff > 0 {
+		// Т.к. нам нужно указывать на "внутренность" последнего кадра.
+		// Иначе, если последний кадр был полностью заполнен, мы получим
+		// ссылку на следующий кадр, который ещё не заполнялся.
 		diff--
 	}
 	off := (diff / int64(frame)) * int64(frame)
-	if _, err := file.Seek(off, 0); err != nil {
+	if _, err := file.Seek(off+fileMetaInfoHeaderSize, 0); err != nil {
 		return id, errors.Wrap(err, "seek to the start")
 	}
 
@@ -172,7 +177,9 @@ func readLastEventID(file *os.File, stat os.FileInfo, frame int) (id types.Index
 		}
 
 		if _, err := bufrdr.Discard(int(length)); err != nil {
-			return id, errors.Wrap(err, "skip encoded content of the event").Stg("invalid-event-id", id)
+			return id, errors.Wrap(err, "skip encoded content of the event").
+				Stg("invalid-event-id", id).
+				Uint64("skip-size", length)
 		}
 	}
 }
