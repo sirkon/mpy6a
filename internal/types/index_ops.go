@@ -13,6 +13,13 @@ func IndexEncode(buf []byte, id Index) {
 	binary.LittleEndian.PutUint64(buf[8:], id.Index)
 }
 
+// IndexEncodeAppend сериализация индекса с поддержкой Append-протокола.
+func IndexEncodeAppend(buf []byte, id Index) []byte {
+	buf = binary.LittleEndian.AppendUint64(buf, id.Term)
+	buf = binary.LittleEndian.AppendUint64(buf, id.Index)
+	return buf
+}
+
 // IndexDecode десериализация индекса.
 // Внимание: размер буфера не проверяется и в случаем размера меньшего 16 байт
 // будет паника.
