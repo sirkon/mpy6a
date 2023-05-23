@@ -13,7 +13,7 @@ import (
 )
 
 // NewReader создаёт итератор для чтения записанных в файл событий из лога.
-func NewReader(name string) (_ *ReadIterator, err error) {
+func NewReader(name string, opts ...ReaderOption) (_ *ReadIterator, err error) {
 	file, err := os.Open(name)
 	if err != nil {
 		return nil, errors.Wrap(err, "open log file")
@@ -36,7 +36,7 @@ func NewReader(name string) (_ *ReadIterator, err error) {
 		return nil, errors.Wrap(err, "load file metadata")
 	}
 
-	return &ReadIterator{
+	res := &ReadIterator{
 		src: &fileBuf{
 			buf: buf,
 			src: file,
@@ -44,62 +44,17 @@ func NewReader(name string) (_ *ReadIterator, err error) {
 		frame: int(frame),
 		evlim: int(evlim),
 		pos:   fileMetaInfoHeaderSize,
-	}, nil
-}
-
-// NewReaderOffset создаёт итератор для чтения событий начиная с позиции off.
-func NewReaderOffset(name string, off, limit uint64) (_ *ReadIterator, err error) {
-	if off < fileMetaInfoHeaderSize {
-		return nil, errors.New("invalid offset value").
-			Uint64("invalid-offset-value", off).
-			Int("minimal-offset-value", fileMetaInfoHeaderSize)
+	}
+	if err := res.applyOptions(opts...); err != nil {
+		return nil, errors.Wrap(err, "apply options")
 	}
 
-	if off > limit {
-		return nil, errors.New("file size limit cannot be lower than the offset").
-			Uint64("offset", off).
-			Uint64("limit", limit)
-	}
-
-	file, err := os.Open(name)
-	if err != nil {
-		return nil, errors.Wrap(err, "open log file")
-	}
-
-	defer func() {
-		if err == nil {
-			return
-		}
-
-		if cErr := file.Close(); cErr != nil {
-			panic(errors.Wrap(err, "close file after processing failure"))
-		}
-	}()
-
-	frame, evlim, err := readMetadata(file)
-	if err != nil {
-		return nil, errors.Wrap(err, "load file metadata")
-	}
-
-	if _, err := file.Seek(int64(off), 0); err != nil {
-		return nil, errors.Wrap(err, "seek to the given offset")
-	}
-	buf := bufio.NewReader(io.LimitReader(file, int64(limit-off)))
-
-	return &ReadIterator{
-		src: &fileBuf{
-			buf: buf,
-			src: file,
-		},
-		frame: int(frame),
-		evlim: int(evlim),
-		pos:   off,
-	}, nil
+	return res, nil
 }
 
 // NewReaderInProcess вычитка файла с логом всё ещё используемого
 // системой.
-func NewReaderInProcess(w *Writer, off uint64) (*ReadIterator, error) {
+func NewReaderInProcess(w *Writer, opts ...ReaderOption) (*ReadIterator, error) {
 	r, err := mpio.NewSimReader(w.dst, mpio.SimReaderOptions())
 	if err != nil {
 		return nil, errors.Wrap(err, "create log file reader")
@@ -110,16 +65,16 @@ func NewReaderInProcess(w *Writer, off uint64) (*ReadIterator, error) {
 		return nil, errors.Wrap(err, "read log file metadata")
 	}
 
-	if _, err := r.Seek(int64(off), 0); err != nil {
-		return nil, errors.Wrap(err, "seek to the offset")
-	}
-
 	res := &ReadIterator{
 		src:   r,
 		frame: int(frame),
 		evlim: int(evlim),
-		pos:   off,
+		pos:   fileMetaInfoHeaderSize,
 	}
+	if err := res.applyOptions(opts...); err != nil {
+		return nil, errors.Wrap(err, "apply options")
+	}
+
 	return res, nil
 }
 
@@ -130,6 +85,7 @@ type logReader interface {
 	io.Reader
 	io.ByteReader
 	io.Closer
+	io.Seeker
 }
 
 // ReadIterator итератор по файлу с данными лога.
@@ -139,10 +95,11 @@ type ReadIterator struct {
 	evlim int
 	pos   uint64
 
-	id    types.Index
-	data  []byte
-	delta int
-	err   error
+	id     types.Index
+	before types.Index
+	data   []byte
+	delta  int
+	err    error
 }
 
 // Next вычитка следующего события.
@@ -167,7 +124,7 @@ func (it *ReadIterator) Next() bool {
 		it.err = errors.Wrap(err, "read event index").Int("unexpected-data-length", n)
 		return false
 	}
-	it.id = types.IndexDecode(buf[:])
+	types.IndexDecode(&it.id, buf[:])
 	if it.id.Term == 0 {
 		if passed {
 			it.err = errors.New("got zero term just after a short frame rest pass").
@@ -189,11 +146,16 @@ func (it *ReadIterator) Next() bool {
 			return false
 		}
 
-		it.id = types.IndexDecode(buf[:])
+		types.IndexDecode(&it.id, buf[:])
 		if it.id.Term == 0 {
 			it.err = errors.New("got zero term just after frame rest pass")
 			return false
 		}
+	}
+
+	if it.before.Term != 0 && !types.IndexLess(it.id, it.before) {
+		it.err = io.EOF
+		return false
 	}
 
 	uvarint, err := binary.ReadUvarint(it.src)
@@ -239,6 +201,16 @@ func (it *ReadIterator) Err() error {
 // Close закрытие источника итерирования.
 func (it *ReadIterator) Close() error {
 	return it.src.Close()
+}
+
+func (it *ReadIterator) applyOptions(opts ...ReaderOption) error {
+	for _, opt := range opts {
+		if err := opt.apply(it, it.src); err != nil {
+			return errors.Wrap(err, opt.String())
+		}
+	}
+
+	return nil
 }
 
 func (it *ReadIterator) passBytes(l int) error {

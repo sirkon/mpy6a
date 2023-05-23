@@ -20,8 +20,14 @@ github.com/sirkon/deepequal v0.5.3 h1:A6z0o/tLHJSmtlMQIFpYHvzBdTt6vLv2EbeUK9u7Sx
 github.com/sirkon/deepequal v0.5.3/go.mod h1:PsB4zwW58QHdYwYNdH2PY8Wsq/L++59Okv+pWygOy6U=
 github.com/sirkon/deepequal v0.5.5 h1:Qbu9QBosF66nWkmLPoCZhIXlhiVdcQlQ5BOCr66wf/I=
 github.com/sirkon/deepequal v0.5.5/go.mod h1:PsB4zwW58QHdYwYNdH2PY8Wsq/L++59Okv+pWygOy6U=
+github.com/sirkon/deepequal v0.5.6 h1:a6uKoLOAGUVqoIrXAnU0rek353RxTm0CJLSOQwkBiiQ=
+github.com/sirkon/deepequal v0.5.6/go.mod h1:PsB4zwW58QHdYwYNdH2PY8Wsq/L++59Okv+pWygOy6U=
+github.com/sirkon/deepequal v0.5.7 h1:wr49XhBvtaQqi20+gtG1wW/3V8Enu0zPPf47bLaoQwM=
+github.com/sirkon/deepequal v0.5.7/go.mod h1:PsB4zwW58QHdYwYNdH2PY8Wsq/L++59Okv+pWygOy6U=
 github.com/sirkon/errors v0.2.1 h1:cbf0gEEpnSsnw3BoZzKubrBYhLohmyB1LgWB+sGedT0=
 github.com/sirkon/errors v0.2.1/go.mod h1:QHzAIbAhNXYSz3uK9tvp99vPxroQWjNz4PbRg8Ef3Wc=
+github.com/sirkon/intypes v0.0.3 h1:nmbEDnObOmLlVU2ZunV8J8w9PvNRuaueWJZ6nbORdo8=
+github.com/sirkon/intypes v0.0.3/go.mod h1:Slw2IUvZASZMYu3+rsrK0PxuYqRdn4mX8tdslfD/EgE=
 github.com/sirkon/testlog v0.1.0 h1:bxvKyAYVEGNl2SHdjx7kS0s0hRwNi0shLc0skPKVhx4=
 github.com/sirkon/testlog v0.1.0/go.mod h1:SMNEfl++p6ujMcswt8Pn+HSGbT2C9fvf6Lv2gxiTnVI=
 github.com/sirkon/varsize v0.0.1 h1:TPdS1JxQBQ54O4CFVvOljQd9EmWtgF6i9ezeA54Ps3c=

@@ -8,7 +8,8 @@ import (
 	"github.com/sirkon/mpy6a/internal/errors"
 )
 
-// SimWriter примитив для записи в файл.
+// SimWriter примитив позволяющий конкурентно осуществлять
+// чтение и запись с одним файлом.
 type SimWriter struct {
 	file *os.File
 	lock *sync.RWMutex
@@ -221,7 +222,7 @@ func (w *SimWriter) setLogger(v func(err error)) {
 }
 
 // EnsureBufferSpace попытка высвободить достаточно места
-// в буфере для записи длинной n. Может возвратить ошибку
+// в буфере для записи длиной n. Может возвратить ошибку
 // слишком короткого буфера или ошибку сброса данных на диск.
 func EnsureBufferSpace(w *SimWriter, n int) error {
 	if n+len(w.buf) < cap(w.buf) {

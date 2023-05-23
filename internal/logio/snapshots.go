@@ -2,6 +2,7 @@ package logio
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -74,7 +75,14 @@ func (s *Snapshots) ReadName() (string, error) {
 	return string(data), nil
 }
 
+// WriteName запись имени последнего слепка.
 func (s *Snapshots) WriteName(name string) error {
+	if len(name) > maxFileNameSize {
+		return errors.New("snapshot name is too large").
+			Int("snapshot-name-length", len(name)).
+			Int("snapshot-name-length-limit", maxFileNameSize)
+	}
+
 	file, err := os.OpenFile(s.name, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return errors.Wrapf(err, "open file")
@@ -85,10 +93,12 @@ func (s *Snapshots) WriteName(name string) error {
 		}
 	}()
 
-	data := []byte(name)
-	data = append(data, '\n')
-	if n, err := file.Write(data); err != nil {
-		return errors.Wrap(err, "write snapshot name").Int("failed-write-length", n)
+	var buf bytes.Buffer
+	buf.WriteByte('\n')
+	buf.WriteString(name)
+	buf.WriteByte('\n')
+	if _, err := io.Copy(file, &buf); err != nil {
+		return errors.Wrap(err, "write snapshot name")
 	}
 
 	if err := file.Sync(); err != nil {

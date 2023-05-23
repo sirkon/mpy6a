@@ -11,12 +11,13 @@ require (
 	github.com/lestrrat/go-strftime v0.0.0-20180220042222-ba3bf9c1d042 // indirect
 	github.com/pkg/errors v0.8.1 // indirect
 	github.com/sirkon/errors v0.5.0 // indirect
+	github.com/sirkon/fenneg v0.1.1 // indirect
 	github.com/sirkon/go-format v0.1.2 // indirect
-	github.com/sirkon/go-format/v2 v2.0.1 // indirect
-	github.com/sirkon/gogh v0.16.0 // indirect
-	github.com/sirkon/jsonexec v0.0.4 // indirect
-	github.com/sirkon/message v1.6.0 // indirect
-	github.com/sirkon/olrgen v0.3.0 // indirect
+	github.com/sirkon/go-format/v2 v2.0.2 // indirect
+	github.com/sirkon/gogh v0.20.1 // indirect
+	github.com/sirkon/jsonexec v0.0.5 // indirect
+	github.com/sirkon/message v1.6.1 // indirect
+	github.com/sirkon/olrgen v0.4.0 // indirect
 	github.com/sirkon/protoast v0.29.0 // indirect
 	github.com/sirkon/varsize v0.0.1 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect

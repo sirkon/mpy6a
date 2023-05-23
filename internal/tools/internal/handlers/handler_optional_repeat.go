@@ -3,7 +3,7 @@ package handlers
 import (
 	"go/types"
 
-	"github.com/sirkon/olrgen"
+	"github.com/sirkon/fenneg"
 )
 
 // NewOptionalRepeat конструктор нового воплощения OptionalRepeat.
@@ -27,14 +27,14 @@ type OptionalRepeat struct {
 	lenkey string
 }
 
-// Name для реализации olrgen.TypeHandler.
-func (o *OptionalRepeat) Name(r *olrgen.Go) string {
+// Name для реализации fenneg.TypeHandler.
+func (o *OptionalRepeat) Name(r *fenneg.Go) string {
 	return r.Type(o.r)
 }
 
-// Pre для реализации olrgen.TypeHandler.
-func (o *OptionalRepeat) Pre(r *olrgen.Go, src string) {
-	r.Imports().Varsize().Ref("$vars")
+// Pre для реализации fenneg.TypeHandler.
+func (o *OptionalRepeat) Pre(r *fenneg.Go, src string) {
+	r.Imports().Varsize().Ref("vars")
 
 	o.lenkey = r.Uniq("key", src)
 	r.L(`var $0 int`, o.lenkey)
@@ -43,18 +43,18 @@ func (o *OptionalRepeat) Pre(r *olrgen.Go, src string) {
 	r.L(`}`)
 }
 
-// Len для реализации olrgen.TypeHandler.
+// Len для реализации fenneg.TypeHandler.
 func (o *OptionalRepeat) Len() int {
 	return -1
 }
 
-// LenExpr для реализации olrgen.TypeHandler.
-func (o *OptionalRepeat) LenExpr(r *olrgen.Go, src string) string {
+// LenExpr для реализации fenneg.TypeHandler.
+func (o *OptionalRepeat) LenExpr(r *fenneg.Go, src string) string {
 	return o.lenkey
 }
 
-// Encoding для реализации olrgen.TypeHandler.
-func (o *OptionalRepeat) Encoding(r *olrgen.Go, dst, src string) {
+// Encoding для реализации fenneg.TypeHandler.
+func (o *OptionalRepeat) Encoding(r *fenneg.Go, dst, src string) {
 	r.Imports().Binary().Ref("bin")
 
 	r.L(`if $src != 0 {`)
@@ -62,8 +62,8 @@ func (o *OptionalRepeat) Encoding(r *olrgen.Go, dst, src string) {
 	r.L(`}`)
 }
 
-// Decoding для реализации olrgen.TypeHandler.
-func (o *OptionalRepeat) Decoding(r *olrgen.Go, dst, src string) bool {
+// Decoding для реализации fenneg.TypeHandler.
+func (o *OptionalRepeat) Decoding(r *fenneg.Go, dst, src string) bool {
 	r.Imports().Binary().Ref("bin")
 	r.Imports().Errors().Ref("errors")
 
@@ -76,9 +76,9 @@ func (o *OptionalRepeat) Decoding(r *olrgen.Go, dst, src string) bool {
 	r.L(`    $siz, $off := $bin.Uvarint($src)`)
 	r.L(`    if $off <= 0 {`)
 	r.L(`        if $off == 0 {`)
-	olrgen.ReturnError().New("$decode: $recordTooSmall").Rend(r)
+	fenneg.ReturnError().New("$decode: $recordTooSmall").Rend(r)
 	r.L(`        }`)
-	olrgen.ReturnError().New("$decode - optional repeat timeout: $malformedUvarint").Rend(r)
+	fenneg.ReturnError().New("$decode - optional repeat timeout: $malformedUvarint").Rend(r)
 	r.L(`    }`)
 	r.N()
 	r.L(`    $dst = $0($siz)`, r.Type(o.r))

@@ -25,6 +25,17 @@ func (f *fileBuf) Close() error {
 	return f.src.Close()
 }
 
+// Seek для реализации logReader.
+func (f *fileBuf) Seek(offset int64, whence int) (int64, error) {
+	n, err := f.src.Seek(offset, whence)
+	if err != nil {
+		return 0, err
+	}
+
+	f.buf.Reset(f.src)
+	return n, nil
+}
+
 var (
 	_ logReader = &fileBuf{}
 )

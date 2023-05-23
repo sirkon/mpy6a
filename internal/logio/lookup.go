@@ -63,7 +63,8 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 				Uint64("frame-length", frame)
 		}
 
-		cid := types.IndexDecode(buf[:16])
+		var cid types.Index
+		types.IndexDecode(&cid, buf[:16])
 		switch types.IndexCmp(cid, id) {
 		case -1:
 			left = c
@@ -94,10 +95,14 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 			}
 
 			rest = rest[eventLen:]
-			if types.IndexDecode(rest).Term == 0 {
-				// Первое событие является последним в кадре, возвращаем начало следующего кадра.
-				// Следующий кадр обязательно существует, т.к. событие не является последним.
-				return LookupResultFound((c+1)*frame + fileMetaInfoHeaderSize), nil
+			{
+				var id types.Index
+				types.IndexDecode(&id, rest)
+				if id.Term == 0 {
+					// Первое событие является последним в кадре, возвращаем начало следующего кадра.
+					// Следующий кадр обязательно существует, т.к. событие не является последним.
+					return LookupResultFound((c+1)*frame + fileMetaInfoHeaderSize), nil
+				}
 			}
 
 			return LookupResultFound(pos + 16 + uint64(uvarints.LengthInt(eventLen)) + eventLen), nil
@@ -125,7 +130,10 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 	var prevID types.Index
 	var prevPos uint64
 	for {
-		cid := types.IndexDecodeSafe(buf)
+		var cid types.Index
+		if len(buf) >= 16 {
+			types.IndexDecode(&cid, buf)
+		}
 		if cid.Term == 0 {
 			// Дошли до конца кадра, но элемент так и не найден.
 			// Это означает, что нужной записи нет.
@@ -166,8 +174,11 @@ func LookupNext(name string, id types.Index, logger func(error)) (_ LookupResult
 			}
 
 			delta := 16 + uvarints.LengthInt(eventLen) + int(eventLen)
+			var cid types.Index
 			buf = buf[delta:]
-			cid := types.IndexDecodeSafe(buf)
+			if len(buf) >= 16 {
+				types.IndexDecode(&cid, buf)
+			}
 			if cid.Term == 0 {
 				// Т.е. мы дошли до последнего события в кадре. Следующее событие лежит
 				// в следующем кадре, либо его нет вообще.

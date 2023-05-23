@@ -12,6 +12,8 @@ func TestRBTreePrint(t *testing.T) {
 	rb.SaveSession(10, types.NewSession(types.NewIndex(1, 1), 12, []byte("Hello")))
 	rb.SaveSession(10, types.NewSession(types.NewIndex(1, 2), 13, []byte("World!")))
 	rb.SaveSession(300, types.NewSession(types.NewIndex(1, 3), 100, []byte("1234")))
+	rb.SaveSession(200, types.NewSession(types.NewIndex(1, 4), 200, []byte("qwerty")))
+	rb.DeleteSessions(200)
 
 	deepequal.SideBySide(t, "trees", rb, rb)
 }

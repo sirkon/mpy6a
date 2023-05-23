@@ -16,6 +16,7 @@
 # vendor/
 
 tmpdata/
+go.work*
 
 internal/state/testdata
 internal/logio/testdata

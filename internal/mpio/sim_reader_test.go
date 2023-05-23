@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/sirkon/mpy6a/internal/errors"
-	"github.com/sirkon/mpy6a/internal/testlog"
+	"github.com/sirkon/mpy6a/internal/tlog"
 )
 
 // Проверка работы конкурентного чтения и записи.
@@ -22,11 +22,11 @@ func TestSimIO(t *testing.T) {
 		SimWriterOptions().
 			BufferSize(4).
 			Logger(func(err error) {
-				testlog.Error(t, err)
+				tlog.Error(t, err)
 			}),
 	)
 	if err != nil {
-		testlog.Error(t, errors.Wrap(err, "init writer"))
+		tlog.Error(t, errors.Wrap(err, "init writer"))
 		return
 	}
 
@@ -40,12 +40,12 @@ func TestSimIO(t *testing.T) {
 
 		r, err := NewSimReader(w, SimReaderOptions().BufferSize(i+1))
 		if err != nil {
-			testlog.Error(t, errors.Wrapf(err, "init reader %d", i))
+			tlog.Error(t, errors.Wrapf(err, "init reader %d", i))
 			return
 		}
 		t.Cleanup(func() {
 			if err := r.Close(); err != nil {
-				testlog.Error(t, errors.Wrapf(err, "close reader %d", i))
+				tlog.Error(t, errors.Wrapf(err, "close reader %d", i))
 			}
 		})
 
@@ -66,7 +66,7 @@ func TestSimIO(t *testing.T) {
 						time.Sleep(time.Second / 10)
 						continue
 					default:
-						testlog.Error(t, errors.Wrapf(err, "read in the reader %d", i))
+						tlog.Error(t, errors.Wrapf(err, "read in the reader %d", i))
 						return
 					}
 				}
@@ -85,28 +85,28 @@ func TestSimIO(t *testing.T) {
 	}
 
 	if _, err := w.Write([]byte("He")); err != nil {
-		testlog.Error(t, errors.Wrapf(err, "write first chunk"))
+		tlog.Error(t, errors.Wrapf(err, "write first chunk"))
 		return
 	}
 
 	time.Sleep(time.Second / 5)
 
 	if _, err := w.Write([]byte("llo")); err != nil {
-		testlog.Error(t, errors.Wrapf(err, "write second chunk"))
+		tlog.Error(t, errors.Wrapf(err, "write second chunk"))
 		return
 	}
 
 	if _, err := w.Write([]byte(" Wor")); err != nil {
-		testlog.Error(t, errors.Wrapf(err, "write third chunk"))
+		tlog.Error(t, errors.Wrapf(err, "write third chunk"))
 	}
 
 	if _, err := w.Write([]byte("ld!")); err != nil {
-		testlog.Error(t, errors.Wrapf(err, "write the last chunk"))
+		tlog.Error(t, errors.Wrapf(err, "write the last chunk"))
 		return
 	}
 
 	if err := w.Close(); err != nil {
-		testlog.Error(t, errors.Wrap(err, "close writer"))
+		tlog.Error(t, errors.Wrap(err, "close writer"))
 	}
 
 	wg.Wait()
@@ -128,11 +128,11 @@ func TestSimReaderPosition(t *testing.T) {
 		SimWriterOptions().
 			BufferSize(4).
 			Logger(func(err error) {
-				testlog.Error(t, err)
+				tlog.Error(t, err)
 			}),
 	)
 	if err != nil {
-		testlog.Error(t, errors.Wrap(err, "init writer"))
+		tlog.Error(t, errors.Wrap(err, "init writer"))
 		return
 	}
 	t.Cleanup(func() {
@@ -141,14 +141,14 @@ func TestSimReaderPosition(t *testing.T) {
 		}
 
 		if err := w.Close(); err != nil {
-			testlog.Error(t, errors.Wrapf(err, "close writer"))
+			tlog.Error(t, errors.Wrapf(err, "close writer"))
 		}
 	})
 
 	pieces := []string{"1234", "5678"}
 	for i, piece := range pieces {
 		if _, err := io.WriteString(w, piece); err != nil {
-			testlog.Error(t, errors.Wrapf(err, "write piece %d", i))
+			tlog.Error(t, errors.Wrapf(err, "write piece %d", i))
 		}
 	}
 
@@ -180,26 +180,26 @@ func TestSimReaderPosition(t *testing.T) {
 			r, err := NewSimReader(w, SimReaderOptions().ReadPosition(uint64(tt.pos)))
 			if err != nil {
 				if tt.wantErr {
-					testlog.Log(t, errors.Wrapf(err, "expected error"))
+					tlog.Log(t, errors.Wrapf(err, "expected error"))
 				} else {
-					testlog.Error(t, errors.Wrapf(err, "create reader"))
+					tlog.Error(t, errors.Wrapf(err, "create reader"))
 				}
 				return
 			}
 			t.Cleanup(func() {
 				if err := r.Close(); err != nil {
-					testlog.Error(t, errors.Wrapf(err, "close reader"))
+					tlog.Error(t, errors.Wrapf(err, "close reader"))
 				}
 			})
 
 			rawdata, err := readRest(r)
 			if err != nil {
-				testlog.Error(t, errors.Wrapf(err, "read the rest"))
+				tlog.Error(t, errors.Wrapf(err, "read the rest"))
 			}
 
 			data := string(rawdata)
 			if data != tt.data {
-				testlog.Error(
+				tlog.Error(
 					t,
 					errors.Wrap(err, "unexpected result").
 						Str("expected", tt.data).
@@ -219,11 +219,11 @@ func TestSimReaderSeek(t *testing.T) {
 		SimWriterOptions().
 			BufferSize(4).
 			Logger(func(err error) {
-				testlog.Error(t, err)
+				tlog.Error(t, err)
 			}),
 	)
 	if err != nil {
-		testlog.Error(t, errors.Wrap(err, "init writer"))
+		tlog.Error(t, errors.Wrap(err, "init writer"))
 		return
 	}
 	t.Cleanup(func() {
@@ -232,25 +232,25 @@ func TestSimReaderSeek(t *testing.T) {
 		}
 
 		if err := w.Close(); err != nil {
-			testlog.Error(t, errors.Wrapf(err, "close writer"))
+			tlog.Error(t, errors.Wrapf(err, "close writer"))
 		}
 	})
 
 	pieces := []string{"1234", "5678"}
 	for i, piece := range pieces {
 		if _, err := io.WriteString(w, piece); err != nil {
-			testlog.Error(t, errors.Wrapf(err, "write piece %d", i))
+			tlog.Error(t, errors.Wrapf(err, "write piece %d", i))
 		}
 	}
 
 	r, err := NewSimReader(w, SimReaderOptions())
 	if err != nil {
-		testlog.Error(t, errors.Wrapf(err, "create reader"))
+		tlog.Error(t, errors.Wrapf(err, "create reader"))
 		return
 	}
 	t.Cleanup(func() {
 		if err := r.Close(); err != nil {
-			testlog.Error(t, errors.Wrapf(err, "close reader"))
+			tlog.Error(t, errors.Wrapf(err, "close reader"))
 		}
 	})
 
@@ -292,11 +292,11 @@ func TestSimReaderSeek(t *testing.T) {
 			func(t *testing.T) {
 				if _, err := r.Seek(tt.pos, tt.whence); err != nil {
 					if tt.wantErr {
-						testlog.Log(t, errors.Wrapf(err, "expected seek error"))
+						tlog.Log(t, errors.Wrapf(err, "expected seek error"))
 						return
 					}
 
-					testlog.Error(t, errors.Wrapf(err, "seek to the position").
+					tlog.Error(t, errors.Wrapf(err, "seek to the position").
 						Int64("failed-position", tt.pos).
 						Int("whence", tt.whence))
 					return
@@ -304,7 +304,7 @@ func TestSimReaderSeek(t *testing.T) {
 
 				rawdata, err := readRest(r)
 				if err != nil {
-					testlog.Error(t, errors.Wrap(err, "read the rest"))
+					tlog.Error(t, errors.Wrap(err, "read the rest"))
 				}
 
 				data := string(rawdata)

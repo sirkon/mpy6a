@@ -1,2 +1,2 @@
-// Package extmocks генерированные pamgen-ом моки сто
+// Package extmocks генерированные pamgen-ом моки.
 package extmocks

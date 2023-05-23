@@ -15,7 +15,7 @@ func TryReadFull(r io.Reader, buf []byte) (n int, err error) {
 				return 0, nil
 			}
 
-			return 0, ErrUnexpectedEOD
+			return n, ErrUnexpectedEOD
 		}
 
 		n += nn

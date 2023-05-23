@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/sirkon/mpy6a/internal/errors"
-	"github.com/sirkon/mpy6a/internal/testlog"
+	"github.com/sirkon/mpy6a/internal/tlog"
 )
 
 func TestSimWriterOverrideData(t *testing.T) {
@@ -16,43 +16,43 @@ func TestSimWriterOverrideData(t *testing.T) {
 
 	w, err := NewSimWriter(name, SimWriterOptions().Logger(errorLogger(t)))
 	if err != nil {
-		testlog.Error(t, errors.Wrap(err, "create writer on the new file"))
+		tlog.Error(t, errors.Wrap(err, "create writer on the new file"))
 		return
 	}
 
 	if _, err := w.Write([]byte("Hello World!")); err != nil {
-		testlog.Error(t, errors.Wrap(err, "write data"))
+		tlog.Error(t, errors.Wrap(err, "write data"))
 		return
 	}
 
 	if err := w.Close(); err != nil {
-		testlog.Error(t, errors.Wrap(err, "close writer"))
+		tlog.Error(t, errors.Wrap(err, "close writer"))
 		return
 	}
 
 	w, err = NewSimWriter(name, SimWriterOptions().Logger(errorLogger(t)).WritePosition(10))
 	if err != nil {
-		testlog.Error(t, errors.Wrap(err, "open writer on existing file with an offset"))
+		tlog.Error(t, errors.Wrap(err, "open writer on existing file with an offset"))
 		return
 	}
 
 	if _, err := w.Write([]byte("g")); err != nil {
-		testlog.Error(t, errors.Wrap(err, "write with override"))
+		tlog.Error(t, errors.Wrap(err, "write with override"))
 		return
 	}
 
 	if err := w.Close(); err != nil {
-		testlog.Error(t, errors.Wrap(err, "close second writer"))
+		tlog.Error(t, errors.Wrap(err, "close second writer"))
 	}
 
 	r, err := NewSimReader(w, SimReaderOptions())
 	if err != nil {
-		testlog.Error(t, errors.Wrap(err, "open reader"))
+		tlog.Error(t, errors.Wrap(err, "open reader"))
 	}
 
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, r); err != nil {
-		testlog.Error(t, errors.Wrap(err, "copy written data"))
+		tlog.Error(t, errors.Wrap(err, "copy written data"))
 	}
 
 	const expected = "Hello Worlg"
@@ -64,6 +64,6 @@ func TestSimWriterOverrideData(t *testing.T) {
 
 func errorLogger(t *testing.T) func(err error) {
 	return func(err error) {
-		testlog.Error(t, err)
+		tlog.Error(t, err)
 	}
 }

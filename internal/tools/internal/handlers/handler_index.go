@@ -4,7 +4,7 @@ import (
 	"go/types"
 	"strconv"
 
-	"github.com/sirkon/olrgen"
+	"github.com/sirkon/fenneg"
 )
 
 // NewIndex конструктор нового воплощения Index.
@@ -27,42 +27,39 @@ type Index struct {
 	id *types.Named
 }
 
-// Name для реализации olrgen.TypeHandler.
-func (i *Index) Name(r *olrgen.Go) string {
+// Name для реализации fenneg.TypeHandler.
+func (i *Index) Name(r *fenneg.Go) string {
 	return r.Type(i.id)
 }
 
-// Pre для реализации olrgen.TypeHandler.
-func (i *Index) Pre(r *olrgen.Go, src string) {}
+// Pre для реализации fenneg.TypeHandler.
+func (i *Index) Pre(r *fenneg.Go, src string) {}
 
-// Len для реализации olrgen.TypeHandler.
+// Len для реализации fenneg.TypeHandler.
 func (i *Index) Len() int {
 	return 16
 }
 
-// LenExpr для реализации olrgen.TypeHandler.
-func (i *Index) LenExpr(r *olrgen.Go, src string) string {
+// LenExpr для реализации fenneg.TypeHandler.
+func (i *Index) LenExpr(r *fenneg.Go, src string) string {
 	return strconv.Itoa(i.Len())
 }
 
-// Encoding для реализации olrgen.TypeHandler.
-func (i *Index) Encoding(r *olrgen.Go, dst, src string) {
-	r.Imports().Add(mpy6aTypesPkg).Ref("mpy6aIndex")
-
-	r.L(`$dst = $mpy6aIndex.IndexEncodeAppend($dst, $src)`)
+// Encoding для реализации fenneg.TypeHandler.
+func (i *Index) Encoding(r *fenneg.Go, dst, src string) {
+	r.L(`$dst = $0($dst, $src)`, r.PkgObject(i.id, "IndexEncodeAppend"))
 }
 
-// Decoding для реализации olrgen.TypeHandler.
-func (i *Index) Decoding(r *olrgen.Go, dst, src string) bool {
+// Decoding для реализации fenneg.TypeHandler.
+func (i *Index) Decoding(r *fenneg.Go, dst, src string) bool {
 	r.Imports().Errors().Ref("errors")
-	r.Imports().Add(mpy6aTypesPkg).Ref("mpy6aIndex")
 
 	r.L(`if len($src) < 16 {`)
-	olrgen.ReturnError().New("$decode: $recordTooSmall").LenReq(16).LenSrc().Rend(r)
+	fenneg.ReturnError().New("$decode: $recordTooSmall").LenReq(16).LenSrc().Rend(r)
 	r.L(`}`)
-	r.L(`$dst = $mpy6aIndex.IndexDecode($src)`)
+	r.L(`$0(&$dst, $src)`, r.PkgObject(i.id, "IndexDecode"))
 
 	return false
 }
 
-var _ olrgen.TypeHandler = &Index{}
+var _ fenneg.TypeHandler = &Index{}

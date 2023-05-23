@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/sirkon/mpy6a/internal/errors"
-	"github.com/sirkon/mpy6a/internal/testlog"
+	"github.com/sirkon/mpy6a/internal/tlog"
 	"github.com/sirkon/mpy6a/internal/types"
 )
 
@@ -21,7 +21,7 @@ func TestNewWriter(t *testing.T) {
 
 		writer, err := NewWriter(name, 160, 20)
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "create new log writer"))
+			tlog.Error(t, errors.Wrap(err, "create new log writer"))
 			return
 		}
 
@@ -30,7 +30,7 @@ func TestNewWriter(t *testing.T) {
 		}
 
 		if err := writer.Close(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "close writer"))
+			tlog.Error(t, errors.Wrap(err, "close writer"))
 			return
 		}
 	})
@@ -39,21 +39,21 @@ func TestNewWriter(t *testing.T) {
 		const name = "testdata/existing-empty-file"
 
 		if err := os.RemoveAll(name); err != nil {
-			testlog.Error(t, errors.Wrap(err, "delete log file if exists"))
+			tlog.Error(t, errors.Wrap(err, "delete log file if exists"))
 		}
 
 		create, err := os.Create(name)
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "create log file"))
+			tlog.Error(t, errors.Wrap(err, "create log file"))
 		}
 
 		if err := create.Close(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "close created log file"))
+			tlog.Error(t, errors.Wrap(err, "close created log file"))
 		}
 
 		writer, err := NewWriter(name, 160, 20)
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "create new log writer"))
+			tlog.Error(t, errors.Wrap(err, "create new log writer"))
 			return
 		}
 
@@ -62,7 +62,7 @@ func TestNewWriter(t *testing.T) {
 		}
 
 		if err := writer.Close(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "close writer"))
+			tlog.Error(t, errors.Wrap(err, "close writer"))
 			return
 		}
 	})
@@ -71,23 +71,23 @@ func TestNewWriter(t *testing.T) {
 		const name = "testdata/existing-file"
 
 		if err := os.RemoveAll(name); err != nil {
-			testlog.Error(t, errors.Wrap(err, "delete log file if exists"))
+			tlog.Error(t, errors.Wrap(err, "delete log file if exists"))
 		}
 
 		writer, err := NewWriter(name, 160, 20)
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "create new log writer"))
+			tlog.Error(t, errors.Wrap(err, "create new log writer"))
 			return
 		}
 
 		if err := writer.Close(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "close writer"))
+			tlog.Error(t, errors.Wrap(err, "close writer"))
 			return
 		}
 
 		writer, err = NewWriter(name, 512, 40)
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "create writer with an old file"))
+			tlog.Error(t, errors.Wrap(err, "create writer with an old file"))
 			return
 		}
 
@@ -104,7 +104,7 @@ func TestNewWriter(t *testing.T) {
 		}
 
 		if err := writer.Close(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "close reopened writer"))
+			tlog.Error(t, errors.Wrap(err, "close reopened writer"))
 			return
 		}
 	})
@@ -115,37 +115,37 @@ func TestNewWriter(t *testing.T) {
 
 		w, err := NewWriter(name, 512, 40, WriterBufferSize(324))
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "create first writer"))
+			tlog.Error(t, errors.Wrap(err, "create first writer"))
 			return
 		}
 
 		for i := 0; i < 40; i++ {
 			if _, err := w.WriteEvent(types.NewIndex(1, uint64(i)), []byte(strconv.Itoa(i))); err != nil {
-				testlog.Error(t, errors.Wrap(err, "write event").Int("event", i))
+				tlog.Error(t, errors.Wrap(err, "write event").Int("event", i))
 				return
 			}
 		}
 
 		if err := w.Close(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "close first writer"))
+			tlog.Error(t, errors.Wrap(err, "close first writer"))
 		}
 
 		w, err = NewWriter(name, 512, 40, WriterBufferSize(324))
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "open the same writer second time"))
+			tlog.Error(t, errors.Wrap(err, "open the same writer second time"))
 			return
 		}
 
 		for i := 40; i < 50; i++ {
 			if _, err := w.WriteEvent(types.NewIndex(1, uint64(i)), []byte(strconv.Itoa(i))); err != nil {
-				testlog.Error(t, errors.Wrap(err, "write event of the second batch").Int("event", i))
+				tlog.Error(t, errors.Wrap(err, "write event of the second batch").Int("event", i))
 				return
 			}
 		}
 
-		r, err := NewReaderInProcess(w, 16)
+		r, err := NewReaderInProcess(w)
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "create reader over the write"))
+			tlog.Error(t, errors.Wrap(err, "create reader over the write"))
 		}
 
 		var i int
@@ -153,7 +153,7 @@ func TestNewWriter(t *testing.T) {
 			id, data, _ := r.Event()
 			wantID := types.NewIndex(1, uint64(i))
 			if !types.IndexEqual(id, wantID) {
-				testlog.Error(
+				tlog.Error(
 					t,
 					errors.New("unexpected event id").
 						Stg("expected-id", wantID).
@@ -162,7 +162,7 @@ func TestNewWriter(t *testing.T) {
 			}
 			wantData := strconv.Itoa(i)
 			if string(data) != wantData {
-				testlog.Error(
+				tlog.Error(
 					t,
 					errors.New("unexpected event data").
 						Any("expected-data", []byte(wantData)).
@@ -172,7 +172,7 @@ func TestNewWriter(t *testing.T) {
 			i++
 		}
 		if i != 50 {
-			testlog.Error(
+			tlog.Error(
 				t,
 				errors.New("not enough events on iteration").
 					Int("events-count-expected", 50).
@@ -180,11 +180,11 @@ func TestNewWriter(t *testing.T) {
 			)
 		}
 		if err := r.Err(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "iterate over events"))
+			tlog.Error(t, errors.Wrap(err, "iterate over events"))
 		}
 
 		if err := w.Close(); err != nil {
-			testlog.Error(t, errors.Wrap(err, "close second writer"))
+			tlog.Error(t, errors.Wrap(err, "close second writer"))
 		}
 	})
 
@@ -256,14 +256,14 @@ func TestNewWriter(t *testing.T) {
 				w, err := NewWriter(tt.file, tt.frame, tt.limit, tt.opts...)
 				if err == nil {
 					if err := w.Close(); err != nil {
-						testlog.Error(t, errors.Wrap(err, "close unexpectedly opened writer"))
+						tlog.Error(t, errors.Wrap(err, "close unexpectedly opened writer"))
 					}
 
 					t.Error("an error was expected here")
 					return
 				}
 
-				testlog.Log(t, errors.Wrap(err, "expected error"))
+				tlog.Log(t, errors.Wrap(err, "expected error"))
 			})
 		}
 	})

@@ -37,7 +37,9 @@ func ExampleIndexDecode() {
 	types.IndexEncode(buf[:], id)
 
 	fmt.Println(id)
-	fmt.Println(types.IndexDecode(buf[:]))
+	var cid types.Index
+	types.IndexDecode(&cid, buf[:])
+	fmt.Println(cid)
 
 	// Output:
 	// 000000000000000c-000000000000000d
@@ -68,6 +70,6 @@ func TestIndexOps(t *testing.T) {
 		}()
 
 		var buf [15]byte
-		types.IndexDecode(buf[:])
+		types.IndexDecode(new(types.Index), buf[:])
 	})
 }

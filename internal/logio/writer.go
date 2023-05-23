@@ -163,12 +163,12 @@ func readLastEventID(file *os.File, stat os.FileInfo, frame int) (id types.Index
 			}
 		}
 
-		nid := types.IndexDecode(buf[:])
-		if nid.Term == 0 {
+		var id types.Index
+		types.IndexDecode(&id, buf[:])
+		if id.Term == 0 {
 			// Предыдущая запись была последней.
 			return id, nil
 		}
-		id = nid
 
 		// Надо пропустить содержимое записи.
 		length, err := binary.ReadUvarint(bufrdr)

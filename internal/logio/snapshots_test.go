@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/sirkon/mpy6a/internal/errors"
-	"github.com/sirkon/mpy6a/internal/testlog"
+	"github.com/sirkon/mpy6a/internal/tlog"
 )
 
 func TestSnapshots(t *testing.T) {
@@ -16,12 +16,12 @@ func TestSnapshots(t *testing.T) {
 	s := NewSnapshots(
 		logname,
 		func(err error) {
-			testlog.Error(t, err)
+			tlog.Error(t, err)
 		},
 	)
 
 	if name, err := s.ReadName(); err != nil {
-		testlog.Error(t, errors.Wrapf(err, "read name from file that does not exist"))
+		tlog.Error(t, errors.Wrapf(err, "read name from file that does not exist"))
 		return
 	} else {
 		if name != "" {
@@ -36,12 +36,12 @@ func TestSnapshots(t *testing.T) {
 		expected := "snapshot-" + strconv.Itoa(i)
 
 		if err := s.WriteName(expected); err != nil {
-			testlog.Error(t, errors.Wrapf(err, "write snapshot %d name", i))
+			tlog.Error(t, errors.Wrapf(err, "write snapshot %d name", i))
 		}
 
 		name, err := s.ReadName()
 		if err != nil {
-			testlog.Error(t, errors.Wrap(err, "read snapshot log name"))
+			tlog.Error(t, errors.Wrap(err, "read snapshot log name"))
 		}
 
 		if name != expected {
@@ -51,7 +51,7 @@ func TestSnapshots(t *testing.T) {
 	}
 
 	if err := s.Rotate(); err != nil {
-		testlog.Error(t, errors.Wrapf(err, "rotate snapshot"))
+		tlog.Error(t, errors.Wrapf(err, "rotate snapshot"))
 		return
 	}
 
@@ -59,7 +59,7 @@ func TestSnapshots(t *testing.T) {
 
 	name, err := s.ReadName()
 	if err != nil {
-		testlog.Error(t, errors.Wrapf(err, "read snapshot log name after rotation"))
+		tlog.Error(t, errors.Wrapf(err, "read snapshot log name after rotation"))
 		return
 	}
 
@@ -72,7 +72,7 @@ func TestSnapshots(t *testing.T) {
 
 	name, err = s.ReadName()
 	if err != nil {
-		testlog.Error(t, errors.Wrapf(err, "read snapshot log name after rotation"))
+		tlog.Error(t, errors.Wrapf(err, "read snapshot log name after rotation"))
 		return
 	}
 

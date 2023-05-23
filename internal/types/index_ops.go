@@ -8,36 +8,24 @@ import (
 // IndexEncode сериализация индекса.
 // Внимание: размер буфера не проверяется и в случаем размера меньшего 16 байт
 // будет паника.
-func IndexEncode(buf []byte, id Index) {
-	binary.LittleEndian.PutUint64(buf, id.Term)
-	binary.LittleEndian.PutUint64(buf[8:], id.Index)
+func IndexEncode(dst []byte, id Index) {
+	binary.LittleEndian.PutUint64(dst, id.Term)
+	binary.LittleEndian.PutUint64(dst[8:], id.Index)
 }
 
-// IndexEncodeAppend сериализация индекса с поддержкой Append-протокола.
-func IndexEncodeAppend(buf []byte, id Index) []byte {
-	buf = binary.LittleEndian.AppendUint64(buf, id.Term)
-	buf = binary.LittleEndian.AppendUint64(buf, id.Index)
-	return buf
+// IndexEncodeAppend аналогично IndexEncode, но с соблюдением Append-протокола.
+func IndexEncodeAppend(dst []byte, id Index) []byte {
+	dst = binary.LittleEndian.AppendUint64(dst, id.Term)
+	dst = binary.LittleEndian.AppendUint64(dst, id.Index)
+	return dst
 }
 
 // IndexDecode десериализация индекса.
 // Внимание: размер буфера не проверяется и в случаем размера меньшего 16 байт
 // будет паника.
-func IndexDecode(buf []byte) Index {
-	return Index{
-		Term:  binary.LittleEndian.Uint64(buf),
-		Index: binary.LittleEndian.Uint64(buf[8:]),
-	}
-}
-
-// IndexDecodeSafe то же самое что и IndexDecode, но при буфере
-// меньше положенного будет возвращён недействительный индекс.
-func IndexDecodeSafe(buf []byte) Index {
-	if len(buf) < 16 {
-		return Index{}
-	}
-
-	return IndexDecode(buf)
+func IndexDecode(dst *Index, src []byte) {
+	dst.Term = binary.LittleEndian.Uint64(src)
+	dst.Index = binary.LittleEndian.Uint64(src[8:])
 }
 
 // IndexIncTerm возвращает новый индекс с увеличенным на единицу сроком.

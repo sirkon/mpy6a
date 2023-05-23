@@ -81,9 +81,7 @@ func (t *rbTree) Clone() *rbTree {
 	}
 }
 
-// DeleteSessions удаляет сессии с повтором в заданное время.
-// Возвращаемый true означает что элемент существовал и был удалён,
-// а false — элемент не найден.
+// DeleteSessions удаляет первую сессию с повтором в заданное время.
 func (t *rbTree) DeleteSessions(repeat uint64) (deleted bool) {
 	n := rbTreeLookupForValue(t.root, repeat)
 	if n == nil {
@@ -680,7 +678,7 @@ func rbTreeAllocNode(
 	values []savedSessionsData,
 	item *rbTreeNode,
 	arenaIndex int,
-) (_ *rbTreeNode, newArentIndex int) {
+) (_ *rbTreeNode, newArenaIndex int) {
 	if item == nil {
 		return nil, arenaIndex
 	}

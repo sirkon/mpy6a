@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/sirkon/mpy6a/internal/errors"
-	"github.com/sirkon/mpy6a/internal/testlog"
+	"github.com/sirkon/mpy6a/internal/tlog"
 	"github.com/sirkon/mpy6a/internal/types"
 )
 
@@ -17,12 +17,12 @@ func TestLookup(t *testing.T) {
 	)
 
 	if err := os.RemoveAll(eventfile); err != nil {
-		testlog.Error(t, errors.Wrap(err, "delete existing event file"))
+		tlog.Error(t, errors.Wrap(err, "delete existing event file"))
 	}
 
 	w, err := NewWriter(eventfile, 128, 32, WriterBufferSize(256))
 	if err != nil {
-		testlog.Error(t, errors.Wrap(err, "create writer"))
+		tlog.Error(t, errors.Wrap(err, "create writer"))
 		return
 	}
 
@@ -30,25 +30,25 @@ func TestLookup(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			index := types.NewIndex(uint64(term), uint64(i))
 			if _, err := w.WriteEvent(index, eventData); err != nil {
-				testlog.Error(t, errors.Wrap(err, "write event").Stg("write-error-index", index))
+				tlog.Error(t, errors.Wrap(err, "write event").Stg("write-error-index", index))
 				return
 			}
 		}
 	}
 
 	if err := w.Close(); err != nil {
-		testlog.Error(t, errors.Wrap(err, "close writer"))
+		tlog.Error(t, errors.Wrap(err, "close writer"))
 		return
 	}
 
 	checkNextEvent := func(t *testing.T, pos uint64, next *types.Index) error {
-		reader, err := NewReaderOffset(eventfile, pos, w.Pos())
+		reader, err := NewReader(eventfile, ReaderStart(pos))
 		if err != nil {
 			return errors.Wrap(err, "open event file for reading")
 		}
 		defer func() {
 			if err := reader.Close(); err != nil {
-				testlog.Error(t, errors.Wrap(err, "close event reader"))
+				tlog.Error(t, errors.Wrap(err, "close event reader"))
 			}
 		}()
 
@@ -137,20 +137,20 @@ func TestLookup(t *testing.T) {
 				eventfile,
 				tt.id,
 				func(err error) {
-					testlog.Error(t, err)
+					tlog.Error(t, err)
 				},
 			)
 			if err != nil {
 				if tt.wantErr {
-					testlog.Log(t, errors.Wrap(err, "expected error"))
+					tlog.Log(t, errors.Wrap(err, "expected error"))
 				} else {
-					testlog.Error(t, errors.Wrap(err, "unexpected error"))
+					tlog.Error(t, errors.Wrap(err, "unexpected error"))
 				}
 				return
 			}
 
 			if tt.wantErr {
-				testlog.Error(t, errors.New("lookup error was expected"))
+				tlog.Error(t, errors.New("lookup error was expected"))
 				return
 			}
 
@@ -160,31 +160,31 @@ func TestLookup(t *testing.T) {
 				case v.Int64() < 0 && tt.next == nil:
 					t.Log("expected no next event state")
 				case v.Int64() < 0 && tt.next != nil:
-					testlog.Error(t, errors.New("no event found").Stg("expected-event-id", *tt.next))
+					tlog.Error(t, errors.New("no event found").Stg("expected-event-id", *tt.next))
 				default:
 					if err := checkNextEvent(t, uint64(v.Int64()), tt.next); err != nil {
-						testlog.Error(t, err)
+						tlog.Error(t, err)
 					}
 				}
 				return
 
 			case *LookupResultIsMissing:
 				if err := checkNextEvent(t, v.LastBeforeOffset, &v.LastBeforeID); err != nil {
-					testlog.Error(t, errors.Wrap(err, "check previous event position"))
+					tlog.Error(t, errors.Wrap(err, "check previous event position"))
 					return
 				} else {
 					t.Log("previous event position checked out")
 				}
 				if v.NextID.Term != 0 {
 					if err := checkNextEvent(t, v.NextOffset, &v.NextID); err != nil {
-						testlog.Error(t, errors.Wrap(err, "check next event position"))
+						tlog.Error(t, errors.Wrap(err, "check next event position"))
 						return
 					}
 					t.Log("next event position checked out")
 				}
 
 				if !types.IndexEqual(v.LastBeforeID, *tt.prev) {
-					testlog.Error(
+					tlog.Error(
 						t,
 						errors.New("unexpected previous event id").
 							Stg("expected-previous-event-id", *tt.prev).
@@ -194,7 +194,7 @@ func TestLookup(t *testing.T) {
 				switch {
 				case v.NextID.Term != 0 && tt.next != nil:
 					if !types.IndexEqual(v.NextID, *tt.next) {
-						testlog.Error(
+						tlog.Error(
 							t,
 							errors.New("unexpected next event id").
 								Stg("expected-next-event-id", *tt.next).
@@ -202,12 +202,12 @@ func TestLookup(t *testing.T) {
 						)
 					}
 				case v.NextID.Term != 0 && tt.next == nil:
-					testlog.Error(
+					tlog.Error(
 						t,
 						errors.New("unexpected next event").Stg("unexpected-next-event-id", v.NextID),
 					)
 				case v.NextID.Term == 0 && tt.next != nil:
-					testlog.Error(
+					tlog.Error(
 						t,
 						errors.New("missing next event").Stg("expected-next-event-id", *tt.next),
 					)

@@ -16,6 +16,5 @@ type Recorder struct {
 }
 
 func (r *Recorder) allocateBuffer(n int) []byte {
-
 	return make([]byte, 0, n)
 }
