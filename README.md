@@ -66,4 +66,5 @@ type RepeatData struct{
    железобетонным и поэтому предпочтительным.
 
 [Глоссарий](docs/glossary.md)
+
 [Поток осуществляения операций](docs/lld/operations_flow.md)
