@@ -1,4 +1,4 @@
-package storage
+package state
 
 import "github.com/sirkon/mpy6a/internal/types"
 
@@ -143,7 +143,7 @@ func (t *rbTree) DeleteSessions(repeat uint64) (deleted bool) {
 		// вершины может быть только красным, иначе нарушается структура
 		// КЧ дерева: чёрная длина пустой ветви равна 1, чёрная длина непустой ветви
 		// с чёрным узлом не меньше 2. Поэтому потомка надо перекрасить
-		// в чёрный перед удалением чтобы соблюсти структуру.
+		// в чёрный перед удалением, чтобы соблюсти структуру.
 		if !n.red {
 			n.right.red = false
 		}
@@ -179,8 +179,8 @@ func (t *rbTree) DeleteSessions(repeat uint64) (deleted bool) {
 	}
 
 	if p == nil {
-		// удалённая вершина была корнем дерева то баланс корректен т.к.
-		// структура поддерева не затронута
+		// Удалённая вершина была корнем дерева то баланс корректен т.к.
+		// структура поддерева не затронута.
 		return
 	}
 
@@ -203,6 +203,7 @@ func (t *rbTree) SaveSession(repeat uint64, sess types.Session) {
 		t.size = 1
 		return
 	}
+	t.size++
 
 	p, isRight, alreadyExist := rbTreeLookupForFreeValueParent(t.root, repeat)
 	if alreadyExist {
@@ -225,7 +226,6 @@ func (t *rbTree) SaveSession(repeat uint64, sess types.Session) {
 		p.left = n
 	}
 
-	t.size++
 	t.rebalanceInserted(p, n)
 }
 
@@ -447,7 +447,7 @@ start:
 		}
 	}
 
-	// удалёние из левого поддерева родителя
+	// Удаление из левого поддерева родителя.
 	r := p.right
 	switch {
 	case p.red:
@@ -587,7 +587,7 @@ type rbTreeIterator struct {
 	justRaised bool
 }
 
-// Next проверка, что есть ещё непройденные узлы.
+// Next проверка, что есть ещё не пройденные узлы.
 func (i *rbTreeIterator) Next() bool {
 	if i.n == nil && i.r == nil {
 		return false

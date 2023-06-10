@@ -28,6 +28,14 @@ func IndexDecode(dst *Index, src []byte) {
 	dst.Index = binary.LittleEndian.Uint64(src[8:])
 }
 
+// IndexDecodeCheck аналогично IndexDecode + проверка, что срок
+// в индексе имеет корректное значение.
+func IndexDecodeCheck(dst *Index, src []byte) bool {
+	dst.Term = binary.LittleEndian.Uint64(src)
+	dst.Index = binary.LittleEndian.Uint64(src[8:])
+	return dst.Term != 0
+}
+
 // IndexIncTerm возвращает новый индекс с увеличенным на единицу сроком.
 func IndexIncTerm(index Index) Index {
 	return Index{

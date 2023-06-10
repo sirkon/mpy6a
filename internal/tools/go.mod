@@ -19,6 +19,7 @@ require (
 	github.com/sirkon/message v1.6.1 // indirect
 	github.com/sirkon/olrgen v0.4.0 // indirect
 	github.com/sirkon/protoast v0.29.0 // indirect
+	github.com/sirkon/rbtree v0.0.1 // indirect
 	github.com/sirkon/varsize v0.0.1 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20230510235704-dd950f8aeaea // indirect

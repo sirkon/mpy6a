@@ -41,8 +41,8 @@ func (s *Session) String() string {
 	return buf.String()
 }
 
-// NewSessionData создание новой сессии.
-func NewSessionData(ID Index, theme uint32, data []byte) Session {
+// NewSession создание новой сессии.
+func NewSession(ID Index, theme uint32, data []byte) Session {
 	return Session{
 		ID:       ID,
 		ChangeID: ID,
