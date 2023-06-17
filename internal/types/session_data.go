@@ -46,6 +46,8 @@ func (d *SessionData) Encode(dst []byte) []byte {
 
 // Decode метод декодирования данных.
 func (d *SessionData) Decode(src []byte) ([]byte, error) {
+	d.buf = d.buf[:0]
+
 	chunks, res := binary.Uvarint(src)
 	if res <= 0 {
 		if res == 0 {

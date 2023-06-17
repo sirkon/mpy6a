@@ -251,7 +251,7 @@ func (b *Buffer) WriteTo(w io.Writer) (n int64, err error) {
 	if nBytes := b.Len(); nBytes > 0 {
 		m, e := w.Write(b.buf[b.off:])
 		if m > nBytes {
-			panic("bytes.Buffer.WriteTo: invalid Write count")
+			panic("bytes.Buffer.WriteTo: invalid write count")
 		}
 		b.off += m
 		n = int64(m)
@@ -259,7 +259,7 @@ func (b *Buffer) WriteTo(w io.Writer) (n int64, err error) {
 			return n, e
 		}
 		// all bytes should have been written, by definition of
-		// Write method in io.Writer
+		// write method in io.Writer
 		if m != nBytes {
 			return n, io.ErrShortWrite
 		}

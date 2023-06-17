@@ -18,12 +18,12 @@ func NewIndexAtomic() IndexAtomic {
 }
 
 // Set атомарная установка индекса в заданное значение.
-func (id *IndexAtomic) Set(index Index) {
+func (id IndexAtomic) Set(index Index) {
 	setAtomic(uintptr(unsafe.Pointer(&id.data[0])), index.Term, index.Index)
 }
 
 // Get атомарное получение индекса.
-func (id *IndexAtomic) Get() Index {
+func (id IndexAtomic) Get() Index {
 	term, index := getAtomic(uintptr(unsafe.Pointer(&id.data[0])))
 	return Index{
 		Term:  term,
