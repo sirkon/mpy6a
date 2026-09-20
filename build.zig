@@ -16,6 +16,27 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    const jsonescape_mod = b.dependency("jsonescape", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("jsonescape");
+
+    // Resolve the packages declared in build.zig.zon so their public modules
+    // can be imported from this package's sources and tests.
+    const blog_mod = b.dependency("blog", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("blog");
+    const zigring_mod = b.dependency("zigring", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zigring");
+    const verztable_mod = b.dependency("verztable", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("verztable");
+
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -39,6 +60,14 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // Dependency modules are only visible to source files that declare
+        // them here, so list every dependency this package may import.
+        .imports = &.{
+            .{ .name = "blog", .module = blog_mod },
+            .{ .name = "zigring", .module = zigring_mod },
+            .{ .name = "verztable", .module = verztable_mod },
+        },
+        .link_libc = true,
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -79,6 +108,9 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "mpy6a", .module = mod },
+                .{ .name = "blog", .module = blog_mod },
+                .{ .name = "zigring", .module = zigring_mod },
+                .{ .name = "verztable", .module = verztable_mod },
             },
         }),
     });
@@ -141,6 +173,53 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Modules only expose their imports to source files that are actually
+    // compiled as part of them. That is fine for files reachable from a root,
+    // but a new file that nothing imports yet (e.g. a fresh `src/foo.zig`)
+    // would otherwise not compile at all and its `@import("blog")` would look
+    // broken. Walking `src` here keeps every file in the build graph, so
+    // dependency imports and `test` blocks work anywhere under `src/`,
+    // including subfolders.
+    const check_step = b.step("check", "Compile every file under src/, including ones nothing imports yet");
+
+    var src_dir = std.Io.Dir.cwd().openDir(b.graph.io, "src", .{ .iterate = true }) catch |err| {
+        std.debug.panic("unable to open src/: {s}", .{@errorName(err)});
+    };
+    defer src_dir.close(b.graph.io);
+
+    var walker = src_dir.walk(b.allocator) catch |err| {
+        std.debug.panic("unable to walk src/: {s}", .{@errorName(err)});
+    };
+    defer walker.deinit();
+
+    while (walker.next(b.graph.io) catch |err| {
+        std.debug.panic("unable to walk src/: {s}", .{@errorName(err)});
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        const file_path = b.dupe(entry.path);
+        if (!std.mem.endsWith(u8, file_path, ".zig")) continue;
+
+        const file_mod = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", file_path })),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mpy6a", .module = mod },
+                .{ .name = "blog", .module = blog_mod },
+                .{ .name = "zigring", .module = zigring_mod },
+                .{ .name = "verztable", .module = verztable_mod },
+                .{ .name = "jsonescape", .module = jsonescape_mod },
+            },
+        });
+
+        const file_check = b.addTest(.{ .root_module = file_mod });
+        const run_file_check = b.addRunArtifact(file_check);
+        check_step.dependOn(&run_file_check.step);
+        // Also run from `zig build test` so a file's `test` blocks are reached
+        // even when nothing imports it yet.
+        test_step.dependOn(&run_file_check.step);
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

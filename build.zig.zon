@@ -32,23 +32,27 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .blog = .{
-            .url = "git+https://github.com/sirkon/blog.git#df1a33f82985c5c446abd62852eab5dab627ab2b",
-            .hash = "blog-0.0.0-IN2Y396RBAD98ToVZgpe7-SaHFggh_lSDaxjwF8PRz8H",
+        .verztable = .{
+            .path = "vendor/verztable",
+        },
+        .jsonescape = .{
+            .url = "git+https://github.com/sirkon/jsonescape.git#0cb0a561089720ae890633dc1b401f3ec6569bb3",
+            .hash = "jsonescape-0.0.2-AjQcMAgsAQDGi9rSvRrEsll7y0WlaIM6XcPTNC8Cd6kv",
         },
         .zigring = .{
-            .url = "git+https://github.com/sirkon/zigring.git#71b5d9e2693846c742867a4e9d8f7e39d53b8357",
-            .hash = "zigring-0.0.1-Srja3-14AgDFhhHtV0Doa6IpeqB6VkmjfzTwLeKvCEuh",
+            .url = "git+https://github.com/sirkon/zigring.git#2e98f28d6d47677884552181e6323d61e9ae21ad",
+            .hash = "zigring-0.0.7-Srja39fYAgDDoTVhQ3DMaLesyhreX5Z8PQQmcdO-sgrJ",
         },
-        .verztable = .{
-            .url = "git+https://github.com/ThobiasKnudsen/verztable.git#a47c86c6e896a964c3e410e9b4a61c153e2ffb29",
-            .hash = "verztable-0.1.0-S-yATOQbAwCmwYv1GsL5F9KomA5gGQUsjaqusjkpRUmC",
+        .blog = .{
+            .url = "git+https://github.com/sirkon/blog.git#9e9cd7116160facc2488e12acdb85b45a4cb163a",
+            .hash = "blog-0.0.7-IN2Y3x6TBAAubFv8rIsnolHgnmFLydfQmBlEhb4nJ8My",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
         // For example...
         //"LICENSE",
         //"README.md",
