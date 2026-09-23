@@ -61,7 +61,8 @@ public contract.
 Completion-driven flow: call a `push*` method to arm an operation, then drain
 completions with `popCQE` (hot path) and fall back to `park` (cold path, one
 syscall) only when it returns null. Check the ring every iteration before
-sleeping.
+sleeping. Use `checkCQNotEmpty` when you only need to know whether completions
+are pending without consuming any (e.g. to decide whether to drain at all).
 
 ```zig
 const std = @import("std");
@@ -169,10 +170,15 @@ Gotchas:
 pub fn popCQE(self: *Self) ?CQE;      // null when the CQ is empty
 pub fn park(self: *Self) void;        // blocking wait for >=1 event
 pub fn batchedCQ(self: *Self) ?BatchCQ; // null when there is nothing to drain
+pub inline fn checkCQNotEmpty(self: *Self) bool; // non-consuming readiness poll
 ```
 
 - `popCQE` advances the CQ head, freeing the slot for the kernel. Leaving
   completions unread eventually stalls the CQ.
+- `checkCQNotEmpty` reports whether at least one completion is waiting without
+  consuming it, so it is a cheap way to poll for readiness before committing to
+  a `popCQE`/`batchedCQ` drain. It performs the same acquire load of the CQ tail
+  as `popCQE`, so a `true` result guarantees the next pop sees a completion.
 - Hot path order: `popCQE` first, `park` only when it returned null. `park`
   costs a syscall. It retries `EINTR` internally; any other error panics.
 - `park` is safe with an empty SQ: it requests events and wakes a parked SQPOLL
@@ -502,7 +508,8 @@ helper does close on that path.
   buffer is pinned until the `hasNotif` one.
 - **Linked timeout must be in the same batch** as the op it guards, else
   `-EINVAL`.
-- **Hot path first**: `popCQE` / `batchedCQ` before `park`.
+- **Hot path first**: `popCQE` / `batchedCQ` before `park`; use
+  `checkCQNotEmpty` to probe readiness without consuming.
 - **One ring per thread**; the `Factory` is the thread-safe allocator.
 - **Check `res`** every time: short reads/writes and negative errnos are normal.
 - Do not rename the misspelled public names (`regiterSizeClassReceiveBuffer`).

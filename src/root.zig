@@ -15,6 +15,13 @@ pub fn SessionTable(comptime V: type) type {
     return table.HashMap(u64, V);
 }
 
+/// Inbound Queue & Notification/Sleep Protocol (Front producers -> Index
+/// consumer): the `IndexInbox` SPSC ring with its `push` / `pop` methods, the
+/// monolithic `batch` window over the ring CQ and the inbound queue (with its
+/// `BatchInbox` view), the conditional `MSG_RING` wake path and the `hang`
+/// spin-then-park sequence of TASK-INDEX-INBOUND.md.
+pub const index_inbound = @import("index_inbox.zig");
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
