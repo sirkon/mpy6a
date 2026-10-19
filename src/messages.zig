@@ -14,15 +14,15 @@
 //!
 //! | taskIdx                 | `res`                      | sent by            |
 //! |-------------------------|----------------------------|--------------------|
-//! | `InitializedIdx`        | sender's `thread_idx`      | every worker       |
+//! | `InitializedIdx`        | sender's `ring_idx`        | every worker       |
 //! | `StartWorkIdx`          | the listening socket fd    | the init thread    |
 //! | `CrossTaskMessageIdx`   | `CrossTaskSlots` index     | anyone             |
 //! | `IndexWakeupTaskIdx`    | wakeup code (no payload)   | fronts -> indexes  |
 //! | `ShutdownDemandIdx`     | unused                     | process -> workers |
-//! | `ShutdownDoneIdx`       | sender's `thread_idx`      | fronts, elephants  |
+//! | `ShutdownDoneIdx`       | sender's `ring_idx`        | fronts, elephants  |
 //! | `ShutdownTickIdx`       | tick number                | the shutdown timer |
 //! | `InitTimeoutIdx`        | n/a                        | the init deadline  |
-//! | `IndexDrainedIdx`       | index's ring index         | index -> its front |
+//! | `IndexDrainedIdx`       | index's `ring_idx`         | index -> its front |
 //!
 //! Payloads that do not fit into the two words a `MSG_RING` CQE carries go
 //! through a `CrossTaskSlots` slot and arrive as `CrossTaskMessageIdx`; the
@@ -34,7 +34,8 @@ const zigring = @import("zigring");
 const index_inbox = @import("index_inbox.zig");
 
 /// taskIdx of the init-ring message reporting "this thread finished
-/// initializing". `res` is the sender's `thread_idx`.
+/// initializing". `res` is the sender's `ring_idx`, the sender's slot in every
+/// per-thread shared array.
 pub const InitializedIdx: u64 = std.math.maxInt(u64) - 1;
 
 /// taskIdx of the `START_WORK` broadcast the init thread sends into every
@@ -58,7 +59,7 @@ pub const IndexWakeupTaskIdx: u64 = index_inbox.IndexWakeupTaskIdx;
 pub const ShutdownDemandIdx: u64 = std.math.maxInt(u64) - 5;
 
 /// Worker -> init-ring: "I have drained and am about to exit". `res` is the
-/// sender's `thread_idx`.
+/// sender's `ring_idx`.
 pub const ShutdownDoneIdx: u64 = std.math.maxInt(u64) - 6;
 
 /// Init-ring and front rings: the periodic tick that polices the startup and
@@ -69,7 +70,7 @@ pub const ShutdownTickIdx: u64 = std.math.maxInt(u64) - 8;
 pub const InitTimeoutIdx: u64 = std.math.maxInt(u64) - 9;
 
 /// Index -> its parent front: "I have drained and stopped". `res` is the index's
-/// own ring index, so the front can translate it into its child slot.
+/// own `ring_idx`, so the front can translate it into its child slot.
 pub const IndexDrainedIdx: u64 = std.math.maxInt(u64) - 10;
 
 /// Every reserved `taskIdx`, in one place so the comptime block below can
@@ -120,7 +121,7 @@ comptime {
 pub const ControlMsgResultBase: u32 = 0x4000_0000;
 
 /// `msg_result` of a `ShutdownTickIdx`. The other control messages carry their
-/// payload in `res` (a `thread_idx`, a slot index, the socket fd) and their
+/// payload in `res` (a `ring_idx`, a slot index, the socket fd) and their
 /// `taskIdx` alone identifies them.
 pub const ShutdownTickMsgResult: u32 = ControlMsgResultBase + 3;
 

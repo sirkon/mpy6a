@@ -47,11 +47,12 @@ const Ctx = struct {
     }
 
     fn ownInbox(self: *Ctx, k: u16) *indexmod.Inbox {
-        return &self.ctrl.inboxes[self.front().first_index.inbox + k];
+        return &self.ctrl.inboxes[self.front().first_index.inbox_idx + k];
     }
 };
 
-/// Runs the front thread to completion.
+/// Runs the front thread to completion. `role` is the role the thread derived
+/// from its `ring_idx` before reporting `INITIALIZED`.
 pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.LoggerStuff) void {
     const front = role.front;
     var ctx = Ctx{
@@ -118,10 +119,10 @@ fn handleCqe(ctx: *Ctx, cqe: zigring.CQE) bool {
     }
 
     if (task_idx == messages.IndexDrainedIdx) {
-        // `res` is the index's ring index; k is its position among our
-        // children. Indexes report their ring index, so translate it.
+        // `res` is the index's ring index, the index's slot in the shared ring
+        // array; k is its position among our children, so translate it.
         const ring_idx: u16 = @intCast(cqe.res);
-        const k = ring_idx - ctx.front().first_index.ring;
+        const k = ring_idx - ctx.front().first_index.ring_idx;
         if (k < ctx.front().index_count) ctx.drained[k] = true;
         if (allDrained(ctx)) {
             reportDone(ctx);
@@ -272,9 +273,9 @@ fn reportDone(ctx: *Ctx) void {
 test "children are addressed by ring offset" {
     const role: lifetime.Role = .{ .front = .{
         .ring_idx = 0,
-        .first_index = .{ .ring = 2, .inbox = 0 },
+        .first_index = .{ .ring_idx = 2, .inbox_idx = 0 },
         .index_count = 2,
     } };
-    try std.testing.expectEqual(@as(u16, 2), role.front.first_index.ring);
+    try std.testing.expectEqual(@as(u16, 2), role.front.first_index.ring_idx);
     try std.testing.expectEqual(@as(u16, 2), role.front.index_count);
 }

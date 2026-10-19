@@ -12,7 +12,8 @@ const lifetime = @import("lifetime.zig");
 const messages = @import("messages.zig");
 const logging = @import("logging.zig");
 
-/// Runs the elephant thread to completion.
+/// Runs the elephant thread to completion. `role` is the role the thread derived
+/// from its `ring_idx` before reporting `INITIALIZED`.
 pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.LoggerStuff) void {
     const ring = &ctrl.rings[role.elephant.ring_idx];
     const log = &logger.logger;
@@ -63,9 +64,9 @@ fn handleTask(task: @import("cross_task.zig").CrossTask, log: *logging.Logger, r
     }
 }
 
-fn reportDone(ring: *lifetime.RingStuff, ctrl: *lifetime.Controller, thread_idx: u16) void {
+fn reportDone(ring: *lifetime.RingStuff, ctrl: *lifetime.Controller, ring_idx: u16) void {
     while (true) {
-        if (ring.ring.pushMsgRingFd(ctrl.init_ring.ring.fd, messages.ShutdownDoneIdx, thread_idx, .{})) |_| {
+        if (ring.ring.pushMsgRingFd(ctrl.init_ring.ring.fd, messages.ShutdownDoneIdx, ring_idx, .{})) |_| {
             return;
         } else |err| switch (err) {
             error.RingFull => std.atomic.spinLoopHint(),

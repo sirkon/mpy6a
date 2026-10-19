@@ -27,12 +27,18 @@ single-message launch safe.
 
 ## Thread identification.
 
-Threads are identified by a role derived from an atomic counter incremented at thread start. The mapping from counter
-value to role is fixed by the config:
+Threads are identified by a role derived from an atomic counter incremented at thread start. The counter value is the
+thread's `ring_idx`: its slot in every per-thread shared array (rings and the payloads of cross-thread reports). There is no separate "thread index" term. The mapping from `ring_idx` to role is fixed by the config:
 
 - `[0, F)` — fronts.
 - `[F, F + I)` — indices.
 - `[F + I, F + I + E)` — elephants.
+
+Each thread takes its `ring_idx` from the counter with `getRingIdx` before doing anything else, and keeps the role
+derived from that value on its own stack. The role is never stored in shared memory: every decision of the thread uses
+its local role, and every process-side decision about a thread derives the role from its `ring_idx` with `roleOf`. The
+launch order is the formula in practice, so a thread whose counter value differs from the slot it was spawned into
+exits fatally.
 
 The formula is the contract. If the formula and the actual launch order ever diverge, that is a fatal bug and the
 process exits.
@@ -61,7 +67,7 @@ Each thread, regardless of role:
 
 1. Creates its own ring.
 2. Creates its own logger (may depend on the ring).
-3. Increments the atomic counter and derives its role from the value.
+3. Increments the atomic counter, takes its `ring_idx` from the value and derives its role from it.
 4. Writes its ring into the shared array of rings at its own slot.
 5. If the thread is an index: creates its LLQ and writes it into the shared LLQ array at its own slot.
 6. Sends `INITIALIZED` into the main ring.

@@ -5,9 +5,14 @@
 //! the array of index inboxes, the cross-thread task slots, the ring factory,
 //! the init ring and the thread handles. A working thread starts in
 //! `runThread`, which derives the thread's role from the rolling counter,
-//! creates the thread-local ring and logger, publishes what has to be
-//! published and dispatches into `front.zig`, `index.zig` or `elephant.zig`.
-//! A counter value that disagrees with the launch order is fatal.
+//! creates the thread-local ring and logger and dispatches into `front.zig`,
+//! `index.zig` or `elephant.zig` according to that role. The role stays on the
+//! thread's stack: nothing else reads it back. A counter value that disagrees
+//! with the launch order is fatal.
+//!
+//! A role's `ring_idx` is the thread's slot in every per-thread shared array:
+//! the rings and the payloads of the cross-thread reports. "Thread index" is
+//! never used as a separate term.
 //!
 //! The two-phase startup contract is documented in
 //! docs/startup-en-reworked.md: initialization publishes and reports, and only
@@ -41,7 +46,7 @@ pub const Controller = struct {
     rolling_role_idx: u32 align(std.atomic.cache_line),
     /// One slot per thread, indexed exactly as the role numbering.
     rings: []RingStuff,
-    /// One inbox per index thread, indexed by the index's global number.
+    /// One inbox per index thread, indexed by the index's own inbox index.
     inboxes: []IndexInbox,
 
     /// Ring of the main lifetime controller thread.
@@ -59,7 +64,8 @@ pub const Controller = struct {
 
     /// Handles of the spawned working threads, in role order.
     threads: []zigring.Thread,
-    /// Per-thread context handed to `runThread`.
+    /// Per-thread context handed to `runThread`, one slot per subject in
+    /// launch order.
     thread_ctx: []ThreadContext,
     /// How many of `threads` were actually spawned.
     spawned: usize,
@@ -135,7 +141,7 @@ pub const Controller = struct {
         // role; spawn order only has to match the role ranges in the counter.
         const total: usize = @as(usize, cfg.fronts) + cfg.indexes + cfg.elephants;
         for (0..total) |i| {
-            self.thread_ctx[i] = .{ .ctrl = self };
+            self.thread_ctx[i] = .{ .ctrl = self, .spawn_idx = @intCast(i) };
             try self.threads[i].spawn(&self.thread_ctx[i], runThread);
             self.spawned += 1;
         }
@@ -152,22 +158,31 @@ pub const Controller = struct {
     /// dispatches to the role logic. Any failure here is fatal by contract.
     ///
     /// The role comes from the atomic counter incremented at thread start, as
-    /// docs/startup-en-reworked.md requires. The counter value is the thread's
-    /// slot in every shared array, so a value outside the configured ranges is
-    /// fatal: the formula and the launch order have diverged.
+    /// docs/startup-en-reworked.md requires, and lives only on this thread's
+    /// stack. Its ring index is the thread's slot in every shared array. A
+    /// counter value outside the configured ranges is fatal: the formula and
+    /// the launch order have diverged.
     pub fn runThread(ctx: *ThreadContext) void {
         const self = ctx.ctrl;
-        const role = self.getRole() catch |err| {
+        const ring_idx = self.getRingIdx() catch |err| {
             std.debug.print("role distribution failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
-        const thread_idx = role.threadIdx();
+        if (ring_idx != ctx.spawn_idx) {
+            std.debug.print(
+                "ring {d}: launched as {d}, role distribution disagrees\n",
+                .{ ctx.spawn_idx, ring_idx },
+            );
+            std.process.exit(1);
+        }
+
+        const role = self.roleOf(ring_idx);
         self.pinSelf(role);
 
-        self.initRing(thread_idx, 1) catch |err| fatal("ring initialization", thread_idx, err);
-        defer self.rings[thread_idx].deinit();
+        self.initRing(ring_idx, 1) catch |err| fatal("ring initialization", ring_idx, err);
+        defer self.rings[ring_idx].deinit();
 
-        const logger = self.getLogger(thread_idx) catch |err| fatal("logger creation", thread_idx, err);
+        const logger = self.getLogger(ring_idx) catch |err| fatal("logger creation", ring_idx, err);
         defer {
             logger.deinit(self.allocator);
             self.allocator.destroy(logger);
@@ -178,16 +193,16 @@ pub const Controller = struct {
             // The inbox is shared with the parent front, which may push into
             // it until it stops, so the controller releases it after every
             // thread has been joined; the index thread must not free it here.
-            .index => |r| self.initIndexInbox(r.idx.inbox, r.idx.ring) catch |err| fatal("index inbox initialization", thread_idx, err),
+            .index => |r| self.initIndexInbox(r.inbox_idx, ring_idx) catch |err| fatal("index inbox initialization", ring_idx, err),
             .front, .elephant => {},
         }
 
-        self.rings[thread_idx].ring.pushMsgRingFd(
+        self.rings[ring_idx].ring.pushMsgRingFd(
             self.init_ring.ring.fd,
             messages.InitializedIdx,
-            thread_idx,
+            ring_idx,
             .{},
-        ) catch |err| fatal("INITIALIZED report", thread_idx, err);
+        ) catch |err| fatal("INITIALIZED report", ring_idx, err);
 
         switch (role) {
             .front => @import("front.zig").run(self, role, logger),
@@ -201,23 +216,24 @@ pub const Controller = struct {
     fn pinSelf(self: *Self, role: Role) void {
         const core: u16 = switch (role) {
             .front => |r| self.cfg.front_cores.cores[r.ring_idx],
-            .index => |r| self.cfg.index_cores.cores[r.idx.inbox],
+            .index => |r| self.cfg.index_cores.cores[r.inbox_idx],
             .elephant => return,
         };
         zigring.Thread.setSelfAffinity(core) catch |err| {
-            std.debug.print("thread {d}: failed to pin to core {d}: {s}\n", .{ role.threadIdx(), core, @errorName(err) });
+            std.debug.print("ring {d}: failed to pin to core {d}: {s}\n", .{ role.ringIdx(), core, @errorName(err) });
         };
     }
 
-    fn fatal(what: []const u8, thread_idx: u16, err: anyerror) noreturn {
-        std.debug.print("thread {d}: {s} failed: {s}\n", .{ thread_idx, what, @errorName(err) });
+    fn fatal(what: []const u8, ring_idx: u16, err: anyerror) noreturn {
+        std.debug.print("ring {d}: {s} failed: {s}\n", .{ ring_idx, what, @errorName(err) });
         std.process.exit(1);
     }
 
-    /// Returns a logger and its buffer pool for the given thread. The logging stuff
-    /// is owned by the caller and needs both deinit and destroy.
-    pub fn getLogger(self: *Self, thread_idx: u32) !*LoggerStuff {
-        return self.getLoggerWithRing(&self.rings[thread_idx]);
+    /// Returns a logger and its buffer pool for the thread that owns the ring
+    /// at `ring_idx`. The logging stuff is owned by the caller and needs both
+    /// deinit and destroy.
+    pub fn getLogger(self: *Self, ring_idx: u32) !*LoggerStuff {
+        return self.getLoggerWithRing(&self.rings[ring_idx]);
     }
 
     /// Returns a logger for the initialization thread. The logging stuff is owned
@@ -258,67 +274,42 @@ pub const Controller = struct {
         return @intCast(fd_raw);
     }
 
-    /// Returned when get_role is not used properly.
+    /// Returned when `getRingIdx` is not used properly.
     pub const RoleDistributionError = error{
-        /// When we did too much get_role exceeding an amount of planned subjects (fronts, indexes, elephants).
+        /// When we did too much `getRingIdx` exceeding an amount of planned subjects (fronts, indexes, elephants).
         Overflow,
     };
 
-    /// The role of the thread occupying slot `thread_idx`, without touching
-    /// the counter. This is the formula from the doc, applied to a known slot;
-    /// the process thread uses it to name roles in diagnostics.
-    pub fn roleAt(self: *Self, thread_idx: u16) RoleDistributionError!Role {
-        const cfg = self.cfg;
-        const index_per_front = cfg.indexes / cfg.fronts;
-        if (thread_idx < cfg.fronts) {
-            return .{
-                .front = .{
-                    .ring_idx = thread_idx,
-                    .first_index = .{
-                        .ring = thread_idx * index_per_front + cfg.fronts,
-                        .inbox = thread_idx * index_per_front,
-                    },
-                    .index_count = index_per_front,
-                },
-            };
-        }
-
-        var domain_idx = thread_idx - cfg.fronts;
-        if (domain_idx < cfg.indexes) {
-            return .{
-                .index = .{
-                    .idx = .{
-                        .ring = thread_idx,
-                        .inbox = domain_idx,
-                    },
-                    .front_idx = domain_idx / index_per_front,
-                },
-            };
-        }
-
-        domain_idx -= cfg.indexes;
-        if (domain_idx < cfg.elephants) {
-            return .{ .elephant = .{ .ring_idx = thread_idx } };
-        }
-
-        return RoleDistributionError.Overflow;
-    }
-
-    /// Returns computed role. This distribution does as follows:
+    /// Returns the `ring_idx` this thread takes from the rolling counter. This
+    /// distribution does as follows:
     ///
     /// ```
-    /// when idx {
+    /// when ring_idx {
     ///   [0..fronts) => .front
     ///   [fronts, fronts + indexes) => .index
     ///   [fronts + indexes, fronts + indexes + elephants) => .elephant
     /// }
     /// ```
     ///
-    /// With proper parameters described in the definition of Role union.
-    pub fn getRole(self: *Self) RoleDistributionError!Role {
+    /// The role itself is derived by `roleOf` from the returned index.
+    pub fn getRingIdx(self: *Self) RoleDistributionError!u16 {
         const role_idx = @atomicRmw(u32, &self.rolling_role_idx, .Add, 1, .monotonic);
         // role_idx never overflows 0xFFFF as was checked by the config validation.
         const idx: u16 = @truncate(role_idx);
+        if (idx >= self.subjectCount()) return RoleDistributionError.Overflow;
+        return idx;
+    }
+
+    fn subjectCount(self: *const Self) u16 {
+        return self.cfg.fronts + self.cfg.indexes + self.cfg.elephants;
+    }
+
+    /// Returns the role of the thread owning `ring_idx`. Every subject has a
+    /// role, and `ring_idx` is always in `[0, subjects)` because both the
+    /// spawning side and `getRingIdx` guarantee it. Public so the process
+    /// thread can name its workers without reading anything back from them.
+    pub fn roleOf(self: *const Self, ring_idx: u16) Role {
+        const idx = ring_idx;
 
         const index_per_front = self.cfg.indexes / self.cfg.fronts;
         if (idx < self.cfg.fronts) {
@@ -326,8 +317,8 @@ pub const Controller = struct {
                 .front = .{
                     .ring_idx = idx,
                     .first_index = .{
-                        .ring = idx * index_per_front + self.cfg.fronts,
-                        .inbox = idx * index_per_front,
+                        .ring_idx = idx * index_per_front + self.cfg.fronts,
+                        .inbox_idx = idx * index_per_front,
                     },
                     .index_count = index_per_front,
                 },
@@ -338,10 +329,8 @@ pub const Controller = struct {
         if (domain_idx < self.cfg.indexes) {
             return .{
                 .index = .{
-                    .idx = .{
-                        .ring = idx,
-                        .inbox = domain_idx,
-                    },
+                    .ring_idx = idx,
+                    .inbox_idx = domain_idx,
                     .front_idx = domain_idx / index_per_front,
                 },
             };
@@ -356,12 +345,12 @@ pub const Controller = struct {
             };
         }
 
-        return RoleDistributionError.Overflow;
+        unreachable;
     }
 
-    /// Initializes a ring and its related stuff for a thread with the given idx.
-    pub fn initRing(self: *Self, thread_idx: u32, weight: u32) !void {
-        return self.initGivenRing(&self.rings[thread_idx], weight);
+    /// Initializes a ring and its related stuff for a thread with the given ring index.
+    pub fn initRing(self: *Self, ring_idx: u32, weight: u32) !void {
+        return self.initGivenRing(&self.rings[ring_idx], weight);
     }
 
     fn initGivenRing(self: *Self, stuff: *RingStuff, weight: u32) !void {
@@ -410,28 +399,32 @@ pub const Controller = struct {
 
     /// Initializes an input inbox for the given index thread. The producer ring
     /// is attached later by the owning front, after the startup barrier.
-    pub fn initIndexInbox(self: *Self, index_idx: u32, index_ring_idx: u32) !void {
-        try self.inboxes[index_idx].init(
+    pub fn initIndexInbox(self: *Self, inbox_idx: u32, ring_idx: u32) !void {
+        try self.inboxes[inbox_idx].init(
             self.allocator,
             self.cfg.index_inbox_capacity,
-            &self.rings[index_ring_idx].ring,
+            &self.rings[ring_idx].ring,
         );
     }
 };
 
-/// Fixed context of one working thread. The thread derives everything else,
-/// including its slot in the shared ring array, from the role counter.
+/// Fixed context of one working thread, handed to it at spawn time. The role
+/// is derived by the thread itself from the rolling counter and never leaves
+/// its stack.
 pub const ThreadContext = struct {
     ctrl: *Controller,
+    /// The slot this thread was spawned into, which is also the `ring_idx` it
+    /// must compute. Kept for the startup cross-check only.
+    spawn_idx: u16,
 };
 
 /// Thread role description.
 pub const Role = union(enum) {
-    /// Index indexes, where `ring` references an index of a ring for index thread. And inbox - its inbox index.
-    /// Rings for indexes goes right after rings for fronts. And inboxes are for index threads only,
+    /// Ring and inbox index of one index thread. Rings for indexes go right
+    /// after the rings for fronts, and inboxes exist for index threads only.
     pub const IndexIdx = struct {
-        ring: u16,
-        inbox: u16,
+        ring_idx: u16,
+        inbox_idx: u16,
     };
 
     front: struct {
@@ -440,18 +433,19 @@ pub const Role = union(enum) {
         index_count: u16,
     },
     index: struct {
-        idx: Role.IndexIdx,
+        ring_idx: u16,
+        inbox_idx: u16,
         front_idx: u16,
     },
     elephant: struct {
         ring_idx: u16,
     },
 
-    /// The slot this thread occupies in the shared ring array.
-    pub fn threadIdx(self: Role) u16 {
+    /// The slot this role occupies in every per-thread shared array.
+    pub fn ringIdx(self: Role) u16 {
         return switch (self) {
             .front => |r| r.ring_idx,
-            .index => |r| r.idx.ring,
+            .index => |r| r.ring_idx,
             .elephant => |r| r.ring_idx,
         };
     }
@@ -527,8 +521,8 @@ test "role distribution" {
             .front = .{
                 .ring_idx = 0,
                 .first_index = Role.IndexIdx{
-                    .ring = 2,
-                    .inbox = 0,
+                    .ring_idx = 2,
+                    .inbox_idx = 0,
                 },
                 .index_count = 2,
             },
@@ -537,45 +531,37 @@ test "role distribution" {
             .front = .{
                 .ring_idx = 1,
                 .first_index = Role.IndexIdx{
-                    .ring = 4,
-                    .inbox = 2,
+                    .ring_idx = 4,
+                    .inbox_idx = 2,
                 },
                 .index_count = 2,
             },
         },
         .{
             .index = .{
-                .idx = .{
-                    .ring = 2,
-                    .inbox = 0,
-                },
+                .ring_idx = 2,
+                .inbox_idx = 0,
                 .front_idx = 0,
             },
         },
         .{
             .index = .{
-                .idx = .{
-                    .ring = 3,
-                    .inbox = 1,
-                },
+                .ring_idx = 3,
+                .inbox_idx = 1,
                 .front_idx = 0,
             },
         },
         .{
             .index = .{
-                .idx = .{
-                    .ring = 4,
-                    .inbox = 2,
-                },
+                .ring_idx = 4,
+                .inbox_idx = 2,
                 .front_idx = 1,
             },
         },
         .{
             .index = .{
-                .idx = .{
-                    .ring = 5,
-                    .inbox = 3,
-                },
+                .ring_idx = 5,
+                .inbox_idx = 3,
                 .front_idx = 1,
             },
         },
@@ -587,12 +573,14 @@ test "role distribution" {
     };
 
     for (expected, 0..) |want, i| {
-        const role = try ctrl.getRole();
+        const ring_idx = try ctrl.getRingIdx();
+        try std.testing.expectEqual(@as(u16, @intCast(i)), ring_idx);
+        const role = ctrl.roleOf(ring_idx);
         try std.testing.expectEqual(want, role);
-        try std.testing.expectEqual(@as(u16, @intCast(i)), role.threadIdx());
+        try std.testing.expectEqual(ring_idx, role.ringIdx());
     }
 
-    try std.testing.expectError(error.Overflow, ctrl.getRole());
+    try std.testing.expectError(error.Overflow, ctrl.getRingIdx());
 }
 
 test "roles map to the shared arrays" {
@@ -615,20 +603,55 @@ test "roles map to the shared arrays" {
     try ctrl.init(std.testing.allocator, &cfg);
     defer ctrl.deinit();
 
-    const front = try ctrl.getRole();
+    const front_idx = try ctrl.getRingIdx();
+    const front = ctrl.roleOf(front_idx);
     try std.testing.expectEqualStrings("front", front.name());
     try std.testing.expectEqual(@as(u16, 2), front.front.index_count);
-    try std.testing.expectEqual(@as(u16, 1), front.front.first_index.ring);
+    try std.testing.expectEqual(@as(u16, 1), front.front.first_index.ring_idx);
 
-    const index = try ctrl.getRole();
-    try std.testing.expectEqual(@as(u16, 1), index.index.idx.ring);
-    try std.testing.expectEqual(@as(u16, 0), index.index.idx.inbox);
+    const index_idx = try ctrl.getRingIdx();
+    const index = ctrl.roleOf(index_idx);
+    try std.testing.expectEqual(@as(u16, 1), index.index.ring_idx);
+    try std.testing.expectEqual(@as(u16, 0), index.index.inbox_idx);
 
-    const second_index = try ctrl.getRole();
+    const second_index_idx = try ctrl.getRingIdx();
+    const second_index = ctrl.roleOf(second_index_idx);
     try std.testing.expectEqualStrings("index", second_index.name());
-    try std.testing.expectEqual(@as(u16, 2), second_index.threadIdx());
+    try std.testing.expectEqual(@as(u16, 2), second_index.ringIdx());
 
-    const elephant = try ctrl.getRole();
+    const elephant_idx = try ctrl.getRingIdx();
+    const elephant = ctrl.roleOf(elephant_idx);
     try std.testing.expectEqualStrings("elephant", elephant.name());
-    try std.testing.expectEqual(@as(u16, 3), elephant.threadIdx());
+    try std.testing.expectEqual(@as(u16, 3), elephant.ringIdx());
+}
+
+test "the derived role addresses the thread's own slot" {
+    var cfg: config.Config = undefined;
+    cfg.fronts = 1;
+    cfg.indexes = 2;
+    cfg.elephants = 1;
+    cfg.queue_depth = 64;
+    cfg.cross_task_slots = 8;
+    cfg.sqpoll_threads = 1;
+    cfg.ring_slots_capacity = 4096;
+    cfg.index_inbox_capacity = 8;
+    cfg.logging = .{
+        .method = .{ .json = {} },
+        .pool_capacity = 64,
+        .pool_frame_size = 1024,
+    };
+
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+    defer ctrl.deinit();
+
+    const ctx = ThreadContext{ .ctrl = &ctrl, .spawn_idx = 0 };
+    try std.testing.expectEqual(@as(u16, 0), ctx.spawn_idx);
+
+    // The first thread takes the first slot, and the role derived from that
+    // index addresses exactly this thread's ring.
+    const ring_idx = try ctrl.getRingIdx();
+    try std.testing.expectEqual(ctx.spawn_idx, ring_idx);
+    const slot = ctrl.roleOf(ring_idx).ringIdx();
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&ctrl.rings[slot]) -| @intFromPtr(ctrl.rings.ptr));
 }

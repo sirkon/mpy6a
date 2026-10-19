@@ -36,7 +36,7 @@ pub const CrossTask = union(enum) {
     /// is the index inbox (`index.FrontMessage.shutdown_soft`); this slot-borne
     /// variant exists for a front that no longer trusts the inbox.
     SoftShutdown: struct {
-        thread_idx: u16,
+        ring_idx: u16,
     },
 
     /// Process -> worker: the listening socket. The skeleton sends it in the
@@ -49,7 +49,7 @@ pub const CrossTask = union(enum) {
     /// Index -> its front: "I have drained and am exiting". The front collects
     /// these to satisfy the shutdown deadline.
     IndexDrained: struct {
-        thread_idx: u16,
+        ring_idx: u16,
     },
 };
 
@@ -84,12 +84,12 @@ test "variants round-trip through a slot" {
     try expect(slots.at(b).ShutdownDemand.hard);
 
     const c = try slots.acquire();
-    slots.at(c).* = .{ .IndexDrained = .{ .thread_idx = 7 } };
-    try expectEqual(@as(u16, 7), slots.at(c).IndexDrained.thread_idx);
+    slots.at(c).* = .{ .IndexDrained = .{ .ring_idx = 7 } };
+    try expectEqual(@as(u16, 7), slots.at(c).IndexDrained.ring_idx);
 
     const d = try slots.acquire();
-    slots.at(d).* = .{ .SoftShutdown = .{ .thread_idx = 2 } };
-    try expectEqual(@as(u16, 2), slots.at(d).SoftShutdown.thread_idx);
+    slots.at(d).* = .{ .SoftShutdown = .{ .ring_idx = 2 } };
+    try expectEqual(@as(u16, 2), slots.at(d).SoftShutdown.ring_idx);
 
     try std.testing.expectError(error.CrossTaskFull, slots.acquire());
 }

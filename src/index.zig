@@ -33,15 +33,16 @@ pub const Inbox = idxinbox.IndexInbox(FrontMessage);
 
 const LoopConfig = idxinbox.LoopConfig;
 
-/// Runs the index thread to completion. Started after the `INITIALIZED`
-/// report; the service loop ends when a shutdown demand has been satisfied.
+/// Runs the index thread to completion. `role` is the role the thread derived
+/// from its `ring_idx` before reporting `INITIALIZED`; the service loop ends
+/// when a shutdown demand has been satisfied.
 pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.LoggerStuff) void {
-    const ring = &ctrl.rings[role.index.idx.ring];
-    const inbox = &ctrl.inboxes[role.index.idx.inbox];
+    const ring = &ctrl.rings[role.index.ring_idx];
+    const inbox = &ctrl.inboxes[role.index.inbox_idx];
     const front_ring = &ctrl.rings[role.index.front_idx].ring;
     const log = &logger.logger;
 
-    log.info("index started", .{ .ring_idx = role.index.idx.ring, .inbox = role.index.idx.inbox });
+    log.info("index started", .{ .ring_idx = role.index.ring_idx, .inbox = role.index.inbox_idx });
 
     const cfg = LoopConfig{};
     var sessions: usize = 0;
@@ -67,7 +68,7 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
             }
         }
         batch.ring.commit() catch |err| {
-            log.err("index CQ commit failed", .{ .ring_idx = role.index.idx.ring, .err = @errorName(err) });
+            log.err("index CQ commit failed", .{ .ring_idx = role.index.ring_idx, .err = @errorName(err) });
             std.process.exit(1);
         };
 
@@ -76,7 +77,7 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
                 // The skeleton owns no session state yet: take ownership of the
                 // descriptor, log it, and close it again.
                 sessions += 1;
-                log.info("index received session", .{ .ring_idx = role.index.idx.ring, .fd = create.fd });
+                log.info("index received session", .{ .ring_idx = role.index.ring_idx, .fd = create.fd });
                 _ = std.os.linux.close(create.fd);
                 sessions -= 1;
             },
@@ -84,16 +85,16 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
             .shutdown_soft => {
                 if (!draining) {
                     draining = true;
-                    log.info("index soft shutdown", .{ .ring_idx = role.index.idx.ring });
+                    log.info("index soft shutdown", .{ .ring_idx = role.index.ring_idx });
                 }
                 if (sessions == 0) {
-                    reportDrained(ring, front_ring, role.index.idx.ring);
+                    reportDrained(ring, front_ring, role.index.ring_idx);
                     return;
                 }
             },
             .shutdown_hard => {
-                log.info("index hard shutdown", .{ .ring_idx = role.index.idx.ring });
-                reportDrained(ring, front_ring, role.index.idx.ring);
+                log.info("index hard shutdown", .{ .ring_idx = role.index.ring_idx });
+                reportDrained(ring, front_ring, role.index.ring_idx);
                 return;
             },
         };
@@ -101,7 +102,7 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
         // A soft shutdown may have been requested while the last session was
         // still open; once it closes, the index is done.
         if (draining and sessions == 0) {
-            reportDrained(ring, front_ring, role.index.idx.ring);
+            reportDrained(ring, front_ring, role.index.ring_idx);
             return;
         }
     }
@@ -109,9 +110,9 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
 
 /// Tells the parent front that this index has stopped. The front ignores the
 /// payload and reads its own per-index bit set instead.
-fn reportDrained(ring: *lifetime.RingStuff, front_ring: *zigring.Ring, thread_idx: u16) void {
+fn reportDrained(ring: *lifetime.RingStuff, front_ring: *zigring.Ring, ring_idx: u16) void {
     while (true) {
-        if (ring.ring.pushMsgRing(front_ring, messages.IndexDrainedIdx, thread_idx, .{})) |_| {
+        if (ring.ring.pushMsgRing(front_ring, messages.IndexDrainedIdx, ring_idx, .{})) |_| {
             return;
         } else |err| switch (err) {
             error.RingFull => std.atomic.spinLoopHint(),

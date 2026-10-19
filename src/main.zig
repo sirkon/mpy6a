@@ -221,9 +221,10 @@ fn waitForInitialized(ctrl: *lifetime.Controller, total: u16, reported: *[max_th
             return error.InitTimeout;
         }
         if (task_idx == messages.InitializedIdx) {
-            const thread_idx: u16 = @intCast(cqe.res);
-            if (thread_idx >= total or reported[thread_idx]) continue;
-            reported[thread_idx] = true;
+            // `res` is the sender's ring index, its slot in every shared array.
+            const ring_idx: u16 = @intCast(cqe.res);
+            if (ring_idx >= total or reported[ring_idx]) continue;
+            reported[ring_idx] = true;
             seen += 1;
         }
     }
@@ -231,14 +232,10 @@ fn waitForInitialized(ctrl: *lifetime.Controller, total: u16, reported: *[max_th
 
 fn reportMissing(ctrl: *lifetime.Controller, total: u16, reported: *const [max_threads]bool) void {
     std.debug.print("startup timed out; missing reports:", .{});
-    var i: u16 = 0;
-    while (i < total) : (i += 1) {
-        if (reported[i]) continue;
-        const role = ctrl.roleAt(i) catch {
-            std.debug.print(" thread {d}", .{i});
-            continue;
-        };
-        std.debug.print(" {s}#{d}", .{ role.name(), i });
+    var ring_idx: u16 = 0;
+    while (ring_idx < total) : (ring_idx += 1) {
+        if (reported[ring_idx]) continue;
+        std.debug.print(" {s}#{d}", .{ ctrl.roleOf(ring_idx).name(), ring_idx });
     }
     std.debug.print("\n", .{});
 }
@@ -247,10 +244,10 @@ fn reportMissing(ctrl: *lifetime.Controller, total: u16, reported: *const [max_t
 /// already observed one `INITIALIZED` per worker, and io_uring preserves the
 /// order inside each ring, so this single message is a safe launch barrier.
 fn broadcastStartWork(ctrl: *lifetime.Controller, total: u16, listen_fd: posix.fd_t) !void {
-    var i: u16 = 0;
-    while (i < total) : (i += 1) {
+    var ring_idx: u16 = 0;
+    while (ring_idx < total) : (ring_idx += 1) {
         try ctrl.init_ring.ring.pushMsgRingFd(
-            ctrl.rings[i].ring.fd,
+            ctrl.rings[ring_idx].ring.fd,
             messages.StartWorkIdx,
             // The socket fd travels in `res`.
             @intCast(listen_fd),
@@ -262,12 +259,13 @@ fn broadcastStartWork(ctrl: *lifetime.Controller, total: u16, listen_fd: posix.f
 /// The process-side shutdown: demand, wait for all fronts and elephants, count
 /// ticks, report what has not stopped, then return so the process can exit.
 fn shutdown(ctrl: *lifetime.Controller, total: u16) !void {
-    var i: u16 = 0;
-    while (i < total) : (i += 1) {
-        const role = ctrl.roleAt(i) catch continue;
-        if (std.meta.activeTag(role) == .index) continue; // stopped by their fronts
+    var ring_idx: u16 = 0;
+    while (ring_idx < total) : (ring_idx += 1) {
+        // The role follows from the ring index, which is the launch slot; the
+        // barrier has collected every `INITIALIZED` report by now.
+        if (std.meta.activeTag(ctrl.roleOf(ring_idx)) == .index) continue; // stopped by their fronts
         try ctrl.init_ring.ring.pushMsgRingFd(
-            ctrl.rings[i].ring.fd,
+            ctrl.rings[ring_idx].ring.fd,
             messages.ShutdownDemandIdx,
             0,
             .{},
@@ -291,9 +289,10 @@ fn shutdown(ctrl: *lifetime.Controller, total: u16) !void {
     while (done < expected) {
         const cqe = waitOne(&ctrl.init_ring.ring);
         if (cqe.taskIdx() == messages.ShutdownDoneIdx) {
-            const thread_idx: u16 = @intCast(cqe.res);
-            if (thread_idx >= total or stopped[thread_idx]) continue;
-            stopped[thread_idx] = true;
+            // `res` is the sender's ring index, its slot in every shared array.
+            const sender_ring_idx: u16 = @intCast(cqe.res);
+            if (sender_ring_idx >= total or stopped[sender_ring_idx]) continue;
+            stopped[sender_ring_idx] = true;
             done += 1;
             continue;
         }
@@ -309,11 +308,10 @@ fn shutdown(ctrl: *lifetime.Controller, total: u16) !void {
 
 fn reportNotStopped(ctrl: *lifetime.Controller, total: u16, stopped: *const [max_threads]bool) void {
     std.debug.print("shutdown timed out; still running:", .{});
-    var i: u16 = 0;
-    while (i < total) : (i += 1) {
-        if (stopped[i]) continue;
-        const role = ctrl.roleAt(i) catch continue;
-        std.debug.print(" {s}#{d}", .{ role.name(), i });
+    var ring_idx: u16 = 0;
+    while (ring_idx < total) : (ring_idx += 1) {
+        if (stopped[ring_idx]) continue;
+        std.debug.print(" {s}#{d}", .{ ctrl.roleOf(ring_idx).name(), ring_idx });
     }
     std.debug.print("\n", .{});
 }
