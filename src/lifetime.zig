@@ -205,7 +205,7 @@ pub const Controller = struct {
             .elephant => return,
         };
         zigring.Thread.setSelfAffinity(core) catch |err| {
-            std.debug.print("thread {d}: could not pin to core {d}: {s}\n", .{ role.threadIdx(), core, @errorName(err) });
+            std.debug.print("thread {d}: failed to pin to core {d}: {s}\n", .{ role.threadIdx(), core, @errorName(err) });
         };
     }
 
