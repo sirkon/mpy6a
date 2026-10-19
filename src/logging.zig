@@ -164,8 +164,8 @@ test "test logging" {
     try lt.init(std.testing.allocator, &cfg);
     defer lt.deinit();
     var logger = try lt.getInitLogger();
-    defer logger.deinit(lt.allocator);
     defer std.testing.allocator.destroy(logger);
+    defer logger.deinit(lt.allocator);
 
     logger.logger.warn("hello", .{ .reply = "world" });
 }

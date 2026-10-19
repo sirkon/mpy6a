@@ -244,9 +244,9 @@ pub const LoggerStuff = struct {
     logger: logging.Logger,
 
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-        self.pool.deinit();
-        self.sink.deinit(allocator);
         self.logger.deinit();
+        self.sink.deinit(allocator);
+        self.pool.deinit();
     }
 };
 
