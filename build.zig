@@ -36,6 +36,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("verztable");
+    const dap_mod = b.dependency("dap", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("dap");
+    const siggy_mod = b.dependency("siggy", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("siggy");
 
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
@@ -66,6 +74,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "blog", .module = blog_mod },
             .{ .name = "zigring", .module = zigring_mod },
             .{ .name = "verztable", .module = verztable_mod },
+            .{ .name = "dap", .module = dap_mod },
+            .{ .name = "siggy", .module = siggy_mod },
         },
         .link_libc = true,
     });
@@ -111,6 +121,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "blog", .module = blog_mod },
                 .{ .name = "zigring", .module = zigring_mod },
                 .{ .name = "verztable", .module = verztable_mod },
+                .{ .name = "dap", .module = dap_mod },
+                .{ .name = "siggy", .module = siggy_mod },
             },
         }),
     });
@@ -143,9 +155,7 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -210,6 +220,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zigring", .module = zigring_mod },
                 .{ .name = "verztable", .module = verztable_mod },
                 .{ .name = "jsonescape", .module = jsonescape_mod },
+                .{ .name = "dap", .module = dap_mod },
+                .{ .name = "siggy", .module = siggy_mod },
             },
         });
 

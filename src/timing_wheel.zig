@@ -372,7 +372,7 @@ fn checkInvariants(comptime W: type, w: *W) void {
 
     // P2: chain integrity, reset state, distinct indices.
     {
-        var seen = [_]bool{false} ** W.L;
+        var seen: [W.L]bool = @splat(false);
         var chain_len: usize = 0;
         var idx = pool.free;
         while (idx != NIL) {
@@ -762,7 +762,7 @@ test "shift grows the buffer and returns the drained set" {
     backing = r.backing;
 
     try std.testing.expectEqual(@as(usize, Small.N + 1), r.size);
-    var seen = [_]bool{false} ** (Small.N + 1);
+    var seen: [Small.N + 1]bool = @splat(false);
     for (r.backing[0..r.size]) |v| {
         try std.testing.expect(v >= 1000 and v < 1000 + Small.N + 1);
         seen[@intCast(v - 1000)] = true;

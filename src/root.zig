@@ -40,13 +40,16 @@ test "basic add functionality" {
 test "dependencies are reachable" {
     const allocator = std.testing.allocator;
 
-    var pool = try blog.BufferPool.init(allocator, 64, 16 * 1024);
+    var pool: blog.BufferPool = undefined;
+    try pool.init(allocator, 64, 16 * 1024);
     defer pool.deinit();
 
-    var sink = blog.MemorySink.init(allocator);
+    var sink: blog.MemorySink = undefined;
+    sink.init(allocator);
     defer sink.deinit();
 
-    var logger = blog.Logger(blog.BufferPool, blog.MemorySink).init(&pool, &sink);
+    var logger: blog.Logger(blog.BufferPool, blog.MemorySink) = undefined;
+    logger.init(&pool, &sink);
     defer logger.deinit();
     logger.info("shard ready", .{ .cores = 8 });
     try std.testing.expect(sink.bytes.items.len > 0);

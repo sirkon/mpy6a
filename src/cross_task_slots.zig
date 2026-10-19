@@ -37,7 +37,7 @@ pub const CrossTaskSlots = struct {
     /// `n` must be at least 1; the returned allocator owns the slices, so
     /// `deinit` must be called on the same instance, and the peer threads must
     /// have stopped before that happens.
-    pub fn init(allocator: std.mem.Allocator, n: usize) !Self {
+    pub fn init(self: *Self, allocator: std.mem.Allocator, n: usize) !void {
         // An empty table has no valid head/tail pair (head would start at 0,
         // one past the last free slot), and an index must fit in i32.
         if (n == 0 or n > std.math.maxInt(i32)) return error.InvalidSize;
@@ -54,14 +54,15 @@ pub const CrossTaskSlots = struct {
         }
         nexts[n - 1] = -1;
 
-        return .{
+        self.* = .{
             .allocator = allocator,
             .tasks = tasks,
             .head = 0,
             .tail = @intCast(n - 1),
             .nexts = nexts,
-            .mutex = zigring.Mutex.init(),
+            .mutex = undefined,
         };
+        self.mutex.init();
     }
 
     /// Destroys the mutex and returns the slices to the allocator.
@@ -137,7 +138,8 @@ fn freeCount(slots: *const CrossTaskSlots) usize {
 }
 
 test "init links every slot in index order and starts empty of handed-out slots" {
-    var slots = try CrossTaskSlots.init(std.testing.allocator, 4);
+    var slots: CrossTaskSlots = undefined;
+    try slots.init(std.testing.allocator, 4);
     defer slots.deinit();
 
     try expectEqual(@as(i32, 0), slots.head);
@@ -151,7 +153,8 @@ test "init links every slot in index order and starts empty of handed-out slots"
 }
 
 test "acquire pops the head and reports exhaustion" {
-    var slots = try CrossTaskSlots.init(std.testing.allocator, 3);
+    var slots: CrossTaskSlots = undefined;
+    try slots.init(std.testing.allocator, 3);
     defer slots.deinit();
 
     var taken: [3]u32 = undefined;
@@ -174,7 +177,8 @@ test "acquire pops the head and reports exhaustion" {
 }
 
 test "single-slot allocator cycles between full and empty" {
-    var slots = try CrossTaskSlots.init(std.testing.allocator, 1);
+    var slots: CrossTaskSlots = undefined;
+    try slots.init(std.testing.allocator, 1);
     defer slots.deinit();
 
     try expectEqual(@as(i32, 0), slots.head);
@@ -194,7 +198,8 @@ test "single-slot allocator cycles between full and empty" {
 }
 
 test "release appends to the tail so freed slots come back in release order" {
-    var slots = try CrossTaskSlots.init(std.testing.allocator, 3);
+    var slots: CrossTaskSlots = undefined;
+    try slots.init(std.testing.allocator, 3);
     defer slots.deinit();
 
     for (0..3) |_| _ = try slots.acquire();
@@ -225,12 +230,14 @@ test "release appends to the tail so freed slots come back in release order" {
 }
 
 test "init rejects a zero-slot allocator" {
-    try std.testing.expectError(error.InvalidSize, CrossTaskSlots.init(std.testing.allocator, 0));
+    var slots: CrossTaskSlots = undefined;
+    try std.testing.expectError(error.InvalidSize, slots.init(std.testing.allocator, 0));
 }
 
 test "concurrent acquire and release keep every slot on the free-list" {
     const thread_count = 4;
-    var slots = try CrossTaskSlots.init(std.testing.allocator, 8);
+    var slots: CrossTaskSlots = undefined;
+    try slots.init(std.testing.allocator, 8);
     defer slots.deinit();
 
     const Worker = struct {
@@ -241,7 +248,7 @@ test "concurrent acquire and release keep every slot on the free-list" {
             var k: usize = 0;
             while (k < self.iterations) : (k += 1) {
                 const i = self.slots.acquire() catch continue;
-                self.slots.at(i).* = .{ .Placeholder = .{} };
+                self.slots.at(i).* = .{ .ShutdownDemand = .{ .hard = false } };
                 self.slots.release(i);
             }
         }
@@ -250,7 +257,7 @@ test "concurrent acquire and release keep every slot on the free-list" {
     var workers: [thread_count]Worker = undefined;
     var threads: [thread_count]zigring.Thread = undefined;
     for (&workers) |*w| w.* = .{ .slots = &slots, .iterations = 2000 };
-    for (&workers, &threads) |*w, *t| t.* = try zigring.Thread.spawn(w, Worker.run);
+    for (&workers, &threads) |*w, *t| try t.spawn(w, Worker.run);
     for (&threads) |t| t.join();
 
     try expectEqual(slots.tasks.len, freeCount(&slots));

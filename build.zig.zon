@@ -25,7 +25,7 @@
     .fingerprint = 0x24367719a221b49f, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -40,12 +40,20 @@
             .hash = "jsonescape-0.0.2-AjQcMAgsAQDGi9rSvRrEsll7y0WlaIM6XcPTNC8Cd6kv",
         },
         .zigring = .{
-            .url = "git+https://github.com/sirkon/zigring.git#1ed6293ebbaeb787f27c5f175ea16891b9b5591f",
-            .hash = "zigring-0.0.8-Srja3x7bAgAVAC_-nuKxa-u2eA_P1-aJgwizoo7TSYMy",
+            .url = "git+https://github.com/sirkon/zigring.git?ref=master#adad99c1d9e146c1e6a4a292589d4c9eb4b7ead9",
+            .hash = "zigring-0.0.13-Srja33UZAwCL_I_G49s_vLEe0ZDxG6lmmxmcjnxk28EG",
         },
         .blog = .{
-            .url = "git+https://github.com/sirkon/blog.git#9e9cd7116160facc2488e12acdb85b45a4cb163a",
-            .hash = "blog-0.0.7-IN2Y3x6TBAAubFv8rIsnolHgnmFLydfQmBlEhb4nJ8My",
+            .url = "git+https://github.com/sirkon/blog.git?ref=master#cf44881ec1220691a679f79e1bbffb7682bd9283",
+            .hash = "blog-0.0.15-IN2Y3yVHBQB2_ADUWUTEpsqapgZ3tsuJ3x568CczJl5p",
+        },
+        .dap = .{
+            .url = "git+https://github.com/sirkon/dap.git?ref=master#2abdabcd4efbb4965f838343d1175c30573a11d3",
+            .hash = "dap-0.0.9-XZkAImIzBQC0uhjtpEwr4qouXGIavS9fUmHktU-feKVy",
+        },
+        .siggy = .{
+            .url = "git+https://github.com/sirkon/siggy.git?ref=master#9933fec6d2088d57e01e3c067e95eef53b96e705",
+            .hash = "siggy-0.0.1-l6MsrVPmAQBaNqWUpgEuaYcIrGcNGOX14dqVlEYoHeK0",
         },
     },
     .paths = .{
