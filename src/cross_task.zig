@@ -32,16 +32,16 @@ pub const CrossTask = union(enum) {
         hard: bool,
     },
 
-    /// Front -> index: stop accepting new sessions and drain. Delivered both
-    /// through the index inbox (the cheap path, see `index.IndexTask`) and
-    /// through a slot when the front no longer trusts the inbox.
+    /// Front -> index: stop accepting new sessions and drain. The normal path
+    /// is the index inbox (`index.FrontMessage.shutdown_soft`); this slot-borne
+    /// variant exists for a front that no longer trusts the inbox.
     SoftShutdown: struct {
         thread_idx: u16,
     },
 
-    /// Process -> front: the listening socket, sent after the process thread
-    /// bound and listened. The descriptor is a `dup` made for this front, so
-    /// each front owns and closes its own copy.
+    /// Process -> worker: the listening socket. The skeleton sends it in the
+    /// `res` word of the `START_WORK` broadcast instead of through a slot; the
+    /// variant stays part of the vocabulary for senders that need a slot.
     ServerSocket: struct {
         fd: posix.fd_t,
     },
@@ -94,10 +94,9 @@ test "variants round-trip through a slot" {
     try std.testing.expectError(error.CrossTaskFull, slots.acquire());
 }
 
-test "shutdown and control codes stay out of the wakeup space" {
-    // The union's `msg_result` companions must not collide with the inbox
-    // protocol's payload-less wakeup base.
-    try expect(messages.ShutdownDemandMsgResult < messages.ControlMsgResultBase + 8);
-    try expect(messages.SignalMsgResult < index_inbox.NoPayloadMsgResultBase);
+test "control codes stay out of the wakeup space" {
+    // Control codes must not collide with the inbox protocol's payload-less
+    // wakeup base.
+    try expect(messages.ShutdownTickMsgResult < index_inbox.NoPayloadMsgResultBase);
     try expectEqual(@as(u32, index_inbox.NoPayloadMsgResultBase + 1), index_inbox.IndexWakeupMsgResult);
 }

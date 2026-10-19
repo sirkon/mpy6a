@@ -132,8 +132,11 @@ pub fn IndexInbox(comptime TaskT: type) type {
         sleep_flag: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
 
         /// Ring of the owning Front thread: the wakeup `MSG_RING` CQE of `push`
-        /// is submitted through it. Immutable after publication (INV-7): written
-        /// once, single-threaded, before any `Thread.spawn`.
+        /// is submitted through it. Written once by the owning Front with
+        /// `setFrontRing`, after the startup barrier published every ring and
+        /// before that Front takes its first session. The `START_WORK` barrier
+        /// establishes the invariant that it is valid whenever a producer can
+        /// call `push`, so no runtime check is made here.
         front_ring: *zigring.Ring,
 
         /// Ring of this Index: the consumer opens its batched CQ window on it,
@@ -156,14 +159,22 @@ pub fn IndexInbox(comptime TaskT: type) type {
         /// by `batch` as `Batch.front`.
         batch_front: BatchInbox,
 
+        /// Cleanup bookkeeping: true between `init` and `deinit`. The inbox is
+        /// released by the controller after every thread has stopped, so this
+        /// flag lets it skip slots that were never created.
+        initialized: bool = false,
+
         /// Bootstrap only, single-threaded, before any `Thread.spawn` (INV-7).
         /// Allocates the `capacity_pow2` slot array; `capacity_pow2` must be a
         /// power of two in [2, 2^30]. `deinit` releases the slots.
+        ///
+        /// The producer ring is attached separately with `setFrontRing`: an
+        /// Index creates its inbox before the owning Front is ready to accept,
+        /// and only that Front ever submits through the ring.
         pub fn init(
             self: *Self,
             allocator: std.mem.Allocator,
             capacity_pow2: u32,
-            front_ring: *zigring.Ring,
             index_ring: *zigring.Ring,
         ) InitError!void {
             if (capacity_pow2 < 2 or capacity_pow2 > (1 << 30))
@@ -179,17 +190,26 @@ pub fn IndexInbox(comptime TaskT: type) type {
             self.head = std.atomic.Value(u32).init(0);
             self.cached_head = 0;
             self.sleep_flag = std.atomic.Value(bool).init(false);
-            self.front_ring = front_ring;
+            self.front_ring = undefined;
             self.index_ring = index_ring;
             self.misses = 0;
             self.batch_cq = undefined;
             self.batch_front = .{ .inbox = self, .remaining = 0 };
+            self.initialized = true;
         }
 
         /// Releases the slot array. The caller must ensure both peer threads
         /// have stopped using the inbox.
         pub fn deinit(self: *Self) void {
+            if (!self.initialized) return;
+            self.initialized = false;
             self.allocator.free(self.slots);
+        }
+
+        /// Producer side: called by the owning Front thread after the startup
+        /// barrier, before it can push anything.
+        pub fn setFrontRing(self: *Self, front_ring: *zigring.Ring) void {
+            self.front_ring = front_ring;
         }
 
         /// Producer side: the owning Front thread ONLY (INV-1). Enqueues the
@@ -318,7 +338,7 @@ pub fn IndexInbox(comptime TaskT: type) type {
         /// A window that exposes nothing but still commits safely (its head is
         /// the ring's current head, so `commit` is a no-op).
         inline fn emptyCqView(self: *Self) zigring.BatchCQ {
-            const head = self.index_ring.cqHead.*;
+            const head = self.index_ring.cq_head.*;
             return .{ .ring = self.index_ring, .head = head, .tail = head };
         }
     };
@@ -369,10 +389,10 @@ test "init rejects non-power-of-two and out-of-range capacities" {
     defer index_ring.deinit();
 
     var inbox: TestInbox = undefined;
-    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 0, &front_ring, &index_ring));
-    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 1, &front_ring, &index_ring));
-    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 3, &front_ring, &index_ring));
-    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 1 << 31, &front_ring, &index_ring));
+    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 0, &index_ring));
+    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 1, &index_ring));
+    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 3, &index_ring));
+    try std.testing.expectError(error.InvalidCapacity, inbox.init(std.testing.allocator, 1 << 31, &index_ring));
 }
 
 test "capacity is per-instance at runtime" {
@@ -384,10 +404,10 @@ test "capacity is per-instance at runtime" {
     defer index_ring.deinit();
 
     var small: TestInbox = undefined;
-    try small.init(std.testing.allocator, 2, &front_ring, &index_ring);
+    try small.init(std.testing.allocator, 2, &index_ring);
     defer small.deinit();
     var large: TestInbox = undefined;
-    try large.init(std.testing.allocator, 128, &front_ring, &index_ring);
+    try large.init(std.testing.allocator, 128, &index_ring);
     defer large.deinit();
 
     try std.testing.expectEqual(@as(u32, 2), small.capacity_pow2);
@@ -410,7 +430,7 @@ test "inbound FIFO single producer" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 8, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 8, &index_ring);
     defer inbox.deinit();
 
     var n: u32 = 0;
@@ -428,7 +448,7 @@ test "inbound full fails immediately and slot is reusable" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 2, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 2, &index_ring);
     defer inbox.deinit();
 
     try inbox.push(.{ .v = 1 });
@@ -449,7 +469,7 @@ test "inbound SPSC two threads: FIFO under backpressure" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 64, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 64, &index_ring);
     defer inbox.deinit();
 
     const Producer = struct {
@@ -488,8 +508,9 @@ test "push enqueues and posts wakeup CQE to the target ring" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 64, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 64, &index_ring);
     defer inbox.deinit();
+    inbox.setFrontRing(&front_ring);
 
     inbox.sleep_flag.store(true, .release);
     try inbox.push(.{ .v = 42 });
@@ -515,7 +536,7 @@ test "push fast path skips the wakeup when the Index is polling" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 64, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 64, &index_ring);
     defer inbox.deinit();
 
     try inbox.push(.{ .v = 7 });
@@ -537,7 +558,7 @@ test "inbound counter wrap-around is transparent (INV-2)" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 4, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 4, &index_ring);
     defer inbox.deinit();
 
     // Wrap both frontiers past 2^32 - 3 so every push/pop crosses the wrap.
@@ -561,7 +582,7 @@ test "batch caps the inbound window and leaves the rest queued" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 64, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 64, &index_ring);
     defer inbox.deinit();
 
     var n: u32 = 0;
@@ -589,8 +610,9 @@ test "batch yields the CQ window when only the ring has work" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 64, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 64, &index_ring);
     defer inbox.deinit();
+    inbox.setFrontRing(&front_ring);
 
     // Announce sleep, then push: the wakeup CQE lands on the Index ring while
     // the task stays in the inbound queue (the batch window is front-capped).
@@ -621,7 +643,7 @@ test "batch tracks misses: null bumps, success resets" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 64, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 64, &index_ring);
     defer inbox.deinit();
 
     try std.testing.expect(inbox.batch(8, 8) == null);
@@ -643,7 +665,7 @@ test "hang aborts without parking when work is already visible" {
     try index_ring.init(64, null);
     defer index_ring.deinit();
     var inbox: TestInbox = undefined;
-    try inbox.init(std.testing.allocator, 64, &front_ring, &index_ring);
+    try inbox.init(std.testing.allocator, 64, &index_ring);
     defer inbox.deinit();
 
     const cfg = LoopConfig{ .batch_k = 4, .idle_iters_n = 2 };
@@ -719,7 +741,8 @@ test "hang parks, wakes on push, and delivers the task" {
         .delivered = std.atomic.Value(u32).init(0),
         .stop = std.atomic.Value(bool).init(false),
     };
-    try index.inbox.init(std.heap.page_allocator, 64, &index.front_ring, &index.index_ring);
+    try index.inbox.init(std.heap.page_allocator, 64, &index.index_ring);
+    index.inbox.setFrontRing(&index.front_ring);
     var worker: zigring.Thread = undefined;
     try worker.spawn(&index, IndexCtx.run);
 

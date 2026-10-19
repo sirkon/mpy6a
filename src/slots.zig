@@ -33,7 +33,7 @@ comptime {
     // Slots indices stay below `max_capacity`, which must stay below every
     // reserved control index in `messages.zig`.
     std.debug.assert(max_capacity < messages.max_slot_capacity);
-    std.debug.assert(max_capacity - 1 < messages.SignalEventIdx);
+    std.debug.assert(max_capacity - 1 < messages.InitTimeoutIdx);
 }
 
 /// What a tracked operation was doing. Stored by copy (no destructor ever

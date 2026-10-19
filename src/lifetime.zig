@@ -1,4 +1,21 @@
+//! Process lifetime: the shared state every thread of the shard is built on,
+//! and the single entry point working threads start from.
+//!
+//! `Controller` owns everything that is not thread-local: the array of rings,
+//! the array of index inboxes, the cross-thread task slots, the ring factory,
+//! the init ring and the thread handles. A working thread starts in
+//! `runThread`, which derives the thread's role from the rolling counter,
+//! creates the thread-local ring and logger, publishes what has to be
+//! published and dispatches into `front.zig`, `index.zig` or `elephant.zig`.
+//! A counter value that disagrees with the launch order is fatal.
+//!
+//! The two-phase startup contract is documented in
+//! docs/startup-en-reworked.md: initialization publishes and reports, and only
+//! the init thread's `START_WORK` broadcast moves any thread into its working
+//! loop.
+
 const std = @import("std");
+const posix = std.posix;
 const config = @import("config.zig");
 const zigring = @import("zigring");
 const idxinbox = @import("index_inbox.zig");
@@ -7,20 +24,24 @@ const cross_slots = @import("cross_task_slots.zig");
 const logging = @import("logging.zig");
 const blog = @import("blog");
 const slots = @import("slots.zig");
+const messages = @import("messages.zig");
 
-/// Lifetime controller.
+/// The controller that owns all shared process resources.
 pub const Controller = struct {
     const Self = @This();
-    const IndexInbox = idxinbox.IndexInbox(indexmod.FrontMessage);
+
+    pub const IndexInbox = idxinbox.IndexInbox(indexmod.FrontMessage);
 
     allocator: std.mem.Allocator,
 
     /// Application config.
     cfg: *const config.Config,
 
-    /// "Hidden" atomic counter for roles distribution.
+    /// "Hidden" atomic counter for role distribution.
     rolling_role_idx: u32 align(std.atomic.cache_line),
+    /// One slot per thread, indexed exactly as the role numbering.
     rings: []RingStuff,
+    /// One inbox per index thread, indexed by the index's global number.
     inboxes: []IndexInbox,
 
     /// Ring of the main lifetime controller thread.
@@ -30,9 +51,22 @@ pub const Controller = struct {
     /// Storage for cross-thread interaction.
     cross_slots: cross_slots.CrossTaskSlots,
 
-    /// Logging stuff.
-    /// Constructor gets cfg as a borrowed value.
-    /// Allocates containers for data.
+    /// Lifetime-owned timer arguments. The kernel reads these asynchronously,
+    /// so they must outlive the helper that armed the timer. Keeping them here
+    /// makes them valid until `deinit`, after every worker has been joined.
+    init_deadline_spec: std.os.linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+    shutdown_tick_spec: std.os.linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+
+    /// Handles of the spawned working threads, in role order.
+    threads: []zigring.Thread,
+    /// Per-thread context handed to `runThread`.
+    thread_ctx: []ThreadContext,
+    /// How many of `threads` were actually spawned.
+    spawned: usize,
+
+    /// Allocates the shared arrays. Rings and inboxes stay `undefined` here:
+    /// each thread publishes its own ring, and each index creates its own
+    /// inbox, during its initialization.
     pub fn init(self: *Self, allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         const subjects: usize = @intCast(cfg.fronts + cfg.indexes + cfg.elephants);
 
@@ -41,6 +75,12 @@ pub const Controller = struct {
 
         const inboxes = try allocator.alloc(IndexInbox, cfg.indexes);
         errdefer allocator.free(inboxes);
+
+        const threads = try allocator.alloc(zigring.Thread, subjects);
+        errdefer allocator.free(threads);
+
+        const thread_ctx = try allocator.alloc(ThreadContext, subjects);
+        errdefer allocator.free(thread_ctx);
 
         self.* = .{
             .allocator = allocator,
@@ -51,6 +91,9 @@ pub const Controller = struct {
             .ring_factory = undefined,
             .init_ring = undefined,
             .cross_slots = undefined,
+            .threads = threads,
+            .thread_ctx = thread_ctx,
+            .spawned = 0,
         };
 
         try self.ring_factory.init(allocator, cfg.sqpoll_threads);
@@ -62,12 +105,113 @@ pub const Controller = struct {
         errdefer self.cross_slots.deinit();
     }
 
+    /// Releases the shared containers and the resources the init thread owns.
+    ///
+    /// Worker rings are owned by their threads and torn down there, so the
+    /// caller must have joined all working threads first. Index inboxes are
+    /// shared with the parent fronts and are released here, after every thread
+    /// has stopped; uninitialized slots are skipped. The init ring goes last
+    /// because it may be the poller master every worker ring attaches to.
     pub fn deinit(self: *Self) void {
-        self.allocator.free(self.rings);
+        for (self.inboxes) |*inbox| inbox.deinit();
+
+        self.allocator.free(self.thread_ctx);
+        self.allocator.free(self.threads);
         self.allocator.free(self.inboxes);
+        self.allocator.free(self.rings);
         self.cross_slots.deinit();
         self.init_ring.deinit();
         self.ring_factory.deinit();
+    }
+
+    /// Spawns every working thread in role order, pinning fronts and indexes to
+    /// their configured cores. Elephants have no configured mask and are left
+    /// unpinned.
+    pub fn spawnThreads(self: *Self) !void {
+        const cfg = self.cfg;
+
+        // The role is decided by the atomic counter inside each thread, so the
+        // spawner cannot pin by slot. Every thread pins itself once it knows its
+        // role; spawn order only has to match the role ranges in the counter.
+        const total: usize = @as(usize, cfg.fronts) + cfg.indexes + cfg.elephants;
+        for (0..total) |i| {
+            self.thread_ctx[i] = .{ .ctrl = self };
+            try self.threads[i].spawn(&self.thread_ctx[i], runThread);
+            self.spawned += 1;
+        }
+    }
+
+    /// Joins every spawned working thread. Only valid once every thread has
+    /// left its service loop; joining a live thread blocks.
+    pub fn joinThreads(self: *Self) void {
+        for (self.threads[0..self.spawned]) |thread| thread.join();
+    }
+
+    /// The entry point of every working thread. It performs the thread-local
+    /// part of phase A, reports `INITIALIZED` to the init ring and only then
+    /// dispatches to the role logic. Any failure here is fatal by contract.
+    ///
+    /// The role comes from the atomic counter incremented at thread start, as
+    /// docs/startup-en-reworked.md requires. The counter value is the thread's
+    /// slot in every shared array, so a value outside the configured ranges is
+    /// fatal: the formula and the launch order have diverged.
+    pub fn runThread(ctx: *ThreadContext) void {
+        const self = ctx.ctrl;
+        const role = self.getRole() catch |err| {
+            std.debug.print("role distribution failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        const thread_idx = role.threadIdx();
+        self.pinSelf(role);
+
+        self.initRing(thread_idx, 1) catch |err| fatal("ring initialization", thread_idx, err);
+        defer self.rings[thread_idx].deinit();
+
+        const logger = self.getLogger(thread_idx) catch |err| fatal("logger creation", thread_idx, err);
+        defer {
+            logger.deinit(self.allocator);
+            self.allocator.destroy(logger);
+        }
+
+        switch (role) {
+            // An index creates its LLQ and publishes it before reporting.
+            // The inbox is shared with the parent front, which may push into
+            // it until it stops, so the controller releases it after every
+            // thread has been joined; the index thread must not free it here.
+            .index => |r| self.initIndexInbox(r.idx.inbox, r.idx.ring) catch |err| fatal("index inbox initialization", thread_idx, err),
+            .front, .elephant => {},
+        }
+
+        self.rings[thread_idx].ring.pushMsgRingFd(
+            self.init_ring.ring.fd,
+            messages.InitializedIdx,
+            thread_idx,
+            .{},
+        ) catch |err| fatal("INITIALIZED report", thread_idx, err);
+
+        switch (role) {
+            .front => @import("front.zig").run(self, role, logger),
+            .index => @import("index.zig").run(self, role, logger),
+            .elephant => @import("elephant.zig").run(self, role, logger),
+        }
+    }
+
+    /// Pins the calling thread to the core configured for its role. A failure
+    /// is reported but not fatal: an unpinned thread still works correctly.
+    fn pinSelf(self: *Self, role: Role) void {
+        const core: u16 = switch (role) {
+            .front => |r| self.cfg.front_cores.cores[r.ring_idx],
+            .index => |r| self.cfg.index_cores.cores[r.idx.inbox],
+            .elephant => return,
+        };
+        zigring.Thread.setSelfAffinity(core) catch |err| {
+            std.debug.print("thread {d}: could not pin to core {d}: {s}\n", .{ role.threadIdx(), core, @errorName(err) });
+        };
+    }
+
+    fn fatal(what: []const u8, thread_idx: u16, err: anyerror) noreturn {
+        std.debug.print("thread {d}: {s} failed: {s}\n", .{ thread_idx, what, @errorName(err) });
+        std.process.exit(1);
     }
 
     /// Returns a logger and its buffer pool for the given thread. The logging stuff
@@ -119,6 +263,46 @@ pub const Controller = struct {
         /// When we did too much get_role exceeding an amount of planned subjects (fronts, indexes, elephants).
         Overflow,
     };
+
+    /// The role of the thread occupying slot `thread_idx`, without touching
+    /// the counter. This is the formula from the doc, applied to a known slot;
+    /// the process thread uses it to name roles in diagnostics.
+    pub fn roleAt(self: *Self, thread_idx: u16) RoleDistributionError!Role {
+        const cfg = self.cfg;
+        const index_per_front = cfg.indexes / cfg.fronts;
+        if (thread_idx < cfg.fronts) {
+            return .{
+                .front = .{
+                    .ring_idx = thread_idx,
+                    .first_index = .{
+                        .ring = thread_idx * index_per_front + cfg.fronts,
+                        .inbox = thread_idx * index_per_front,
+                    },
+                    .index_count = index_per_front,
+                },
+            };
+        }
+
+        var domain_idx = thread_idx - cfg.fronts;
+        if (domain_idx < cfg.indexes) {
+            return .{
+                .index = .{
+                    .idx = .{
+                        .ring = thread_idx,
+                        .inbox = domain_idx,
+                    },
+                    .front_idx = domain_idx / index_per_front,
+                },
+            };
+        }
+
+        domain_idx -= cfg.indexes;
+        if (domain_idx < cfg.elephants) {
+            return .{ .elephant = .{ .ring_idx = thread_idx } };
+        }
+
+        return RoleDistributionError.Overflow;
+    }
 
     /// Returns computed role. This distribution does as follows:
     ///
@@ -175,27 +359,70 @@ pub const Controller = struct {
         return RoleDistributionError.Overflow;
     }
 
-    // Initializes a ring and its related stuff for a thread with the given idx.
+    /// Initializes a ring and its related stuff for a thread with the given idx.
     pub fn initRing(self: *Self, thread_idx: u32, weight: u32) !void {
         return self.initGivenRing(&self.rings[thread_idx], weight);
     }
 
     fn initGivenRing(self: *Self, stuff: *RingStuff, weight: u32) !void {
+        stuff.ready = false;
         try self.ring_factory.acquireRing(&stuff.ring, self.cfg.queue_depth, weight);
         errdefer stuff.ring.deinit();
         stuff.ring.streamedSQ(&stuff.sqstream);
-        try stuff.slots.init(self.allocator, 4096); // TODO need to set up via config.
+        try stuff.slots.init(self.allocator, self.cfg.ring_slots_capacity);
+        stuff.ready = true;
     }
 
-    // Initializes an input inbox for the given index thread with the given idx.
-    pub fn initIndexInbox(self: *Self, index_idx: u32, index_ring_idx: u32, front_ring_idx: u32) !void {
+    /// Creates, binds and listens on the server socket described by the
+    /// config. The descriptor is owned by the controller's process thread and
+    /// is shared with all fronts through `START_WORK`.
+    pub fn createServerSocket(self: *Self) !std.posix.fd_t {
+        const cfg = self.cfg;
+
+        // The config names an IPv4 endpoint; `localhost` is accepted as the
+        // loopback spelling used by the default document.
+        const ip = if (std.mem.eql(u8, cfg.bind, "localhost"))
+            std.Io.net.Ip4Address.loopback(cfg.port)
+        else
+            try std.Io.net.Ip4Address.parse(cfg.bind, cfg.port);
+
+        const fd = try zigring.createTCPServerSocket();
+        errdefer _ = std.os.linux.close(fd);
+
+        const addr = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, ip.port),
+            .addr = @bitCast(ip.bytes),
+        };
+
+        const bind_res = std.os.linux.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        if (std.os.linux.errno(bind_res) != .SUCCESS) {
+            return posix.unexpectedErrno(std.os.linux.errno(bind_res));
+        }
+
+        const listen_res = std.os.linux.listen(fd, cfg.accept_backlog);
+        if (std.os.linux.errno(listen_res) != .SUCCESS) {
+            return posix.unexpectedErrno(std.os.linux.errno(listen_res));
+        }
+
+        return fd;
+    }
+
+    /// Initializes an input inbox for the given index thread. The producer ring
+    /// is attached later by the owning front, after the startup barrier.
+    pub fn initIndexInbox(self: *Self, index_idx: u32, index_ring_idx: u32) !void {
         try self.inboxes[index_idx].init(
             self.allocator,
             self.cfg.index_inbox_capacity,
             &self.rings[index_ring_idx].ring,
-            &self.rings[front_ring_idx].ring,
         );
     }
+};
+
+/// Fixed context of one working thread. The thread derives everything else,
+/// including its slot in the shared ring array, from the role counter.
+pub const ThreadContext = struct {
+    ctrl: *Controller,
 };
 
 /// Thread role description.
@@ -219,6 +446,24 @@ pub const Role = union(enum) {
     elephant: struct {
         ring_idx: u16,
     },
+
+    /// The slot this thread occupies in the shared ring array.
+    pub fn threadIdx(self: Role) u16 {
+        return switch (self) {
+            .front => |r| r.ring_idx,
+            .index => |r| r.idx.ring,
+            .elephant => |r| r.ring_idx,
+        };
+    }
+
+    /// The role name, for diagnostics.
+    pub fn name(self: Role) []const u8 {
+        return switch (self) {
+            .front => "front",
+            .index => "index",
+            .elephant => "elephant",
+        };
+    }
 };
 
 /// Ring itself and the related stuff.
@@ -228,10 +473,18 @@ pub const RingStuff = struct {
     ring: zigring.Ring,
     sqstream: zigring.StreamSQ,
     slots: slots.RingSlots,
+    /// Timer argument owned by this ring's service loop. The kernel reads it
+    /// asynchronously, so it must outlive the loop frame that armed the timer;
+    /// it lives here until `deinit`, after the thread has been joined.
+    tick_spec: std.os.linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+    /// Whether `initGivenRing` reached the end for this slot.
+    ready: bool = false,
 
     pub fn deinit(self: *Self) void {
+        if (!self.ready) return;
         self.slots.deinit();
         self.ring.deinit();
+        self.ready = false;
     }
 };
 
@@ -258,6 +511,12 @@ test "role distribution" {
     cfg.queue_depth = 64;
     cfg.cross_task_slots = 16;
     cfg.sqpoll_threads = 1;
+    cfg.ring_slots_capacity = 4096;
+    cfg.logging = .{
+        .method = .{ .pretty = .dark },
+        .pool_capacity = 64,
+        .pool_frame_size = 1024,
+    };
 
     var ctrl: Controller = undefined;
     try ctrl.init(std.testing.allocator, &cfg);
@@ -327,10 +586,49 @@ test "role distribution" {
         },
     };
 
-    for (expected) |want| {
+    for (expected, 0..) |want, i| {
         const role = try ctrl.getRole();
         try std.testing.expectEqual(want, role);
+        try std.testing.expectEqual(@as(u16, @intCast(i)), role.threadIdx());
     }
 
     try std.testing.expectError(error.Overflow, ctrl.getRole());
+}
+
+test "roles map to the shared arrays" {
+    var cfg: config.Config = undefined;
+    cfg.fronts = 1;
+    cfg.indexes = 2;
+    cfg.elephants = 1;
+    cfg.queue_depth = 64;
+    cfg.cross_task_slots = 8;
+    cfg.sqpoll_threads = 1;
+    cfg.ring_slots_capacity = 4096;
+    cfg.index_inbox_capacity = 8;
+    cfg.logging = .{
+        .method = .{ .json = {} },
+        .pool_capacity = 64,
+        .pool_frame_size = 1024,
+    };
+
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+    defer ctrl.deinit();
+
+    const front = try ctrl.getRole();
+    try std.testing.expectEqualStrings("front", front.name());
+    try std.testing.expectEqual(@as(u16, 2), front.front.index_count);
+    try std.testing.expectEqual(@as(u16, 1), front.front.first_index.ring);
+
+    const index = try ctrl.getRole();
+    try std.testing.expectEqual(@as(u16, 1), index.index.idx.ring);
+    try std.testing.expectEqual(@as(u16, 0), index.index.idx.inbox);
+
+    const second_index = try ctrl.getRole();
+    try std.testing.expectEqualStrings("index", second_index.name());
+    try std.testing.expectEqual(@as(u16, 2), second_index.threadIdx());
+
+    const elephant = try ctrl.getRole();
+    try std.testing.expectEqualStrings("elephant", elephant.name());
+    try std.testing.expectEqual(@as(u16, 3), elephant.threadIdx());
 }
