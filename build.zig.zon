@@ -44,8 +44,8 @@
             .hash = "zigring-0.0.14-Srja394aAwCDUAgv5pm2rQipUQ7EDu0HXtHytn3dg7Db",
         },
         .blog = .{
-            .url = "git+https://github.com/sirkon/blog.git?ref=master#cf44881ec1220691a679f79e1bbffb7682bd9283",
-            .hash = "blog-0.0.15-IN2Y3yVHBQB2_ADUWUTEpsqapgZ3tsuJ3x568CczJl5p",
+            .url = "git+https://github.com/sirkon/blog.git?ref=master#df15139c786ae1b7654e9001d9d65846ffb0f600",
+            .hash = "blog-0.0.17-IN2Y3w1rBQCvABvMQ1DT6XgXN57jIdFHG69OUp1rekyL",
         },
         .dap = .{
             .url = "git+https://github.com/sirkon/dap.git?ref=master#2abdabcd4efbb4965f838343d1175c30573a11d3",

@@ -142,7 +142,9 @@ pub const IouringSink = struct {
     stream: *zigring.StreamSQ,
     slots: *slots.RingSlots,
 
-    pub fn write(self: *Self, _: *blog.BufferPool, buf: []const u8) blog.WriteError!usize {
+    pub fn write(self: *Self, pool: *blog.BufferPool, buf: []const u8) blog.WriteError!usize {
+        defer _ = pool.put(@constCast(buf));
+
         const task_idx = self.slots.add(.{ .logging = .{
             .buf = @constCast(buf),
         } }) catch |err| {
