@@ -161,20 +161,15 @@ pub const Controller = struct {
     /// docs/startup-en-reworked.md requires, and lives only on this thread's
     /// stack. Its ring index is the thread's slot in every shared array. A
     /// counter value outside the configured ranges is fatal: the formula and
-    /// the launch order have diverged.
+    /// the configured role counts have diverged. The counter value does not
+    /// have to match the spawn slot, because threads may reach the counter in
+    /// any order; only the set of values must be complete.
     pub fn runThread(ctx: *ThreadContext) void {
         const self = ctx.ctrl;
         const ring_idx = self.getRingIdx() catch |err| {
             std.debug.print("role distribution failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
-        if (ring_idx != ctx.spawn_idx) {
-            std.debug.print(
-                "ring {d}: launched as {d}, role distribution disagrees\n",
-                .{ ctx.spawn_idx, ring_idx },
-            );
-            std.process.exit(1);
-        }
 
         const role = self.roleOf(ring_idx);
         self.pinSelf(role);

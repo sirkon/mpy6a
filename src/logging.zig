@@ -3,13 +3,14 @@
 //! Standard error is the only destination for now. Every thread builds its own
 //! `Scoped` logger: its own frame pool, its own `PrettySink` and therefore its
 //! own render scratch space, plus a handle onto the one shared `FdWriter` that
-//! owns the descriptor. Nothing is shared mutably and no lock is taken, so a
-//! log call costs one pooled allocation and one `write(2)`.
+//! owns the descriptor. Render state is per thread, but the final write to the
+//! descriptor is serialised with `std.debug`'s stderr lock: the process also
+//! prints lifecycle messages with `std.debug.print`, and without the shared
+//! lock those records can land in the middle of a rendered frame.
 //!
-//! Records are deliberately not ordered between threads. `FdWriter` is
-//! stateless and each record leaves as a single small `write(2)`; the kernel
-//! serialises those per file description, and a minor reordering or a spliced
-//! record under load is not worth a mutex. Swapping `Writer` for an
+//! Records are deliberately not ordered between threads. Each record leaves as
+//! one `write(2)` while the lock is held, so a caller cannot observe a splice
+//! even if the kernel returns a short write. Swapping `Writer` for an
 //! io_uring-backed sink later needs no change at the call sites.
 //!
 //! `blog`'s sinks are typed over the non-thread-safe pool (`BufferPool(false)`),
@@ -50,10 +51,14 @@ pub const Sink = union(enum) {
         switch (self.*) {
             .pretty => |pretty| {
                 @branchHint(.cold);
+                _ = std.debug.lockStderr(&.{});
+                defer std.debug.unlockStderr();
                 return pretty.sink.write(bufpool, buf);
             },
             .json => |json| {
                 @branchHint(.cold);
+                _ = std.debug.lockStderr(&.{});
+                defer std.debug.unlockStderr();
                 return json.sink.write(bufpool, buf);
             },
             .file => |file| {
