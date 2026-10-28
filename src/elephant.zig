@@ -22,7 +22,9 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
 
     while (true) {
         while (ring.ring.popCQE()) |cqe| {
-            switch (cqe.taskIdx()) {
+            const task_idx = cqe.taskIdx();
+            if (logger.completeLogging(task_idx)) continue;
+            switch (task_idx) {
                 // Launch broadcast: an elephant never touches the socket.
                 messages.StartWorkIdx => {},
                 messages.CrossTaskMessageIdx => {
@@ -61,6 +63,21 @@ fn handleTask(task: @import("cross_task.zig").CrossTask, log: *logging.Logger, r
             _ = std.os.linux.close(socket.fd);
         },
         .IndexDrained => {},
+        // Complaints are addressed to a front: an elephant never owns a
+        // client socket and has nothing to validate.
+        .Complaint => |complaint| {
+            log.warn("elephant got a client complaint", .{
+                .ring_idx = ring_idx,
+                .code = @tagName(complaint.code),
+                .fd = complaint.fd,
+            });
+        },
+        // A handed-over mirror socket belongs to an index: an elephant closes
+        // its copy rather than leaking the descriptor.
+        .MirrorSocket => |mirror| {
+            log.warn("elephant got a mirror socket", .{ .ring_idx = ring_idx, .fd = mirror.fd });
+            _ = std.os.linux.close(mirror.fd);
+        },
     }
 }
 

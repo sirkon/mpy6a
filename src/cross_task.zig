@@ -51,6 +51,40 @@ pub const CrossTask = union(enum) {
     IndexDrained: struct {
         ring_idx: u16,
     },
+
+    /// Index -> parent front: a client the index declares faulty (2.3, 2.5).
+    ///
+    /// The index never writes to such a client itself: the front validates the
+    /// carried tag against its own bookkeeping entry, answers the client with
+    /// the angry reply the code names and marks the socket for the deferred
+    /// close. The offending `session_id` rides along for the angry text of the
+    /// unknown-session case (2.5).
+    Complaint: struct {
+        code: Code,
+        fd: posix.fd_t,
+        tag: usize,
+        session_id: u128,
+    },
+
+    /// Front -> index: an accepted replication connection, already behind its
+    /// greeting (2.3). The front read the greeting, so it knows which host
+    /// dialled and which index service the socket serves; the descriptor
+    /// changes hands here and the index owns it from then on.
+    MirrorSocket: struct {
+        fd: posix.fd_t,
+        host_idx: u8,
+    },
+};
+
+/// Why an index declared a client faulty (2.3, 2.5).
+pub const Code = enum {
+    /// An op for a session that is not in `ExpectOp`: the client pushed a
+    /// mutation before the previous one resolved.
+    protocol_violation,
+    /// A `Close` op: the session is retired and the socket has no more work.
+    closed,
+    /// An op naming a session that does not exist, fatal pole (2.5).
+    unknown_session,
 };
 
 comptime {
@@ -64,7 +98,10 @@ comptime {
                 "' must be plain data, found " ++ @typeName(field_type)),
         }
     }
-    std.debug.assert(@sizeOf(CrossTask) <= 16);
+    // One `Complaint` carries a code, a descriptor, a tag and the offending
+    // session id, so the union outgrows the two `MSG_RING` words. That is
+    // fine: a complaint always travels slot-borne, never in `msg_result`.
+    std.debug.assert(@sizeOf(CrossTask) <= 48);
 }
 
 const expect = std.testing.expect;
@@ -72,7 +109,7 @@ const expectEqual = std.testing.expectEqual;
 
 test "variants round-trip through a slot" {
     var slots: @import("cross_task_slots.zig").CrossTaskSlots = undefined;
-    try slots.init(std.testing.allocator, 4);
+    try slots.init(std.testing.allocator, 8);
     defer slots.deinit();
 
     const a = try slots.acquire();
@@ -91,7 +128,23 @@ test "variants round-trip through a slot" {
     slots.at(d).* = .{ .SoftShutdown = .{ .ring_idx = 2 } };
     try expectEqual(@as(u16, 2), slots.at(d).SoftShutdown.ring_idx);
 
-    try std.testing.expectError(error.CrossTaskFull, slots.acquire());
+    const e = try slots.acquire();
+    slots.at(e).* = .{ .Complaint = .{
+        .code = .protocol_violation,
+        .fd = 11,
+        .tag = 5,
+        .session_id = 1,
+    } };
+    try expectEqual(Code.protocol_violation, slots.at(e).Complaint.code);
+    try expectEqual(@as(usize, 5), slots.at(e).Complaint.tag);
+
+    // Exhaust the rest and prove the table reports a full house.
+    while (true) {
+        _ = slots.acquire() catch |err| {
+            try expectEqual(error.CrossTaskFull, err);
+            break;
+        };
+    }
 }
 
 test "control codes stay out of the wakeup space" {

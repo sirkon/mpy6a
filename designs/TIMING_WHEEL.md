@@ -1,32 +1,34 @@
 # Wheel Description.
 
-The wheel is implemented as a comptime factory: `M`, `N` and `L` are parameters, not hardcoded constants, and the
-factory returns a type specialized to them.
+The wheel is implemented as a comptime factory for the block shape: `N` and `L` are parameters, not hardcoded constants,
+and the factory returns a type specialized to them. The slot count `M` (the ticks) is runtime state, passed to `init`.
 
 ```zig
-pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_int, comptime readyBlocks: comptime_int) type {
+pub fn TimingWheel(comptime blockSize: comptime_int, comptime readyBlocks: comptime_int) type {
     // parameter validation via @compileError
     return struct {
         const Self = @This();
-        pub const M = ticks;
         pub const N = blockSize;
         pub const L = readyBlocks;
-        // structures below, sized by Self.M, Self.N and Self.L
+        pub const MAX_TICKS: u32 = 0x10_0000;
+        // structures below, sized by Self.N and Self.L
     };
 }
 ```
 
-(Parameters are lower-case so the re-exported `M`/`N`/`L` declarations do not shadow them.)
+(Parameters are lower-case so the re-exported `N`/`L` declarations do not shadow them.)
 
-Usage: `const W = TimingWheel(16, 4, 8); const w = try W.init(allocator);`
+Usage: `const W = TimingWheel(4, 8); const w = try W.init(allocator, 16);` where the second argument is `M`, validated
+by `init` as a power of two in `1..MAX_TICKS` (`error.InvalidTicks` otherwise).
 
 ## Slot Ring.
 
-This is an array with a ring cursor and a length that never changes. The length is parameterized by the value M equal to some
-power of two. Each slot contains "stripes" (see below)
+This is an array with a ring cursor and a length that never changes. The length is set at `init` by the runtime value M,
+which must be a power of two. Each slot contains "stripes" (see below)
 
 ```zig
-slots: [Self.M]*Stripe,
+slots: []*Stripe,
+ticks: u32,
 cursor: u32,
 ```
 

@@ -64,10 +64,103 @@ pub const TaskCtx = union(enum) {
     logging: struct {
         buf: []u8,
     },
+    /// Sending one consensus request to one mirror (2.4). The encoded frame is
+    /// a heap buffer that travels with the slot, since the kernel reads it
+    /// until the completion lands; the index frees it there.
+    replicate_op: struct {
+        session_id: u128,
+        host_idx: u8,
+        buf: [*]u8,
+        len: u32,
+    },
+    /// Writing the operation to the WAL, the index' own log (2.4, 2.5 step 5).
+    /// The record buffer travels with the slot: the kernel reads it until the
+    /// completion lands, and the index frees it there.
+    flush_op: struct {
+        session_id: u128,
+        buf: [*]u8,
+        len: u32,
+    },
+    /// Writing one log command to the index' own log (stage 7): an `Isolate`
+    /// decision of this host. The buffer travels with the slot, like a flush,
+    /// and the index frees it on completion.
+    log_command: struct {
+        buf: [*]u8,
+        len: u32,
+    },
+    /// Writing the reply to the client fd: the direct write of 2.5 step 6.
+    /// `known` says whether the id names a session (the state machine tail) or
+    /// is the unknown-session angry write of the non-fatal pole (2.5), which
+    /// has no session to advance. The buffer is freed on completion.
+    reply_op: struct {
+        session_id: u128,
+        fd: std.posix.fd_t,
+        known: bool,
+        buf: [*]u8,
+        len: u32,
+    },
+    /// A front's ticker step: `start` is the stagger one-shot, `run` is the
+    /// periodic tick that relays into the indexes and sweeps the sockets (2.3).
+    front_tick: struct {
+        run: bool,
+    },
+    /// A reply the front writes itself, on a complaint or a rogue session op
+    /// (2.3). The buffer is freed on completion, after which the socket is
+    /// marked for the deferred close.
+    front_reply: struct {
+        fd: std.posix.fd_t,
+        buf: [*]u8,
+        len: u32,
+    },
+    /// A reply from a mirror: a receive on a mirror socket (2.4). The buffer
+    /// lives on the index controller, one per host index, and is only ever
+    /// borrowed by one armed receive per mirror.
+    mirror_recv: struct {
+        host_idx: u8,
+    },
+    /// The multishot accept on a front's replication listener (2.3): a mirror
+    /// connection of another host arrives here and is routed to the index
+    /// service its greeting names.
+    replication_accept: struct {
+        generation: u32 = 0,
+    },
+    /// The greeting read of one accepted mirror connection (2.3). The buffer
+    /// is a small heap allocation that travels with the slot, since the kernel
+    /// reads into it until the completion lands; the front frees it there.
+    replication_greeting: struct {
+        fd: std.posix.fd_t,
+        buf: [*]u8,
+    },
+    /// The cancellation of one greeting read, armed when its deadline expires
+    /// or the front begins to drain (2.3). The cancel's own completion is a
+    /// bookkeeping-only event; the receive reports the cancelled read.
+    greeting_cancel: struct {
+        fd: std.posix.fd_t,
+    },
+    /// Connect/timeout steps of the connection machine (2.4): the connect, the
+    /// greeting and the parked retry.
+    connect_op: struct {
+        host_idx: u8,
+        stage: ConnectStage,
+    },
 
     /// A placeholder that never reaches the ring; used by tests and by slots
     /// that are allocated but not yet armed.
     idle: void,
+};
+
+/// The steps of the mirror connection machine (2.3): a connect SQE, then the
+/// greeting exchange, then the established stream. A failed step parks the
+/// retry on the timing wheel and the machine starts over at `waiting_connect`.
+pub const ConnectStage = enum {
+    /// A connect SQE is in flight, or a retry is parked on the wheel.
+    waiting_connect,
+    /// The connection is up and the greeting is on its way to the peer.
+    greeting_sent,
+    /// The greeting of the peer is awaited.
+    awaiting_accept,
+    /// Both greetings have been exchanged: the socket takes the frames.
+    established,
 };
 
 /// One `Slots` table per ring. Thin wrapper so call sites never deal with the

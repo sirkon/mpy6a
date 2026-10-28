@@ -5,19 +5,22 @@
 //! masking for all ring arithmetic (G3), and keeps every persistent index or
 //! counter in `i32`/`u32` (G4).
 //!
-//! `TimingWheel` is a comptime factory, not a concrete type. Call it with the
-//! three shape parameters and it returns a wheel type specialized to them:
+//! `TimingWheel` is a comptime factory for the block shape, not a concrete
+//! type. Call it with the two comptime shape parameters and it returns a wheel
+//! type specialized to them; the slot count is a runtime parameter of `init`:
 //!
 //! ```zig
-//! const W = TimingWheel(16, 4, 8);
-//! const w = try W.init(allocator);
+//! const W = TimingWheel(4, 8);
+//! const w = try W.init(allocator, 16);
 //! ```
 //!
-//! `M` (slot count), `N` (block capacity) and `L` (inline pool capacity) must
-//! each be a power of two and satisfy `1 <= M <= 2^20`, `1 <= N <= 2^20`,
-//! `1 <= L <= 2^30`; violations are `@compileError`s raised while instantiating
-//! the type. Each returned type re-exports its parameters as `W.M`, `W.N` and
-//! `W.L`.
+//! `N` (block capacity) and `L` (inline pool capacity) must each be a power of
+//! two and satisfy `1 <= N <= 2^20`, `1 <= L <= 2^30`; violations are
+//! `@compileError`s raised while instantiating the type. `M` (slot count, the
+//! number of ticks in the ring) is runtime state: `init` validates that it is a
+//! power of two satisfying `1 <= M <= 2^20` and returns `error.InvalidTicks`
+//! otherwise. Each returned type re-exports its comptime parameters as `W.N`
+//! and `W.L`; the runtime slot count of an instance is `w.ticks`.
 
 const std = @import("std");
 
@@ -35,16 +38,14 @@ pub const Pos = struct { block: u32, slot: u32 };
 /// Decoded set of payloads returned by `shift`.
 pub const ShiftResult = struct { backing: []u64, size: usize };
 
-/// Build a timing wheel type with `ticks` slots, blocks of `blockSize` payload
-/// slots, and an inline pool of `readyBlocks` blocks. All three are comptime
-/// parameters; the returned type owns no global state, so several differently
-/// shaped wheels can coexist in one binary.
-pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_int, comptime readyBlocks: comptime_int) type {
+/// Build a timing wheel type whose blocks hold `blockSize` payload slots and
+/// whose inline pool holds `readyBlocks` blocks. Both are comptime parameters;
+/// the runtime slot count is supplied to `init`. The returned type owns no
+/// global state, so several differently shaped wheels can coexist in one binary.
+pub fn TimingWheel(comptime blockSize: comptime_int, comptime readyBlocks: comptime_int) type {
     comptime {
-        if (!std.math.isPowerOfTwo(ticks)) @compileError("ticks must be a power of two");
         if (!std.math.isPowerOfTwo(blockSize)) @compileError("blockSize must be a power of two");
         if (!std.math.isPowerOfTwo(readyBlocks)) @compileError("readyBlocks must be a power of two");
-        if (ticks < 1 or ticks > 0x10_0000) @compileError("ticks must satisfy 1 <= M <= 2^20");
         if (blockSize < 1 or blockSize > 0x10_0000) @compileError("blockSize must satisfy 1 <= N <= 2^20");
         if (readyBlocks < 1 or readyBlocks > 0x4000_0000) @compileError("readyBlocks must fit the i32 free index");
     }
@@ -52,8 +53,8 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
     return struct {
         const Self = @This();
 
-        /// Wheel slot count, fixed at instantiation.
-        pub const M = ticks;
+        /// Largest accepted runtime slot count.
+        pub const MAX_TICKS: u32 = 0x10_0000;
         /// Payload slots per block, fixed at instantiation.
         pub const N = blockSize;
         /// Blocks held inline by the pool, fixed at instantiation.
@@ -160,18 +161,30 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
             }
         };
 
-        slots: [Self.M]*Stripe,
+        /// Ring of stripes, allocated at `init` with `ticks` entries.
+        slots: []*Stripe,
+        /// Runtime slot count: a power of two in `1..MAX_TICKS`.
+        ticks: u32,
         cursor: u32,
         pool: BlocksPool,
         allocator: std.mem.Allocator,
 
-        /// Heap-allocate and initialize a wheel. The returned object owns inline
-        /// pool storage and must never be moved or copied: stripes hold raw
-        /// pointers into it.
-        pub fn init(allocator: std.mem.Allocator) error{OutOfMemory}!*Self {
+        /// Mask applied to the cursor to land inside `slots`.
+        inline fn mask(self: *const Self) u32 {
+            return self.ticks - 1;
+        }
+
+        /// Heap-allocate and initialize a wheel with `ticks` ring slots. The
+        /// returned object owns inline pool storage and must never be moved or
+        /// copied: stripes hold raw pointers into it. Returns `InvalidTicks`
+        /// unless `ticks` is a power of two in `1..MAX_TICKS`.
+        pub fn init(allocator: std.mem.Allocator, ticks: u32) error{ OutOfMemory, InvalidTicks }!*Self {
+            if (ticks < 1 or ticks > Self.MAX_TICKS or !std.math.isPowerOfTwo(ticks)) return error.InvalidTicks;
+
             const w = try allocator.create(Self);
             errdefer allocator.destroy(w);
             w.allocator = allocator;
+            w.ticks = ticks;
             w.cursor = 0;
             w.pool.allocator = allocator;
             w.pool.free = 0;
@@ -189,23 +202,25 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
                 w.pool.nexts[i] = if (i + 1 < Self.L) @intCast(i + 1) else NIL;
             }
 
+            const slots = try allocator.alloc(*Stripe, ticks);
+            errdefer allocator.free(slots);
             var created: usize = 0;
-            errdefer for (0..created) |j| allocator.destroy(w.slots[j]);
-            while (created < Self.M) : (created += 1) {
+            errdefer for (0..created) |j| allocator.destroy(slots[j]);
+            while (created < slots.len) : (created += 1) {
                 const s = try allocator.create(Stripe);
                 s.* = .{ .blocks = &.{}, .len = 0, .last = NIL };
-                w.slots[created] = s;
+                slots[created] = s;
             }
+            w.slots = slots;
             return w;
         }
 
         /// Release every owned allocation: outstanding heap blocks, stripe
-        /// capacity slices, stripe objects, then the wheel itself (inline pool
-        /// storage is freed with it).
+        /// capacity slices, stripe objects, the slot ring, then the wheel itself
+        /// (inline pool storage is freed with it).
         pub fn deinit(self: *Self) void {
             const allocator = self.allocator;
-            for (0..Self.M) |i| {
-                const s = self.slots[i];
+            for (self.slots) |s| {
                 for (0..s.len) |bi| {
                     if (s.blocks[bi]) |b| {
                         if (b.index < 0) allocator.destroy(b);
@@ -214,6 +229,7 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
                 allocator.free(s.blocks);
                 allocator.destroy(s);
             }
+            allocator.free(self.slots);
             allocator.destroy(self);
         }
 
@@ -221,7 +237,18 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
         /// Fallible operations precede all state commits, so a failed call leaves
         /// the wheel unchanged and is safe to retry.
         pub fn add_value(self: *Self, value: u64) error{OutOfMemory}!u64 {
-            const s = self.slots[self.cursor & (Self.M - 1)];
+            return self.add_delay(value, 0);
+        }
+
+        /// Insert `value` `ticks` shifts ahead of the cursor and return its
+        /// position handle: the value is delivered once the wheel has turned
+        /// that many times, wrapping modulo the stripe count. `ticks == 0` is
+        /// the current stripe, the fixed-lap insertion of `add_value`; a caller
+        /// that wants a deadline of D ticks passes D. Same commit discipline as
+        /// `add_value`.
+        pub fn add_delay(self: *Self, value: u64, ticks: u32) error{OutOfMemory}!u64 {
+            const stripe = (self.cursor +% ticks) & self.mask();
+            const s = self.slots[stripe];
 
             if (s.len == 0) {
                 if (s.blocks.len == 0) {
@@ -261,7 +288,7 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
             s.last = p;
             b.len += 1;
             b.occupied += 1;
-            return encode(self.cursor & (Self.M - 1), bi, si);
+            return encode(stripe, bi, si);
         }
 
         /// Unlink and remove a live element. Infallible; the block is reclaimed
@@ -303,7 +330,7 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
         /// error the wheel is unchanged but the placeholder is invalid and must
         /// be discarded.
         pub fn shift(self: *Self, placeholder: []u64) error{OutOfMemory}!ShiftResult {
-            const target: u32 = (self.cursor +% 1) & (Self.M - 1);
+            const target: u32 = (self.cursor +% 1) & self.mask();
             const s = self.slots[target];
             var backing = placeholder;
             var out: usize = 0;
@@ -348,14 +375,19 @@ pub fn TimingWheel(comptime ticks: comptime_int, comptime blockSize: comptime_in
     };
 }
 
-/// Test instantiations. `Small` is the original 16x4x8 wheel; `Tiny` proves the
-/// factory really specializes on its parameters instead of ignoring them.
-/// `Wide` exercises a block capacity beyond 2^16, which the slot field must
-/// track rather than assume a fixed 16-bit width.
-const Small = TimingWheel(16, 4, 8);
-const Tiny = TimingWheel(4, 2, 4);
-const Big = TimingWheel(1024, 64, 16);
-const Wide = TimingWheel(4, 1 << 17, 1);
+/// Test instantiations and their runtime slot counts. `Small` is the original
+/// 16x4x8 wheel; `Tiny` proves the factory really specializes on its parameters
+/// instead of ignoring them. `Wide` exercises a block capacity beyond 2^16,
+/// which the slot field must track rather than assume a fixed 16-bit width.
+const Small = TimingWheel(4, 8);
+const Tiny = TimingWheel(2, 4);
+const Big = TimingWheel(64, 16);
+const Wide = TimingWheel(1 << 17, 1);
+
+const SMALL_TICKS: u32 = 16;
+const TINY_TICKS: u32 = 4;
+const BIG_TICKS: u32 = 1024;
+const WIDE_TICKS: u32 = 4;
 
 /// Assert every invariant of Section 2. Test-only helper.
 fn checkInvariants(comptime W: type, w: *W) void {
@@ -387,7 +419,7 @@ fn checkInvariants(comptime W: type, w: *W) void {
         std.debug.assert(chain_len <= W.L);
     }
 
-    for (0..W.M) |si| {
+    for (0..w.ticks) |si| {
         const s = w.slots[si];
 
         // S1
@@ -480,11 +512,11 @@ fn freeBacking(a: std.mem.Allocator, b: []u64) void {
 }
 
 /// Parameterized shared test bodies: one instantiation per wheel shape below.
-fn testWheelShape(comptime W: type) !void {
+fn testWheelShape(comptime W: type, ticks: u32) !void {
     const a = std.testing.allocator;
 
     {
-        const w = try W.init(a);
+        const w = try W.init(a, ticks);
         defer w.deinit();
         checkInvariants(W, w);
         const r = try w.shift(&.{});
@@ -495,7 +527,7 @@ fn testWheelShape(comptime W: type) !void {
     }
 
     {
-        const w = try W.init(a);
+        const w = try W.init(a, ticks);
         defer w.deinit();
         for (0..W.L * W.N + 1) |i| _ = try w.add_value(@intCast(i));
         checkInvariants(W, w);
@@ -506,16 +538,16 @@ fn testWheelShape(comptime W: type) !void {
         var backing: []u64 = &.{};
         defer freeBacking(a, backing);
         var i: usize = 0;
-        while (i < W.M - 1) : (i += 1) backing = (try w.shift(backing)).backing;
+        while (i < ticks - 1) : (i += 1) backing = (try w.shift(backing)).backing;
         const r = try w.shift(backing);
         backing = r.backing;
         try std.testing.expectEqual(@as(usize, W.L * W.N + 1), r.size);
-        try std.testing.expectEqual(@as(u32, W.M), w.cursor);
+        try std.testing.expectEqual(ticks, w.cursor);
         checkInvariants(W, w);
     }
 
     {
-        const w = try W.init(a);
+        const w = try W.init(a, ticks);
         defer w.deinit();
         var handles: [W.N + 1]u64 = undefined;
         for (0..W.N + 1) |i| handles[i] = try w.add_value(@intCast(i));
@@ -531,36 +563,73 @@ fn testWheelShape(comptime W: type) !void {
 }
 
 test "16x4x8 wheel: empty shift, pool depletion, reclaimed frontier" {
-    try testWheelShape(Small);
+    try testWheelShape(Small, SMALL_TICKS);
 }
 
 test "4x2x4 wheel: empty shift, pool depletion, reclaimed frontier" {
-    try testWheelShape(Tiny);
+    try testWheelShape(Tiny, TINY_TICKS);
 }
 
 test "1024x64x16 wheel: empty shift, pool depletion, reclaimed frontier" {
-    try testWheelShape(Big);
+    try testWheelShape(Big, BIG_TICKS);
 }
 
-test "factory re-exports its shape parameters" {
-    try std.testing.expectEqual(16, Small.M);
+test "factory re-exports its comptime shape parameters" {
     try std.testing.expectEqual(4, Small.N);
     try std.testing.expectEqual(8, Small.L);
-    try std.testing.expectEqual(4, Tiny.M);
     try std.testing.expectEqual(2, Tiny.N);
     try std.testing.expectEqual(4, Tiny.L);
-    try std.testing.expectEqual(1024, Big.M);
     try std.testing.expectEqual(64, Big.N);
     try std.testing.expectEqual(16, Big.L);
+}
+
+test "runtime ticks set the ring length and the cursor mask" {
+    const a = std.testing.allocator;
+    inline for (.{
+        .{ Small, SMALL_TICKS },
+        .{ Tiny, TINY_TICKS },
+        .{ Big, BIG_TICKS },
+        .{ Small, @as(u32, 32) },
+    }) |case| {
+        const W = case[0];
+        const ticks = case[1];
+        const w = try W.init(a, ticks);
+        defer w.deinit();
+        try std.testing.expectEqual(ticks, w.ticks);
+        try std.testing.expectEqual(@as(usize, ticks), w.slots.len);
+        try std.testing.expectEqual(ticks - 1, w.mask());
+
+        _ = try w.add_value(7);
+        var i: usize = 0;
+        while (i < ticks) : (i += 1) freeBacking(a, (try w.shift(&.{})).backing);
+        try std.testing.expectEqual(ticks, w.cursor);
+        checkInvariants(W, w);
+    }
+}
+
+test "invalid runtime ticks are rejected before any allocation" {
+    const a = std.testing.allocator;
+    inline for (.{
+        Small,
+        Tiny,
+        Big,
+        Wide,
+    }) |W| {
+        inline for (.{ @as(u32, 0), 3, 24, W.MAX_TICKS * 2 }) |bad| {
+            try std.testing.expectError(error.InvalidTicks, W.init(a, bad));
+        }
+    }
+    const one = try Small.init(a, 1);
+    defer one.deinit();
+    try std.testing.expectEqual(@as(usize, 1), one.slots.len);
+    try std.testing.expectEqual(@as(u32, 0), one.mask());
 }
 
 test "block sizes follow N and pool sizes follow L" {
     try std.testing.expectEqual(16 * Small.N + 16, @sizeOf(@TypeOf(@as(Small, undefined).pool.blocks[0])));
     try std.testing.expectEqual(16 * Tiny.N + 16, @sizeOf(@TypeOf(@as(Tiny, undefined).pool.blocks[0])));
     try std.testing.expectEqual(16 * Big.N + 16, @sizeOf(@TypeOf(@as(Big, undefined).pool.blocks[0])));
-    try std.testing.expectEqual(8 * Small.M, @sizeOf(@TypeOf(@as(Small, undefined).slots)));
-    try std.testing.expectEqual(8 * Tiny.M, @sizeOf(@TypeOf(@as(Tiny, undefined).slots)));
-    try std.testing.expectEqual(8 * Big.M, @sizeOf(@TypeOf(@as(Big, undefined).slots)));
+    try std.testing.expectEqual(@as(usize, 2 * @sizeOf(usize)), @sizeOf(@TypeOf(@as(Small, undefined).slots)));
 }
 
 test "packing tracks N instead of a fixed 16-bit slot field" {
@@ -582,7 +651,7 @@ test "packing tracks N instead of a fixed 16-bit slot field" {
 
 test "wide block capacity round-trips through add and shift" {
     const a = std.testing.allocator;
-    const w = try Wide.init(a);
+    const w = try Wide.init(a, WIDE_TICKS);
     defer w.deinit();
 
     for (0..Wide.N + 1) |i| _ = try w.add_value(@intCast(i));
@@ -593,7 +662,7 @@ test "wide block capacity round-trips through add and shift" {
     var backing: []u64 = &.{};
     defer freeBacking(a, backing);
     var i: usize = 0;
-    while (i < Wide.M - 1) : (i += 1) backing = (try w.shift(backing)).backing;
+    while (i < WIDE_TICKS - 1) : (i += 1) backing = (try w.shift(backing)).backing;
     const r = try w.shift(backing);
     backing = r.backing;
     try std.testing.expectEqual(@as(usize, Wide.N + 1), r.size);
@@ -602,7 +671,7 @@ test "wide block capacity round-trips through add and shift" {
 
 test "shift on an untouched wheel is quiet" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     checkInvariants(Small, w);
@@ -615,7 +684,7 @@ test "shift on an untouched wheel is quiet" {
 
 test "round trip, delete, and M-shift lifetime" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     const h0 = try w.add_value(100);
@@ -631,7 +700,7 @@ test "round trip, delete, and M-shift lifetime" {
     defer freeBacking(a, backing);
 
     var i: usize = 0;
-    while (i < Small.M - 1) : (i += 1) {
+    while (i < SMALL_TICKS - 1) : (i += 1) {
         const r = try w.shift(backing);
         backing = r.backing;
         try std.testing.expectEqual(@as(usize, 0), r.size);
@@ -641,13 +710,54 @@ test "round trip, delete, and M-shift lifetime" {
     backing = r.backing;
     try std.testing.expectEqual(@as(usize, 1), r.size);
     try std.testing.expectEqual(@as(u64, 200), r.backing[0]);
-    try std.testing.expectEqual(@as(u32, Small.M), w.cursor);
+    try std.testing.expectEqual(@as(u32, SMALL_TICKS), w.cursor);
     checkInvariants(Small, w);
+}
+
+test "a delayed value matures after the stripe it was scheduled for" {
+    const a = std.testing.allocator;
+    const w = try Small.init(a, SMALL_TICKS);
+    defer w.deinit();
+
+    // Two values, one a third of the ring ahead of the other: a deadline is
+    // scheduled where it belongs, not at the cursor.
+    const now = try w.add_value(1);
+    const later = try w.add_delay(2, SMALL_TICKS / 3);
+    try std.testing.expectEqual(@as(u32, 0), Small.decode(now).stripe);
+    try std.testing.expectEqual(@as(u32, SMALL_TICKS / 3), Small.decode(later).stripe);
+    checkInvariants(Small, w);
+
+    var backing: []u64 = &.{};
+    defer freeBacking(a, backing);
+
+    var i: usize = 0;
+    while (i < SMALL_TICKS / 3 - 1) : (i += 1) {
+        const r = try w.shift(backing);
+        backing = r.backing;
+        try std.testing.expectEqual(@as(usize, 0), r.size);
+    }
+
+    const r = try w.shift(backing);
+    backing = r.backing;
+    try std.testing.expectEqual(@as(usize, 1), r.size);
+    try std.testing.expectEqual(@as(u64, 2), r.backing[0]);
+
+    // The zero-delay value is the current stripe: it takes the full ring.
+    var j: usize = SMALL_TICKS / 3;
+    while (j < SMALL_TICKS - 1) : (j += 1) {
+        const q = try w.shift(backing);
+        backing = q.backing;
+        try std.testing.expectEqual(@as(usize, 0), q.size);
+    }
+    const last = try w.shift(backing);
+    backing = last.backing;
+    try std.testing.expectEqual(@as(usize, 1), last.size);
+    try std.testing.expectEqual(@as(u64, 1), last.backing[0]);
 }
 
 test "block rollover grows the stripe slice" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     for (0..Small.N + 1) |i| {
@@ -662,7 +772,7 @@ test "block rollover grows the stripe slice" {
 
 test "pool depletion falls back to the heap" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     for (0..Small.L * Small.N + 1) |i| {
@@ -677,7 +787,7 @@ test "pool depletion falls back to the heap" {
 
 test "reclaimed frontier block is reused" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     var handles: [Small.N + 1]u64 = undefined;
@@ -698,7 +808,7 @@ test "reclaimed frontier block is reused" {
 
 test "delete head, middle, and tail" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     const h0 = try w.add_value(1);
@@ -720,7 +830,7 @@ test "delete head, middle, and tail" {
 
 test "shift retains the first block and preserves buffer capacity" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     _ = try w.add_value(11);
@@ -731,11 +841,11 @@ test "shift retains the first block and preserves buffer capacity" {
     defer freeBacking(a, backing);
 
     var i: usize = 0;
-    while (i < Small.M) : (i += 1) {
+    while (i < SMALL_TICKS) : (i += 1) {
         const r = try w.shift(backing);
         backing = r.backing;
     }
-    try std.testing.expectEqual(@as(u32, Small.M), w.cursor);
+    try std.testing.expectEqual(@as(u32, SMALL_TICKS), w.cursor);
     checkInvariants(Small, w);
 
     const s = w.slots[0];
@@ -748,7 +858,7 @@ test "shift retains the first block and preserves buffer capacity" {
 
 test "shift grows the buffer and returns the drained set" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     for (0..Small.N + 1) |i| _ = try w.add_value(1000 + @as(u64, i));
@@ -757,7 +867,7 @@ test "shift grows the buffer and returns the drained set" {
     defer freeBacking(a, backing);
 
     var i: usize = 0;
-    while (i < Small.M - 1) : (i += 1) backing = (try w.shift(backing)).backing;
+    while (i < SMALL_TICKS - 1) : (i += 1) backing = (try w.shift(backing)).backing;
     const r = try w.shift(backing);
     backing = r.backing;
 
@@ -773,7 +883,7 @@ test "shift grows the buffer and returns the drained set" {
 
 test "fuzz add/delete/shift against a shadow model" {
     const a = std.testing.allocator;
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     var prng = std.Random.DefaultPrng.init(0x1234_5678_9ABC_DEF0);
@@ -791,7 +901,7 @@ test "fuzz add/delete/shift against a shadow model" {
         if (shadow.items.len == 0 or choice < 4) {
             const value = rnd.int(u64);
             const h = try w.add_value(value);
-            const stripe: u32 = w.cursor & (Small.M - 1);
+            const stripe: u32 = w.cursor & (SMALL_TICKS - 1);
             try std.testing.expectEqual(@as(u32, @truncate(h >> STRIPE_SHIFT)), stripe);
             try shadow.append(a, .{ .handle = h, .value = value, .stripe = stripe });
         } else if (choice < 7) {
@@ -799,7 +909,7 @@ test "fuzz add/delete/shift against a shadow model" {
             w.delete_by_index(shadow.items[idx].handle);
             _ = shadow.orderedRemove(idx);
         } else {
-            const target: u32 = (w.cursor +% 1) & (Small.M - 1);
+            const target: u32 = (w.cursor +% 1) & (SMALL_TICKS - 1);
             const r = try w.shift(backing);
             backing = r.backing;
 
@@ -838,7 +948,7 @@ test "fuzz add/delete/shift against a shadow model" {
 
 test "fuzz on the tiny wheel exercises wrap-around every few ticks" {
     const a = std.testing.allocator;
-    const w = try Tiny.init(a);
+    const w = try Tiny.init(a, TINY_TICKS);
     defer w.deinit();
 
     var prng = std.Random.DefaultPrng.init(0x0BAD_C0DE_DEAD_BEEF);
@@ -856,7 +966,7 @@ test "fuzz on the tiny wheel exercises wrap-around every few ticks" {
         if (shadow.items.len == 0 or choice < 4) {
             const value = rnd.int(u64);
             const h = try w.add_value(value);
-            const stripe: u32 = w.cursor & (Tiny.M - 1);
+            const stripe: u32 = w.cursor & (TINY_TICKS - 1);
             try std.testing.expectEqual(@as(u32, @truncate(h >> STRIPE_SHIFT)), stripe);
             try shadow.append(a, .{ .handle = h, .value = value, .stripe = stripe });
         } else if (choice < 7) {
@@ -864,7 +974,7 @@ test "fuzz on the tiny wheel exercises wrap-around every few ticks" {
             w.delete_by_index(shadow.items[idx].handle);
             _ = shadow.orderedRemove(idx);
         } else {
-            const target: u32 = (w.cursor +% 1) & (Tiny.M - 1);
+            const target: u32 = (w.cursor +% 1) & (TINY_TICKS - 1);
             const r = try w.shift(backing);
             backing = r.backing;
 
@@ -901,11 +1011,11 @@ test "fuzz on the tiny wheel exercises wrap-around every few ticks" {
 
 test "init is leak-free at every allocation failure" {
     var fail: usize = 0;
-    while (fail < Small.M + 2) : (fail += 1) {
+    while (fail < SMALL_TICKS + 2) : (fail += 1) {
         var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail });
         const a = fa.allocator();
-        if (Small.init(a)) |w| {
-            try std.testing.expect(fail > Small.M);
+        if (Small.init(a, SMALL_TICKS)) |w| {
+            try std.testing.expect(fail > SMALL_TICKS);
             w.deinit();
         } else |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
@@ -916,7 +1026,7 @@ test "init is leak-free at every allocation failure" {
 test "add OOM on stripe slice growth preserves state" {
     var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const a = fa.allocator();
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     for (0..Small.N) |i| _ = try w.add_value(@intCast(i));
@@ -939,7 +1049,7 @@ test "add OOM on stripe slice growth preserves state" {
 test "heap fallback OOM preserves state" {
     var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const a = fa.allocator();
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     for (0..Small.L * Small.N) |i| _ = try w.add_value(@intCast(i));
@@ -966,7 +1076,7 @@ test "heap fallback OOM preserves state" {
 test "shift OOM leaves the wheel unchanged and is retry-safe" {
     var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const a = fa.allocator();
-    const w = try Small.init(a);
+    const w = try Small.init(a, SMALL_TICKS);
     defer w.deinit();
 
     _ = try w.add_value(0xCAFE);
@@ -975,13 +1085,13 @@ test "shift OOM leaves the wheel unchanged and is retry-safe" {
     var backing: []u64 = &.{};
     defer freeBacking(a, backing);
     var i: usize = 0;
-    while (i < Small.M - 1) : (i += 1) backing = (try w.shift(backing)).backing;
-    try std.testing.expectEqual(@as(u32, Small.M - 1), w.cursor);
+    while (i < SMALL_TICKS - 1) : (i += 1) backing = (try w.shift(backing)).backing;
+    try std.testing.expectEqual(@as(u32, SMALL_TICKS - 1), w.cursor);
 
     fa.fail_index = fa.alloc_index;
     fa.resize_fail_index = fa.resize_index;
     try std.testing.expectError(error.OutOfMemory, w.shift(backing));
-    try std.testing.expectEqual(@as(u32, Small.M - 1), w.cursor);
+    try std.testing.expectEqual(@as(u32, SMALL_TICKS - 1), w.cursor);
     checkInvariants(Small, w);
     try std.testing.expectEqual(@as(u32, 1), w.slots[0].len);
 
@@ -991,7 +1101,7 @@ test "shift OOM leaves the wheel unchanged and is retry-safe" {
     backing = r.backing;
     try std.testing.expectEqual(@as(usize, 1), r.size);
     try std.testing.expectEqual(@as(u64, 0xCAFE), r.backing[0]);
-    try std.testing.expectEqual(@as(u32, Small.M), w.cursor);
+    try std.testing.expectEqual(@as(u32, SMALL_TICKS), w.cursor);
     checkInvariants(Small, w);
 }
 
@@ -1018,7 +1128,7 @@ test "shift OOM leaves the wheel unchanged and is retry-safe" {
 //  Shift to 3 with no elements.
 //  Shift to 0 with no elements and back to once .
 test "finally human usage test" {
-    var w = try TimingWheel(4, 2, 16).init(std.testing.allocator);
+    var w = try TimingWheel(2, 16).init(std.testing.allocator, 4);
     defer w.deinit();
 
     const emptyArray = &[_]u64{};

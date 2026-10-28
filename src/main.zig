@@ -16,8 +16,43 @@ const config = @import("config.zig");
 const lifetime = @import("lifetime.zig");
 const messages = @import("messages.zig");
 
+const Duration = config.Duration;
+
 /// Path used when `-c/--config` is not given.
 const default_config_path = "mpy6a.toml";
+
+pub const DapDuration = struct {
+    value: Duration,
+
+    pub fn decode(allocator: std.mem.Allocator, data: []const u8) dap.DecodeError!DapDuration {
+        _ = allocator;
+        const value = Duration.parse(data) catch |err| switch (err) {
+            error.InvalidFormat => return error.InvalidWire,
+            error.Overflow => return error.InvalidValue,
+        };
+        return .{ .value = value };
+    }
+
+    pub fn encode(self: *DapDuration, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        return self.value.toString(allocator);
+    }
+
+    pub fn deinit(self: *DapDuration, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
+    }
+};
+
+const dap_duration_decl = .{
+    .timeout = dap.Flag(DapDuration){
+        .default = dap.defaultValue(DapDuration, DapDuration{ .value = Duration.second }),
+    },
+};
+
+const DapDurationCLI = dap.generate(
+    dap.App{ .name = "duration-test", .help = "" },
+    dap_duration_decl,
+);
 
 const cliDecl = .{
     .run = dap.Command(
@@ -284,7 +319,10 @@ fn shutdown(ctrl: *lifetime.Controller, total: u16) !void {
     var stopped: [max_threads]bool = @splat(false);
     var done: u16 = 0;
     var ticks: u32 = 0;
-    const max_ticks = ctrl.cfg.shutdown_timeout_sec * 2;
+    // Twice the front deadline: the front escalates at `shutdown_timeout_sec`
+    // and the hard shutdown it then broadcasts needs room to complete. The
+    // ticker is armed at 500 ms, so the doubled window is four ticks a second.
+    const max_ticks = ctrl.cfg.shutdown_timeout_sec * 4;
 
     while (done < expected) {
         const cqe = waitOne(&ctrl.init_ring.ring);
@@ -322,4 +360,41 @@ fn waitOne(ring: *zigring.Ring) zigring.CQE {
         if (ring.popCQE()) |cqe| return cqe;
         ring.park();
     }
+}
+
+test "DapDuration implements the dap value contract" {
+    const decoded = try DapDuration.decode(std.testing.allocator, "1h17m33s");
+    try std.testing.expectEqual(@as(i64, 4_653_000_000_000), decoded.value.nanos);
+
+    var value = decoded;
+    const text = try value.encode(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("1h17m33s", text);
+    value.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.InvalidWire, DapDuration.decode(std.testing.allocator, "1d"));
+    try std.testing.expectError(error.InvalidValue, DapDuration.decode(std.testing.allocator, "10000000h"));
+}
+
+test "DapDuration works as a dap flag value" {
+    var diag: dap.Diag = .{};
+    defer diag.deinit(std.testing.allocator);
+
+    var given = try DapDurationCLI.parse(
+        std.testing.allocator,
+        std.process.Environ.empty,
+        &.{ "--timeout", "1h17m33s" },
+        &diag,
+    );
+    defer DapDurationCLI.deinit(&given, std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 4_653_000_000_000), given.timeout.value.nanos);
+
+    var defaulted = try DapDurationCLI.parse(
+        std.testing.allocator,
+        std.process.Environ.empty,
+        &.{},
+        &diag,
+    );
+    defer DapDurationCLI.deinit(&defaulted, std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 1_000_000_000), defaulted.timeout.value.nanos);
 }
