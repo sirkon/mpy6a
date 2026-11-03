@@ -1,0 +1,603 @@
+# Index states
+
+Promoted from `.mailbox/index-state/2.md` (history in `.mailbox/index-state/`; the Russian source design is preserved
+verbatim at `.mailbox/index-state/source-ru.md`).
+
+The implementation plan for the index state: the structures of `src/state.zig`, the replay queue of
+`src/replay_queue.zig`, and the state logic as methods of `lifetime.Controller`. The twelve open questions of the
+mailbox thread are all resolved and folded in as the facts below. `src/state.zig`'s current draft (`Buffer`, `Session`,
+`WALOperation`) is superseded item by item and is replaced by the implementing change; no code is written by the plan
+itself.
+
+Two corrections of the Russian source are folded in, both of the "pressed a wrong key" kind:
+
+- The replication factor is **3**, not 2; the source's three-column table was right all along.
+- The replay blob's fixed head is **24 bytes** — 8 of retry time plus 16 of session id — not the "20 bytes" the source
+  states twice. 8 + 16 = 24; a blob is therefore at least 25 bytes (the head plus at least one `uvarint` length byte).
+
+## 1. Decisions
+
+The twelve resolutions of the thread, restated as the facts this plan is built on:
+
+- **U1 — the boundary.** The structures of `src/state.zig` (and, per U3, the queue wrapper of `src/replay_queue.zig`)
+  may carry simple methods: trivial accessors, mutators and other one-line mechanics. Everything else — every behavioral
+  function — is a method of `lifetime.Controller`, the registry for resources: when work needs resources (memory, the
+  compensator registry, the config), it goes to the Controller. The process-lifetime code already in `lifetime.zig` is
+  untouched; the index-state logic is a new banner section of methods beside it.
+- **U2 — the session shape.** The map value is a runtime `Session`; `SessionData` — exactly the four persisted fields —
+  is a part of `Session`; everything meta is a member of `Session`; the session's data is a part of its internal
+  `SessionData` field. The draft `Buffer` survives as the capacity holder inside `SessionData.data`.
+- **U3 — the replay queue.** The wrapper surface as proposed, renamed `ReplayQueue` (no shadowing of
+  `std.PriorityQueue`), in its own file `src/replay_queue.zig`. The queue owns every blob it holds.
+- **U4 — the dump record.** The per-session record inside the `IndexState` dump is `session_id: LE(u128)` (the current
+  id, the map key) followed by `uvarint(len)` and the `SessionData` codec bytes — the replay blob minus `retry_time`.
+  `SNAPSHOT_VERSION = 1`; unknown versions are rejected with `error.UnsupportedVersion`.
+- **U5 — the key hash.** Hash the index slice only: `verztable.hashInteger(@as(u64, @truncate(id)))` over the low 64
+  bits; equality stays full-width `u128`. Valid because **active sessions belong to the current working epoch only**
+  (invariant 8 below): within one data set's map the host and epoch prefix is constant, so the op-index slice carries
+  all the entropy. The vendored `AutoHashFn` is not an option — its checked `@intCast` to `u64` panics for every id ≥
+  2^64, and such ids are the norm.
+- **U6 — no `sessions_count`.** The field is dropped; the dump emits `uvarint(sessions.count())` — the vendored
+  verztable has an O(1) `count()`. The dump format is unchanged; only the field's existence is gone.
+- **U7 — the comparator.** `blobOrder` decodes both heads into integers and compares numerically — time first, id as the
+  tiebreaker. The LE encoding on the wire stays: optimization on writes, and reads are asynchronous and less
+  performance-picky. A `memcmp` over the LE bytes is not the tuple order (0x0102 < 0x0201 numerically;
+  byte-lexicographic comparison says the opposite) and is explicitly not used.
+- **U8 — the clock.** `retry_time` is CLOCK_REALTIME nanoseconds; `nowRealtimeNs()` lives in `lifetime.zig` (over
+  `clock_gettime`; zigring's `monotonicNs()` is deliberately not used — a reboot resets a monotonic clock and the due
+  times must survive a restart). `restart_in` computes `retry_time = nowRealtimeNs() + seconds * 1_000_000_000`.
+- **U9 — identity.** No lineage chain: an original and an envelope, that is all. `original_id` names the original
+  business session and is copied verbatim through any number of generations; a fresh session's `original_id` duplicates
+  its own id. The re-activated envelope is minted a **new id from the data set's current state index** — the HLD pins
+  it: "the session identifier becomes equal to the current state index" — with **no dedicated counter**: the state index
+  already exists in the op stream (one op, one state).
+- **U10 — the data sets.** The replication factor is 3. One index thread owns one `IndexState` per member of its index's
+  replication group: its own data set plus one mirror per remote host.
+- **U11 — no consensus here.** `docs/consensus.md` is outdated and out of scope; there is no consensus yet. This module
+  is the state **between two consensus ops**; the future consensus thread consumes this work as code, not as this
+  thread's output. The `Op` union stands as proposed: `create` carries the compensator **name** (the logging-performance
+  rationale of the source; the draft's numeric `replayer: u64` is superseded), `restart_in` carries `seconds: u32` (the
+  draft's width). The compensator registry is a Controller-owned, name-keyed map built once at startup from the config's
+  `compensators` block; the siggy grammar for the block is a follow-up. A `Create` naming an unknown compensator is
+  rejected before any state change.
+- **U12 — the drain.** The head drain is "take the first out of the queue, decode it and give me the result" — as
+  deterministic as a disk read. No reliance on the current time inside it; checking the recorded retry time against the
+  current time is the outer logic's task. Stage one keeps: (a) no file spill and no composite provider — the failable
+  wrapper surface and the ordered dump encoding are the seam they plug into; and (c) the `src/index.zig` wiring lands in
+  the same change, so the module is exercisable end to end.
+
+## 2. What an index is
+
+An index is an execution flow (code plus metadata) **and** data. The data is itself split by origin host. With
+replication factor 3, on the host owning index 1, inside index number 4:
+
+| Index-4 data of host 0 | Own index-4 data (host 1) | Index-4 data of host 2 |
+| ---------------------- | ------------------------- | ---------------------- |
+
+The execution flow for `(host_idx = 0, index_idx = 4)` differs on host 0 and on host 1: on host 0 it reacts to client
+requests and to internal computed states ("send session X to replay in T seconds", "start the replay/compensation of the
+first session of the replay queue"); on host 1 it processes the operations arriving over host 0's connection, filtering
+them through the consensus logic and applying them.
+
+One index thread therefore owns an array of R data sets, one per member of its index's replication group, **indexed by
+host_idx with its own data set at the own host's slot** (`cfg.host_index`): a 3-host group yields exactly the source's
+three columns, and the indexing matches the sibling WAL design's per-`(index, host)` file and battery scheme.
+`IndexState` itself is per data set; the epoch and isolation machinery layered over the data sets belongs to
+`consensus-driver` and is out of scope here.
+
+## 3. The boundary: shapes, wrapper, controller
+
+- **`src/state.zig` holds shapes only**: the types of §4 with their fields and doc comments, the snapshot format
+  constants, the map's hash/equality functions (they are comptime arguments of the map _type_ and therefore part of the
+  structure), and trivial accessors.
+- **`src/replay_queue.zig` (new) holds the `ReplayQueue` wrapper**, its error set, `blobOrder`, and the blob-head
+  constants — the blob layout is the queue's storage contract. The wrapper's methods are the mechanical kind U1 allows
+  to stay with the type.
+- **`src/lifetime.zig` holds every behavioral function as a method of `lifetime.Controller`** (§6), beside the existing
+  process-lifetime code, which is untouched. `nowRealtimeNs()` is the one free function, exactly as U8 confirmed it.
+
+The current draft contents of `state.zig` are superseded in the implementing change: `WALOperation` becomes the `Op`
+union (the `ovewrite` typo fixed; `repeat(delay)` becomes `restart_in(seconds)`; the numeric `replayer` becomes the
+compensator name string); `Session` is absorbed field-for-field into the new `Session` as its meta; `Buffer` survives
+unchanged as the payload capacity holder.
+
+## 4. The structure inventory (`src/state.zig`)
+
+```zig
+const std = @import("std");
+const verztable = @import("verztable");
+const replay_queue = @import("replay_queue.zig");
+
+/// The wire/snapshot format version written into the IndexState dump (U4).
+/// A loader rejects any other value with error.UnsupportedVersion.
+pub const SNAPSHOT_VERSION: u16 = 1;
+
+/// One configured compensator endpoint (U11): the `compensators = fixed {...}`
+/// block of the config, resolved once at startup. Key names are immutable
+/// once created — the source's hard requirement.
+pub const CompensatorEndpoint = struct {
+    bind: []const u8,
+    port: u16,
+};
+
+/// The compensator registry's shape; the instance lives on the
+/// lifetime.Controller (U1: the registry for resources).
+pub const CompensatorMap = verztable.HashMapWithFns(
+    []const u8,
+    CompensatorEndpoint,
+    hashCompensatorName,
+    eqlCompensatorName,
+);
+
+/// The operations that reach the state (U11). consensus.md is outdated and
+/// not consulted; this is the state between two consensus ops, and the op
+/// stream of the future consensus driver dispatches into these tags.
+pub const Op = union(enum) {
+    create: struct { compensator: []const u8, payload: []const u8 },
+    append: struct { session_id: u128, payload: []const u8 },
+    overwrite: struct { session_id: u128, payload: []const u8 },
+    close: struct { session_id: u128 },
+    restart_in: struct { session_id: u128, seconds: u32 },
+};
+
+/// The capacity holder for a session's payload — the old draft's `Buffer`,
+/// surviving verbatim. Content is `backing[0..len]`; growth amortizes into
+/// the spare capacity.
+pub const Buffer = struct {
+    backing: []u8,
+    len: usize,
+};
+
+/// The four persisted fields, exactly as the source pins them (U2). These
+/// bytes — and only these — ride every codec: the blob, the per-session dump
+/// record, the wire.
+pub const SessionData = struct {
+    /// A session may be a restored one, brought back for replay-compensation.
+    /// Work on it then happens in a NEW session — the data may have been moved
+    /// to a completely different shard with its own settings, where this index
+    /// simply does not exist and the front would go crazy figuring out which
+    /// index to push the client's next portion of data into. The ORIGINAL is
+    /// carried verbatim through any number of generations; for a freshly
+    /// created session this is, of course, a duplicate of the session's own id.
+    original_id: u128,
+
+    /// The identifier of the service that must perform compensations for this
+    /// session. Set by the user at session creation; validated by the service
+    /// against the configured registry. A string rather than a number: the
+    /// operation is rare, and on the logging path fetching a name by identifier
+    /// would be the pain. The registry's key names must NEVER change:
+    ///
+    ///     compensators = fixed {
+    ///         marker = bind { bind = "10.0.0.1", port = 20301 }
+    ///         viper  = bind { bind = "10.0.0.2", port = 20301 }
+    ///         hermes = bind { bind = "10.0.0.10", port = 20301 }
+    ///     }
+    ///
+    /// Mind the cloud-native extensions: besides `bind` there will be `dns`,
+    /// `grpc` (xDS, etcd), and eventually the compensators block becomes a
+    /// runtime resolver of compensator endpoints. The session owns its copy of
+    /// the name; the codec makes the session self-contained.
+    compensator: []const u8,
+
+    /// Count of compensation attempts. 0 for new sessions. A failed
+    /// compensation increases it by 1 — never the replay round-trip itself.
+    retry_count: u32,
+
+    /// The session's own data, chunked: `uvarint(len) || payload`,
+    /// `uvarint(len) || payload`, ... Changed by Create (one chunk — a
+    /// payload-free Create would cost an extra hop), Append (one chunk at the
+    /// tail), Overwrite (the whole content replaced by one chunk). All other
+    /// operations touch metadata only.
+    data: Buffer,
+};
+
+/// The runtime session (U2): everything meta around the persisted `SessionData`.
+/// The map value is `*Session`. The meta fields are the old draft's, absorbed
+/// field-for-field; the consensus driver owns their discipline, this module
+/// only carries them (and initializes them to the resting state).
+pub const Session = struct {
+    const Self = @This();
+
+    pub const State = enum(u32) {
+        ExpectOp,
+        ExpectConsensus,
+        ExpectAcceptedFlush,
+    };
+    pub const ConsensusProgress = struct {
+        accepted: u16 = 0,
+        rejected: u16 = 0,
+    };
+
+    id: u128,
+    /// The state at which the session's current op was accepted.
+    index_idx: u128,
+    /// The identifier that becomes `index_idx` once the last op has
+    /// successfully passed.
+    upgrade_idx: u128,
+    /// Current identifier in the timing wheel. Must be changed after a
+    /// successful mutation or pulse.
+    wheel_idx: u64,
+    state: State,
+    consensus_progress: ConsensusProgress,
+
+    /// The persisted part, exactly the four source fields. The payload lives
+    /// at `data.data` (a `Buffer`); the rest of this struct never serializes.
+    data: SessionData,
+
+    /// The kind of simple method U1 allows to stay on the struct: a trivial
+    /// mutator, no resources, no logic.
+    pub fn prepareForNewConsensus(self: *Self) void {
+        self.consensus_progress = .{};
+    }
+};
+
+/// The map of active sessions. HashMapWithFns, not HashMap: the vendored
+/// AutoHashFn casts the key to u64 with a checked @intCast and panics for
+/// ids >= 2^64 — and session ids carry host and epoch in the high bits (U5).
+pub const SessionsMap = verztable.HashMapWithFns(
+    u128,
+    *Session,
+    hashSessionId,
+    eqlSessionId,
+);
+
+/// One data set of one index thread: active sessions plus the sessions
+/// awaiting replay, ordered by (retry_time, session_id). U10: a thread owns
+/// one of these per member of its index's replication group, indexed by
+/// host_idx, its own at cfg.host_index.
+pub const IndexState = struct {
+    /// The data set's current state — a full u128 in the layout of the
+    /// sibling WAL design (`host_id: u8, index_id: u16, epoch_id: u40,
+    /// index: u64`), whose `index: u64` slice is the op ordinal within the
+    /// current epoch. Session ids are minted from it ("the session identifier
+    /// becomes equal to the current state index"). Runtime-only, never part
+    /// of the dump: the snapshot's file name carries the state. Moved only by
+    /// the consensus driver; see §7.
+    state: u128,
+
+    /// The active sessions of this data set, keyed by the session's current
+    /// id. The old draft's separate sessions_count is dropped (U6): the
+    /// vendored map has an O(1) count().
+    sessions: SessionsMap,
+
+    /// The sessions awaiting replay, one blob each (§5).
+    replay_queue: replay_queue.ReplayQueue,
+};
+
+fn hashSessionId(id: u128) u64 {
+    // The index slice only (U5): valid because active sessions belong to the
+    // current working epoch only, so the host/epoch prefix is constant within
+    // one data set's map (invariant 8).
+    return verztable.hashInteger(@as(u64, @truncate(id)));
+}
+
+fn eqlSessionId(a: u128, b: u128) bool {
+    // Full width: a hash that ignores the high bits must not let equality
+    // ignore them.
+    return a == b;
+}
+
+fn hashCompensatorName(name: []const u8) u64 {
+    return verztable.wyhash(name);
+}
+
+fn eqlCompensatorName(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+```
+
+## 5. The replay queue (`src/replay_queue.zig`)
+
+`std.PriorityQueue` is the stage-one choice; later it is replaced by an object with a strongly identical interface but
+composite internals, where the priority queue (or its extension) is only one provider among several, plus ordered files.
+To reflect the file work from day one, the queue is used through this wrapper, whose errors express problems arising
+while working with the backing storage — today allocation, later the file-backed providers of the composite (U12a).
+
+```zig
+/// Head of every replay blob: retry_time (LE u64) then session_id (LE u128).
+pub const RETRY_TIME_OFF: usize = 0;
+pub const SESSION_ID_OFF: usize = 8;
+pub const BLOB_HEAD: usize = 24;
+
+/// Extended when the composite/file-backed providers land.
+pub const Error = error{OutOfMemory};
+
+/// Numeric tuple order on the blob heads: retry_time first, session_id second.
+/// Decodes both heads and compares numerically (U7); a memcmp over the LE
+/// bytes is NOT the tuple order and is not used.
+pub fn blobOrder(_: void, a: []u8, b: []u8) std.math.Order;
+
+pub const ReplayQueue = struct {
+    const Self = @This();
+    const Inner = std.PriorityQueue([]u8, void, blobOrder);
+
+    allocator: std.mem.Allocator,
+    inner: Inner,
+
+    pub fn init(allocator: std.mem.Allocator) Self;
+
+    /// Borrow of the head blob, valid until the queue's next mutation.
+    pub fn peek(self: *Self) Error!?[]u8;
+
+    /// The recorded due time of the head, decoded; null when empty. The
+    /// mechanical helper for the service loop's external time check (U12).
+    pub fn peekRetryTime(self: *Self) Error!?u64;
+
+    /// Copies the blob; the queue owns its copy.
+    pub fn push(self: *Self, blob: []const u8) Error!void;
+
+    /// Removes the head and transfers ownership of the blob.
+    pub fn pop(self: *Self) Error!?[]u8;
+
+    /// O(n) scan matching the session id at blob bytes [8, 24), then the
+    /// heap's popIndex; transfers the blob. std's update() only matches a
+    /// full (time, id) pair and is useless for closing or re-arming a queued
+    /// session by id.
+    pub fn removeSessionId(self: *Self, id: u128) Error!?[]u8;
+
+    pub fn count(self: *const Self) usize;
+
+    /// Ordered-dump support: duplicates the handle slice only; the blobs are
+    /// borrowed and stay owned by the queue. This is the realization of the
+    /// source's "iteration over a cloned queue": Zig 0.17's std.PriorityQueue
+    /// has no clone(), and copying blobs just to iterate them would be absurd.
+    /// The dump sorts the handles with blobOrder and emits.
+    pub fn snapshotHandles(self: *Self) Error![][]u8;
+
+    /// Frees every blob still held, then the items array.
+    pub fn deinit(self: *Self) void;
+};
+```
+
+Ownership is one-way and simple: `push` copies, `pop` and `removeSessionId` transfer, `deinit` frees what is left,
+`snapshotHandles` borrows (the caller frees the handle slice only).
+
+## 6. The Controller surface (`src/lifetime.zig`)
+
+A new banner section inside `lifetime.Controller`. The methods use only `self.allocator` and the compensator registry;
+the data sets themselves stay on the owning index thread's stack — the Controller owns everything that is not
+thread-local, and the state is thread-local (G1: no locks, no atomics, the discipline already documented in
+`src/timing_wheel.zig`). The Controller gains one field:
+
+```zig
+/// The compensator registry (U11): built once at startup from the config's
+/// `compensators` block; key names immutable once created. The siggy grammar
+/// for the block is a follow-up; until it lands the registry is built from
+/// whatever the config offers (empty today) and tests populate it directly.
+compensators: state.CompensatorMap,
+```
+
+The methods (all single-threaded, called only from the owning index thread's service loop — or, for the dump, the
+elephant over a clone; see §12):
+
+```zig
+pub const Reactivated = struct {
+    new_id: u128,
+    session: *state.Session,
+};
+
+pub const IndexError = error{
+    OutOfMemory,
+    UnknownCompensator,
+    UnknownSession,
+};
+
+// init/teardown of one data set
+pub fn initIndexState(self: *Self, st: *state.IndexState) !void;
+pub fn deinitIndexState(self: *Self, st: *state.IndexState) void;
+
+/// Applies one accepted op. The caller (the consensus driver) has already
+/// set `st.state` to this op's state; `create` mints the session id from it.
+pub fn applyIndexOp(self: *Self, st: *state.IndexState, op: state.Op) IndexError!void;
+
+/// The head drain (U12): take the first blob out of the queue, decode it,
+/// mint the envelope a fresh id from `st.state`, re-insert it as an active
+/// session. No time logic inside — the caller checked the head's recorded
+/// retry time against its own clock. Deterministic: the same queue and the
+/// same state yield the same result, every time.
+pub fn popReplayHead(self: *Self, st: *state.IndexState) !?Reactivated;
+
+/// The whole-state dump in the format of §8. The queue part is emitted in
+/// queue order: snapshotHandles, sort with replay_queue.blobOrder, emit.
+pub fn dumpIndexState(self: *Self, st: *const state.IndexState,
+    out: *std.ArrayList(u8)) !void;
+
+/// The inverse. Rejects unknown versions (UnsupportedVersion) and malformed
+/// bytes (CorruptInput), including a queue section that is not in queue
+/// order. The caller sets `st.state` afterwards from the snapshot file's
+/// name tag (§12).
+pub fn loadIndexState(self: *Self, bytes: []const u8) !state.IndexState;
+
+/// The snapshot seam of the sibling WAL design (§12 there): the index
+/// thread clones its data set into the caller's arena; the elephant dumps
+/// the clone. The requirement is unchanged from that design's sketch — an
+/// IndexState dumpable through a public interface — but per U1 the methods
+/// live on the Controller, not on IndexState.
+pub fn cloneIndexState(self: *Self, st: *const state.IndexState,
+    arena: std.mem.Allocator) !state.IndexState;
+
+pub fn validateCompensator(self: *const Self, name: []const u8) bool;
+
+// codecs (U1: logic lives with the Controller)
+pub fn putUvarint(self: *const Self, buf: []u8, v: u64) !usize;
+pub fn readUvarint(self: *const Self, buf: []const u8)
+    !struct { value: u64, len: usize };
+pub fn encodeSessionData(self: *Self, sd: *const state.SessionData) ![]u8;
+pub fn decodeSessionData(self: *Self, bytes: []const u8) !state.SessionData;
+pub fn makeReplayBlob(self: *Self, retry_time: u64, session_id: u128,
+    sd_bytes: []const u8) ![]u8;
+```
+
+The one free function, confirmed verbatim by U8:
+
+```zig
+/// CLOCK_REALTIME nanoseconds. The queue's due times must survive a dump and
+/// reload across a restart, so monotonic is wrong here; zigring's
+/// monotonicNs() is deliberately not used.
+pub fn nowRealtimeNs() u64;
+```
+
+## 7. Session identity: the state, the mint, the envelope
+
+- **The id is a state.** A session id is the data set's `state: u128` at the moment of the mint. The HLD pins the layout
+  and the rule: the id doubles as the state index, and "the session identifier becomes equal to the current state
+  index". Both mints — `create` and the drain — read `st.state`; nothing else composes ids, and there is no counter
+  (U9).
+- **The mint contract with the consensus driver.** The driver — the only caller of `applyIndexOp` and `popReplayHead` —
+  sets `st.state` to the state of the op it is applying (the arriving record's `upgrade` on a mirror, the assigned state
+  on the own data set) before the call, and guarantees **one state per op, the internally generated drain included**. No
+  two mints therefore ever see the same state: ids are unique by construction. And because the drain's op carries its
+  minted state to the mirrors, which apply it over the same queue head, every replica mints the same id for the same
+  envelope — the drain's determinism (U12: "as determined as the disk read is") is what makes the id stable across the
+  replication group.
+- **The envelope.** A queued session is an envelope: a serialized `SessionData` carrying the original's `original_id`
+  and `retry_count`. On drain they are copied verbatim into the fresh session; the meta starts at the resting state
+  (`state = .ExpectOp`, progress zeroed, `index_idx` = the minted state, a fresh wheel handle). `retry_count` is
+  incremented only on a failed compensation, never on the round-trip.
+- **The hash.** `hashSessionId` mixes the low 64 bits only (U5); invariant 8 makes that total on the map, and full-width
+  equality keeps the map correct regardless.
+
+## 8. Codecs
+
+**`data` chunks.** One piece of payload is always encoded as `uvarint(payload.len)` followed by the payload bytes.
+`Create(payload)` initializes `data` with one such chunk (semantically Create would better be payload-free, but then an
+extra hop would be paid); `Append(payload)` appends one to the tail; `Overwrite(payload)` replaces the whole content
+with one.
+
+| `uvarint(payload.len)` | `payload...` |
+| ---------------------- | ------------ |
+
+**`SessionData`.** Exactly these bytes are the stored representation — the meta never rides:
+
+| `original_id: LE(u128)` | `uvarint(compensator.len)` | `compensator...` | `retry_count: LE(u32)` | `uvarint(data.len)` | `data...` |
+| ----------------------- | -------------------------- | ---------------- | ---------------------- | ------------------- | --------- |
+
+**Replay-queue blob.** The queue entry carries the ordering key and the length-prefixed serialized session. The head is
+24 bytes; a blob is at least 25.
+
+| `retry_time: LE(u64)` | `session_id: LE(u128)` | `uvarint(session_data.len)` | `session_data...` |
+| --------------------- | ---------------------- | --------------------------- | ----------------- |
+
+**Queue dump.** The built-in bulk unload of a priority queue is unordered, and the future composite minheap spills to
+ordered files precisely because the heap grew too big — reloading an unordered dump would mean pulling all of it back
+into memory. So the dump is the ordered output of an iteration over the queue (§5's `snapshotHandles`), and since the
+compensation session is already represented as the blob above, the entries are written verbatim:
+
+| `uvarint(replay_queue.count())` | blobs in queue order... |
+| ------------------------------- | ----------------------- |
+
+**`IndexState` dump.**
+
+| `version: LE(u16)` | `uvarint(sessions.count())` | `session by session...` | queue dump |
+| ------------------ | --------------------------- | ----------------------- | ---------- |
+
+The per-session record (U4) — the replay blob minus `retry_time`:
+
+| `session_id: LE(u128)` | `uvarint(session_data.len)` | `session_data...` |
+| ---------------------- | --------------------------- | ----------------- |
+
+`session_id` is the **current** id, the map key: for a re-activated session it differs from `original_id`, and it must
+be written explicitly or the map could not be rebuilt. Sessions are emitted in map iteration order (the loader rebuilds
+a map and is order-agnostic); queue entries must be in queue order, and the loader verifies nondecreasing `blobOrder`,
+rejecting anything else. `st.state` is never part of the dump.
+
+## 9. The lifecycle
+
+1. **`Create(compensator, payload)`.** Validate the compensator against the registry first — an unknown name rejects the
+   op with `UnknownCompensator` **before any state change**. Mint the id from `st.state`. Copy the compensator name into
+   session-owned memory; initialize `data` with one chunk; `original_id` = the minted id; `retry_count` = 0; meta at the
+   resting state. Insert into `sessions` under the minted id.
+2. **`Append(session_id, payload)`.** Look up the session (`UnknownSession` on miss); append
+   `uvarint(payload.len) || payload` at the tail, growing the `Buffer` with standard amortized doubling. Metadata is
+   untouched.
+3. **`Overwrite(session_id, payload)`.** The whole content is replaced by one chunk; the old backing is released or
+   reused per capacity.
+4. **`Close(session_id)`.** An active session: free it and remove it from `sessions`. A queued (evicted) one:
+   `removeSessionId` drops its blob and frees it. Neither: `UnknownSession`.
+5. **`RestartIn(session_id, seconds)`.** Serialize the `SessionData`, build the blob with
+   `retry_time = nowRealtimeNs() + seconds * 1_000_000_000` and `session_id` = the current id, `push` it (the queue
+   copies), remove the session from `sessions`, free the `Session` — its content lives in the blob now. This transition
+   IS the source's "send session X to replay in T seconds": the queue entry itself carries the future due time, so no
+   separate timer exists for the queue; the `timing-wheel` subject stays responsible for the other computed lifetimes
+   (mirror silence, session liveness), not for this ordering.
+6. **Drain.** The service loop peeks the head, reads its recorded `retry_time`, and compares it against its own clock —
+   the time check is outer logic (U12). When due, `popReplayHead`: pop the head, decode the `SessionData`, mint the
+   fresh id from `st.state`, re-insert as active, return the `Reactivated`. `retry_count` survives the trip; it is never
+   incremented by the round-trip itself.
+7. **Compensation failure.** `retry_count += 1`, then re-arm through the `RestartIn` transition. The compensator
+   protocol on the wire is out of scope for this module.
+
+## 10. Invariants
+
+1. The map key is the session's **current** id; at evict time it equals the blob's `session_id`.
+2. A session id **is** a state: the data set's state at the mint. Every mint sees a distinct state — one op (client or
+   internally generated drain), one state; the consensus driver owns that discipline.
+3. `original_id` names the original business session — an original and an envelope, no chain. A fresh session's
+   `original_id` duplicates its own id; a re-activated one copies it verbatim from the envelope.
+4. The blob head is 24 bytes LE — `retry_time: u64` then `session_id: u128`; a blob is at least 25 bytes; the remainder
+   is `uvarint(len)` plus the `SessionData` codec.
+5. Queue order is the numeric `(retry_time, session_id)` tuple order (U7); the dump is emitted in exactly that order;
+   the load accepts nothing else.
+6. The dump begins with `version: LE(u16)`; `SNAPSHOT_VERSION = 1`; a loader rejects unknown versions with
+   `error.UnsupportedVersion` (U4). `st.state` is runtime-only — the snapshot file's name tag carries it.
+7. The compensator registry's key names are immutable once created; a `Create` naming an unknown compensator is rejected
+   before any state changes (U11).
+8. **Active sessions belong to the current working epoch only.** Old-epoch sessions live solely in the queue as blobs
+   until a drain mints them into the current epoch. This is what makes the index-slice hash total on the map (U5).
+9. All of a data set's state is owned by exactly one index thread: no locks, no atomics (the G1 discipline of
+   `src/timing_wheel.zig`). A thread owns R data sets (U10), one per member of its index's replication group.
+10. The queue owns every blob it holds (U3): `push` copies, `pop` and removal transfer, `deinit` frees what is left,
+    `snapshotHandles` borrows.
+11. The drain does no time math. It is as deterministic as a disk read; due-ness is the caller's judgment (U12).
+
+## 11. Tests (`zig build test`)
+
+- **Chunk codec:** round-trip of `data` after Create/Append/Overwrite, including empty payloads and multi-byte uvarint
+  lengths.
+- **`SessionData` codec:** round-trip; compensator bytes with hostile contents; exact byte layout against a golden
+  vector built from the field table in §8.
+- **Blob codec and `blobOrder`:** numeric tuple order, explicitly including pairs where a memcmp over the LE bytes would
+  give the wrong answer (retry times 0x0102 vs 0x0201) (U7).
+- **Queue:** N random inserts, drain yields the sessions sorted by `(retry_time, id)`; removal by session id; peek does
+  not disturb order; the failable surface returns `error.OutOfMemory` under a failing allocator.
+- **Map:** u128 keys ≥ 2^64 — the regression the vendored `AutoHashFn` would panic on (U5); index-slice hashing with
+  full-width equality.
+- **Lifecycle:** create → `restart_in` → `popReplayHead` → the session is back with the id minted from `st.state`, the
+  original's `original_id` and the `retry_count` intact; close of a queued session; re-arming a queued session (remove
+  the old blob, push the new deadline).
+- **Drain determinism (U12):** the same queue and the same `st.state` yield the same `Reactivated`; no clock is read
+  inside — the time comparison is exercised separately, as the loop's outer logic.
+- **Mint uniqueness (U2/U9):** two mints at two states produce two distinct ids; the envelope's meta starts at the
+  resting state.
+- **Dump/load:** whole-`IndexState` round-trip; empty queue; zero sessions; an unknown future version is rejected (U4);
+  a queue section out of order is rejected (invariant 5); the dump never contains `st.state`.
+- **Registry (U11):** a `Create` with an unknown compensator is rejected with no state change; validation is by exact
+  name bytes.
+- **uvarint edges:** 0, 127, 128, `u64` maximum.
+
+The tests construct the `Controller` the way the file's existing tests do (`ctrl.init(std.testing.allocator, &cfg)`) and
+populate the compensator registry directly, since the config grammar for the `compensators` block is a follow-up.
+
+## 12. Where it plugs in
+
+- **`src/index.zig`'s `run` loop** owns the R data sets on its stack (indexed by host_idx, own at `cfg.host_index`) and,
+  per pass: drains its CQ and LLQ batch as today, dispatches ops into `applyIndexOp` as far as the current
+  `FrontMessage` payloads allow (the real op plumbing is `consensus-driver`'s), then does the drain check —
+  `peekRetryTime()` against `nowRealtimeNs()`, and `popReplayHead` while due. The skeleton's placeholder session
+  counting is replaced: the soft-shutdown "no sessions left" condition reads the own data set's `sessions.count()`; the
+  replay queue does not gate shutdown, its contents are dump-persistent state that survives the restart. This wiring
+  lands in the same change (U12c). The exact shutdown choreography stays with `docs/startup-en-reworked.md`.
+- **The mirror data sets** are additional `IndexState` values in the same thread; mirror application is the same
+  `applyIndexOp` path, reached by the replication inbox instead of the front, with `st.state` set from each arriving
+  op's `upgrade`. The consensus reactions around all of it stay with `consensus-driver` (U11).
+- **The snapshot and recovery choreography** belongs to `wal-design`: `loadIndexState` is the first step of the startup
+  sequence ("read the last immutable snapshot, then replay the WAL over it" — the snapshot named by the registry's last
+  valid line, its file-name tag restoring `st.state`, then each replayed record's `upgrade` moving it);
+  `cloneIndexState` (index thread, into the elephant's arena) plus `dumpIndexState` (elephant, over the clone) are the
+  dumpable public interface that design's §12 prerequisite asks for — realized as Controller methods per U1, which
+  supersedes the method-on-IndexState shape of that sketch.
+- **The compensator registry** is built from the config's `compensators` block at startup; the siggy grammar for the
+  block is a follow-up, and until it lands the registry is built from whatever the config offers (empty today).
+- **Siblings by slug:** `wal-design` consumes the dump/load and the state layout; `consensus-driver` consumes the op
+  stream, the state discipline of §7 and the session meta as code; `timing-wheel` owns the wheel handles carried in the
+  meta and is deliberately not involved in the queue's ordering (invariant 11's neighborhood).

@@ -323,3 +323,19 @@ fn waitOne(ring: *zigring.Ring) zigring.CQE {
         ring.park();
     }
 }
+
+const Vzt = @import("verztable");
+
+test "u128 high-bits collision" {
+    var t = Vzt.HashMap(u128, u32).init(std.testing.allocator);
+    defer t.deinit();
+
+    // Ключи, различающиеся ТОЛЬКО в старших 64 битах
+    try t.put(0x0000_0000_0000_0001_0000_0000_0000_0001, 1);
+    try t.put(0x0000_0000_0000_0001_0000_0000_0000_0002, 2);
+    try t.put(0x0000_0000_0000_0002_0000_0000_0000_0001, 3);
+
+    try std.testing.expectEqual(@as(?u32, 1), t.get(0x0000_0000_0000_0001_0000_0000_0000_0001));
+    try std.testing.expectEqual(@as(?u32, 2), t.get(0x0000_0000_0000_0001_0000_0000_0000_0002));
+    try std.testing.expectEqual(@as(?u32, 3), t.get(0x0000_0000_0000_0002_0000_0000_0000_0001));
+}
