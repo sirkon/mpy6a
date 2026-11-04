@@ -30,6 +30,8 @@ const logging = @import("logging.zig");
 const blog = @import("blog");
 const slots = @import("slots.zig");
 const messages = @import("messages.zig");
+const state = @import("state.zig");
+const replay_queue = @import("replay_queue.zig");
 
 /// The controller that owns all shared process resources.
 pub const Controller = struct {
@@ -56,6 +58,13 @@ pub const Controller = struct {
     /// Storage for cross-thread interaction.
     cross_slots: cross_slots.CrossTaskSlots,
 
+    /// The compensator registry: built once at startup from the config's
+    /// `compensators` block; key names immutable once created. The siggy
+    /// grammar for the block is a follow-up; until it lands the registry is
+    /// built from whatever the config offers (empty today) and tests populate
+    /// it directly.
+    compensators: state.CompensatorMap,
+
     /// Lifetime-owned timer arguments. The kernel reads these asynchronously,
     /// so they must outlive the helper that armed the timer. Keeping them here
     /// makes them valid until `deinit`, after every worker has been joined.
@@ -80,6 +89,9 @@ pub const Controller = struct {
         errdefer allocator.free(rings);
 
         const inboxes = try allocator.alloc(IndexInbox, cfg.indexes);
+        // Inboxes are created by their index threads; marking the slots clean
+        // keeps `deinit` safe for slots that were never initialized.
+        for (inboxes) |*inbox| inbox.initialized = false;
         errdefer allocator.free(inboxes);
 
         const threads = try allocator.alloc(zigring.Thread, subjects);
@@ -97,10 +109,12 @@ pub const Controller = struct {
             .ring_factory = undefined,
             .init_ring = undefined,
             .cross_slots = undefined,
+            .compensators = state.CompensatorMap.init(allocator),
             .threads = threads,
             .thread_ctx = thread_ctx,
             .spawned = 0,
         };
+        errdefer self.compensators.deinit();
 
         try self.ring_factory.init(allocator, cfg.sqpoll_threads);
         errdefer self.ring_factory.deinit();
@@ -125,6 +139,7 @@ pub const Controller = struct {
         self.allocator.free(self.threads);
         self.allocator.free(self.inboxes);
         self.allocator.free(self.rings);
+        self.compensators.deinit();
         self.cross_slots.deinit();
         self.init_ring.deinit();
         self.ring_factory.deinit();
@@ -401,7 +416,518 @@ pub const Controller = struct {
             &self.rings[ring_idx].ring,
         );
     }
+
+    // ========================================================================
+    // Index state: active sessions and the replay queue.
+    //
+    // Every behavioral function of the index state lives here because it needs
+    // resources (memory and the compensator registry). The data sets are
+    // thread-local and owned by the index thread's service loop; the methods
+    // below are called only from that thread, except the dump, which the
+    // elephant runs over a clone.
+    // ========================================================================
+
+    /// A session brought back from the replay queue: the freshly minted id and
+    /// the active session inserted under it.
+    pub const Reactivated = struct {
+        new_id: u128,
+        session: *state.Session,
+    };
+
+    pub const IndexError = error{
+        OutOfMemory,
+        UnknownCompensator,
+        UnknownSession,
+    };
+
+    /// Initializes one data set. The caller assigns `st.state` before the
+    /// first op; the loader's caller does the same from the snapshot's
+    /// file-name tag.
+    pub fn initIndexState(self: *Self, st: *state.IndexState) !void {
+        st.* = .{
+            .state = 0,
+            .sessions = state.SessionsMap.init(self.allocator),
+            .replay_queue = replay_queue.ReplayQueue.init(self.allocator),
+        };
+    }
+
+    /// Releases one data set: every active session, the map, and every blob
+    /// the replay queue still holds.
+    pub fn deinitIndexState(self: *Self, st: *state.IndexState) void {
+        var it = st.sessions.iterator();
+        while (it.next()) |bucket| self.freeSession(bucket.val);
+        st.sessions.deinit();
+        st.replay_queue.deinit();
+        st.* = undefined;
+    }
+
+    /// Applies one accepted op. The caller (the consensus driver) has already
+    /// set `st.state` to this op's state; `create` mints the session id from
+    /// it.
+    pub fn applyIndexOp(self: *Self, st: *state.IndexState, op: state.Op) IndexError!void {
+        switch (op) {
+            .create => |create| {
+                // Validate before any state change: an unknown name rejects
+                // the op and leaves the data set exactly as it was.
+                if (!self.validateCompensator(create.compensator)) return error.UnknownCompensator;
+
+                const id = st.state;
+
+                const compensator = try self.allocator.dupe(u8, create.compensator);
+                errdefer self.allocator.free(compensator);
+
+                const chunk_len = uvarintLen(create.payload.len) + create.payload.len;
+                const backing = try self.allocator.alloc(u8, chunk_len);
+                errdefer self.allocator.free(backing);
+                const written = self.putUvarint(backing, create.payload.len) catch unreachable;
+                @memcpy(backing[written..][0..create.payload.len], create.payload);
+
+                const session = try self.allocator.create(state.Session);
+                errdefer self.allocator.destroy(session);
+                session.* = .{
+                    .id = id,
+                    .index_idx = id,
+                    .upgrade_idx = id,
+                    .wheel_idx = 0,
+                    .state = .ExpectOp,
+                    .consensus_progress = .{},
+                    .data = .{
+                        .original_id = id,
+                        .compensator = compensator,
+                        .retry_count = 0,
+                        .data = .{ .backing = backing, .len = chunk_len },
+                    },
+                };
+
+                try st.sessions.put(id, session);
+            },
+            .append => |append| {
+                const session = st.sessions.get(append.session_id) orelse
+                    return error.UnknownSession;
+
+                const chunk_len = uvarintLen(append.payload.len) + append.payload.len;
+                const new_len = session.data.data.len + chunk_len;
+
+                if (new_len > session.data.data.backing.len) {
+                    var new_capacity = @max(session.data.data.backing.len, 16);
+                    while (new_capacity < new_len) {
+                        new_capacity = std.math.mul(usize, new_capacity, 2) catch new_len;
+                    }
+                    session.data.data.backing = try self.allocator.realloc(
+                        session.data.data.backing,
+                        new_capacity,
+                    );
+                }
+
+                const at = session.data.data.len;
+                const written = self.putUvarint(session.data.data.backing[at..], append.payload.len) catch unreachable;
+                @memcpy(session.data.data.backing[at + written ..][0..append.payload.len], append.payload);
+                session.data.data.len = new_len;
+            },
+            .overwrite => |overwrite| {
+                const session = st.sessions.get(overwrite.session_id) orelse
+                    return error.UnknownSession;
+
+                const chunk_len = uvarintLen(overwrite.payload.len) + overwrite.payload.len;
+                const backing = try self.allocator.alloc(u8, chunk_len);
+                errdefer self.allocator.free(backing);
+                const written = self.putUvarint(backing, overwrite.payload.len) catch unreachable;
+                @memcpy(backing[written..][0..overwrite.payload.len], overwrite.payload);
+
+                self.allocator.free(session.data.data.backing);
+                session.data.data = .{ .backing = backing, .len = chunk_len };
+            },
+            .close => |close| {
+                if (st.sessions.get(close.session_id)) |session| {
+                    _ = st.sessions.remove(close.session_id);
+                    self.freeSession(session);
+                } else if (try st.replay_queue.removeSessionId(close.session_id)) |blob| {
+                    self.allocator.free(blob);
+                } else {
+                    return error.UnknownSession;
+                }
+            },
+            .restart_in => |restart| {
+                const session = st.sessions.get(restart.session_id) orelse
+                    return error.UnknownSession;
+
+                const sd_bytes = try self.encodeSessionData(&session.data);
+                defer self.allocator.free(sd_bytes);
+
+                const retry_time = nowRealtimeNs() +
+                    @as(u64, restart.seconds) * std.time.ns_per_s;
+                const blob = try self.makeReplayBlob(retry_time, restart.session_id, sd_bytes);
+                defer self.allocator.free(blob);
+
+                try st.replay_queue.push(blob);
+
+                // The session's content lives in the blob now.
+                _ = st.sessions.remove(restart.session_id);
+                self.freeSession(session);
+            },
+        }
+    }
+
+    /// The head drain: take the first blob out of the queue, decode it, mint
+    /// the envelope a fresh id from `st.state`, and re-insert it as an active
+    /// session. No time logic inside; the caller compared the head's recorded
+    /// retry time against its own clock. Deterministic: the same queue and the
+    /// same state yield the same result.
+    pub fn popReplayHead(self: *Self, st: *state.IndexState) !?Reactivated {
+        const blob = (try st.replay_queue.pop()) orelse return null;
+        defer self.allocator.free(blob);
+
+        if (blob.len < replay_queue.BLOB_HEAD + 1) return error.CorruptInput;
+
+        const sd_len_res = try self.readUvarint(blob[replay_queue.BLOB_HEAD..]);
+        const sd_len = std.math.cast(usize, sd_len_res.value) orelse return error.CorruptInput;
+        const body_off = replay_queue.BLOB_HEAD + sd_len_res.len;
+        if (body_off > blob.len or blob.len - body_off != sd_len) return error.CorruptInput;
+
+        const sd = try self.decodeSessionData(blob[body_off..][0..sd_len]);
+        errdefer {
+            self.allocator.free(sd.compensator);
+            self.allocator.free(sd.data.backing);
+        }
+
+        const new_id = st.state;
+        const session = try self.allocator.create(state.Session);
+        errdefer self.allocator.destroy(session);
+        session.* = .{
+            .id = new_id,
+            .index_idx = new_id,
+            .upgrade_idx = new_id,
+            .wheel_idx = 0,
+            .state = .ExpectOp,
+            .consensus_progress = .{},
+            .data = sd,
+        };
+
+        try st.sessions.put(new_id, session);
+        return .{ .new_id = new_id, .session = session };
+    }
+
+    /// The whole-state dump. Sessions come in map iteration order; the queue
+    /// is emitted in `(retry_time, session_id)` order.
+    pub fn dumpIndexState(
+        self: *Self,
+        st: *const state.IndexState,
+        out: *std.ArrayList(u8),
+    ) !void {
+        // The output rides the dump's own allocator: for a clone that is the
+        // elephant's arena, so one reset releases the clone and the snapshot.
+        const output_allocator = st.replay_queue.allocator;
+
+        var version: [2]u8 = undefined;
+        std.mem.writeInt(u16, &version, state.SNAPSHOT_VERSION, .little);
+        try out.appendSlice(output_allocator, &version);
+
+        var count_buf: [10]u8 = undefined;
+        const count_len = try self.putUvarint(&count_buf, st.sessions.count());
+        try out.appendSlice(output_allocator, count_buf[0..count_len]);
+
+        var it = st.sessions.iterator();
+        while (it.next()) |bucket| {
+            const sd_bytes = try self.encodeSessionData(&bucket.val.data);
+            defer self.allocator.free(sd_bytes);
+
+            var id_buf: [16]u8 = undefined;
+            std.mem.writeInt(u128, &id_buf, bucket.key, .little);
+            try out.appendSlice(output_allocator, &id_buf);
+
+            var len_buf: [10]u8 = undefined;
+            const len_len = try self.putUvarint(&len_buf, sd_bytes.len);
+            try out.appendSlice(output_allocator, len_buf[0..len_len]);
+            try out.appendSlice(output_allocator, sd_bytes);
+        }
+
+        const queue_allocator = st.replay_queue.allocator;
+        const handles = try @constCast(&st.replay_queue).snapshotHandles();
+        defer queue_allocator.free(handles);
+        std.mem.sort([]u8, handles, {}, blobLessThan);
+
+        var queue_count_buf: [10]u8 = undefined;
+        const queue_count_len = try self.putUvarint(&queue_count_buf, handles.len);
+        try out.appendSlice(output_allocator, queue_count_buf[0..queue_count_len]);
+        for (handles) |blob| try out.appendSlice(output_allocator, blob);
+    }
+
+    /// The inverse of `dumpIndexState`. Rejects unknown versions with
+    /// `error.UnsupportedVersion` and malformed bytes with
+    /// `error.CorruptInput`, including a queue section that is not in queue
+    /// order. The caller sets `st.state` afterwards from the snapshot file's
+    /// name tag.
+    pub fn loadIndexState(self: *Self, bytes: []const u8) !state.IndexState {
+        if (bytes.len < 2) return error.CorruptInput;
+        const version = std.mem.readInt(u16, bytes[0..2], .little);
+        if (version != state.SNAPSHOT_VERSION) return error.UnsupportedVersion;
+
+        var st: state.IndexState = undefined;
+        try self.initIndexState(&st);
+        errdefer self.deinitIndexState(&st);
+
+        var pos: usize = 2;
+
+        const count_res = try self.readUvarint(bytes[pos..]);
+        pos += count_res.len;
+        const count = std.math.cast(usize, count_res.value) orelse return error.CorruptInput;
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (bytes.len - pos < 16) return error.CorruptInput;
+            const id = std.mem.readInt(u128, bytes[pos..][0..16], .little);
+            pos += 16;
+
+            const len_res = try self.readUvarint(bytes[pos..]);
+            pos += len_res.len;
+            const sd_len = std.math.cast(usize, len_res.value) orelse return error.CorruptInput;
+            if (bytes.len - pos < sd_len) return error.CorruptInput;
+
+            const sd = try self.decodeSessionData(bytes[pos..][0..sd_len]);
+            pos += sd_len;
+
+            const session = try self.allocator.create(state.Session);
+            errdefer self.allocator.destroy(session);
+            session.* = .{
+                .id = id,
+                .index_idx = 0,
+                .upgrade_idx = 0,
+                .wheel_idx = 0,
+                .state = .ExpectOp,
+                .consensus_progress = .{},
+                .data = sd,
+            };
+            try st.sessions.put(id, session);
+        }
+
+        const queue_count_res = try self.readUvarint(bytes[pos..]);
+        pos += queue_count_res.len;
+        const queue_count = std.math.cast(usize, queue_count_res.value) orelse return error.CorruptInput;
+
+        var previous: ?[]const u8 = null;
+        var q: usize = 0;
+        while (q < queue_count) : (q += 1) {
+            if (bytes.len - pos < replay_queue.BLOB_HEAD + 1) return error.CorruptInput;
+
+            const sd_len_res = try self.readUvarint(bytes[pos + replay_queue.BLOB_HEAD ..]);
+            const sd_len = std.math.cast(usize, sd_len_res.value) orelse return error.CorruptInput;
+            const blob_len = replay_queue.BLOB_HEAD + sd_len_res.len + sd_len;
+            if (bytes.len - pos < blob_len) return error.CorruptInput;
+
+            const blob = bytes[pos..][0..blob_len];
+            if (previous) |prev| {
+                if (replay_queue.blobOrder({}, @constCast(prev), @constCast(blob)) == .gt) {
+                    return error.CorruptInput;
+                }
+            }
+
+            try st.replay_queue.push(blob);
+            previous = blob;
+            pos += blob_len;
+        }
+
+        if (pos != bytes.len) return error.CorruptInput;
+        return st;
+    }
+
+    /// The snapshot seam: deep-copies the own data set into the caller's
+    /// arena. Every `Session` (the struct, the session-owned compensator name
+    /// bytes, the `Buffer` backing of `data.data`) and every replay blob is
+    /// copied into arena memory; the result shares no allocation with the live
+    /// state. The caller releases the clone and the dump buffer together with
+    /// one `arena.reset(.free_all)`.
+    pub fn cloneIndexState(
+        self: *Self,
+        st: *const state.IndexState,
+        arena: std.mem.Allocator,
+    ) !state.IndexState {
+        _ = self;
+        var clone: state.IndexState = .{
+            .state = st.state,
+            .sessions = state.SessionsMap.init(arena),
+            .replay_queue = replay_queue.ReplayQueue.init(arena),
+        };
+
+        var it = st.sessions.iterator();
+        while (it.next()) |bucket| {
+            const source = bucket.val;
+            const session = try arena.create(state.Session);
+            session.* = source.*;
+            session.data.compensator = try arena.dupe(u8, source.data.compensator);
+            session.data.data.backing = try arena.dupe(u8, source.data.data.backing);
+            try clone.sessions.put(bucket.key, session);
+        }
+
+        const source_allocator = st.replay_queue.allocator;
+        const handles = try @constCast(&st.replay_queue).snapshotHandles();
+        defer source_allocator.free(handles);
+        for (handles) |blob| try clone.replay_queue.push(blob);
+
+        return clone;
+    }
+
+    pub fn validateCompensator(self: *const Self, name: []const u8) bool {
+        return self.compensators.contains(name);
+    }
+
+    /// Writes a base-128 varint into `buf` and returns its length.
+    pub fn putUvarint(self: *const Self, buf: []u8, v: u64) !usize {
+        _ = self;
+        var value = v;
+        var i: usize = 0;
+        while (value >= 0x80) {
+            if (i >= buf.len) return error.BufferTooSmall;
+            buf[i] = @as(u8, @truncate(value)) | 0x80;
+            value >>= 7;
+            i += 1;
+        }
+        if (i >= buf.len) return error.BufferTooSmall;
+        buf[i] = @truncate(value);
+        return i + 1;
+    }
+
+    /// Reads one base-128 varint and returns its value and encoded length.
+    pub fn readUvarint(self: *const Self, buf: []const u8) !struct { value: u64, len: usize } {
+        _ = self;
+        var value: u64 = 0;
+        var shift: u32 = 0;
+        var i: usize = 0;
+
+        while (i < buf.len) : (i += 1) {
+            const byte = buf[i];
+            if (shift >= 64) return error.CorruptInput;
+
+            const bits: u64 = byte & 0x7f;
+            if (shift == 63 and bits > 1) return error.CorruptInput;
+            value |= bits << @as(u6, @intCast(shift));
+
+            if (byte & 0x80 == 0) {
+                return .{ .value = value, .len = i + 1 };
+            }
+            shift += 7;
+        }
+
+        return error.CorruptInput;
+    }
+
+    /// Encodes the persisted part of a session: `original_id`,
+    /// `uvarint(compensator.len) || compensator`, `retry_count`, and
+    /// `uvarint(data.len) || data`.
+    pub fn encodeSessionData(self: *Self, sd: *const state.SessionData) ![]u8 {
+        const comp_len = uvarintLen(sd.compensator.len);
+        const data_len = uvarintLen(sd.data.len);
+        const total = 16 + comp_len + sd.compensator.len + 4 + data_len + sd.data.len;
+
+        const buf = try self.allocator.alloc(u8, total);
+        errdefer self.allocator.free(buf);
+
+        var pos: usize = 0;
+        std.mem.writeInt(u128, buf[pos..][0..16], sd.original_id, .little);
+        pos += 16;
+
+        pos += self.putUvarint(buf[pos..], sd.compensator.len) catch unreachable;
+        @memcpy(buf[pos..][0..sd.compensator.len], sd.compensator);
+        pos += sd.compensator.len;
+
+        std.mem.writeInt(u32, buf[pos..][0..4], sd.retry_count, .little);
+        pos += 4;
+
+        pos += self.putUvarint(buf[pos..], sd.data.len) catch unreachable;
+        @memcpy(buf[pos..][0..sd.data.len], sd.data.backing[0..sd.data.len]);
+        pos += sd.data.len;
+
+        std.debug.assert(pos == total);
+        return buf;
+    }
+
+    /// Decodes a `SessionData` produced by `encodeSessionData`. The caller
+    /// owns the compensator bytes and the buffer backing.
+    pub fn decodeSessionData(self: *Self, bytes: []const u8) !state.SessionData {
+        var pos: usize = 0;
+        if (bytes.len < 16) return error.CorruptInput;
+
+        const original_id = std.mem.readInt(u128, bytes[pos..][0..16], .little);
+        pos += 16;
+
+        const comp_res = try self.readUvarint(bytes[pos..]);
+        pos += comp_res.len;
+        const comp_len = std.math.cast(usize, comp_res.value) orelse return error.CorruptInput;
+        if (bytes.len - pos < comp_len) return error.CorruptInput;
+        const compensator = try self.allocator.dupe(u8, bytes[pos..][0..comp_len]);
+        errdefer self.allocator.free(compensator);
+        pos += comp_len;
+
+        if (bytes.len - pos < 4) return error.CorruptInput;
+        const retry_count = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+        pos += 4;
+
+        const data_res = try self.readUvarint(bytes[pos..]);
+        pos += data_res.len;
+        const data_len = std.math.cast(usize, data_res.value) orelse return error.CorruptInput;
+        if (bytes.len - pos < data_len) return error.CorruptInput;
+        const backing = try self.allocator.dupe(u8, bytes[pos..][0..data_len]);
+        errdefer self.allocator.free(backing);
+        pos += data_len;
+
+        if (pos != bytes.len) return error.CorruptInput;
+
+        return .{
+            .original_id = original_id,
+            .compensator = compensator,
+            .retry_count = retry_count,
+            .data = .{ .backing = backing, .len = data_len },
+        };
+    }
+
+    /// Builds a replay blob: the 24-byte head, then the length-prefixed
+    /// `SessionData` codec bytes.
+    pub fn makeReplayBlob(
+        self: *Self,
+        retry_time: u64,
+        session_id: u128,
+        sd_bytes: []const u8,
+    ) ![]u8 {
+        const total = replay_queue.BLOB_HEAD + uvarintLen(sd_bytes.len) + sd_bytes.len;
+        const blob = try self.allocator.alloc(u8, total);
+        errdefer self.allocator.free(blob);
+
+        std.mem.writeInt(u64, blob[replay_queue.RETRY_TIME_OFF..][0..8], retry_time, .little);
+        std.mem.writeInt(u128, blob[replay_queue.SESSION_ID_OFF..][0..16], session_id, .little);
+
+        const written = self.putUvarint(blob[replay_queue.BLOB_HEAD..], sd_bytes.len) catch unreachable;
+        const body = replay_queue.BLOB_HEAD + written;
+        @memcpy(blob[body..][0..sd_bytes.len], sd_bytes);
+
+        return blob;
+    }
+
+    fn freeSession(self: *Self, session: *state.Session) void {
+        self.allocator.free(session.data.compensator);
+        self.allocator.free(session.data.data.backing);
+        self.allocator.destroy(session);
+    }
+
+    fn blobLessThan(_: void, a: []u8, b: []u8) bool {
+        return replay_queue.blobOrder({}, a, b) == .lt;
+    }
+
+    fn uvarintLen(v: u64) usize {
+        var value = v;
+        var len: usize = 1;
+        while (value >= 0x80) : (value >>= 7) len += 1;
+        return len;
+    }
 };
+
+/// CLOCK_REALTIME nanoseconds. The queue's due times must survive a dump and
+/// reload across a restart, so monotonic is wrong here; zigring's
+/// `monotonicNs()` is deliberately not used.
+pub fn nowRealtimeNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    const res = std.os.linux.clock_gettime(.REALTIME, &ts);
+    if (res != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
 
 /// Fixed context of one working thread, handed to it at spawn time. The role
 /// is derived by the thread itself from the rolling counter and never leaves
@@ -649,4 +1175,519 @@ test "the derived role addresses the thread's own slot" {
     try std.testing.expectEqual(ctx.spawn_idx, ring_idx);
     const slot = ctrl.roleOf(ring_idx).ringIdx();
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&ctrl.rings[slot]) -| @intFromPtr(ctrl.rings.ptr));
+}
+
+// ============================================================================
+// Index state tests
+// ============================================================================
+
+const TestController = struct {
+    cfg: config.Config = undefined,
+    ctrl: Controller = undefined,
+
+    fn init(self: *TestController) !void {
+        self.cfg = .{
+            .fronts = 1,
+            .indexes = 1,
+            .elephants = 1,
+            .queue_depth = 64,
+            .cross_task_slots = 8,
+            .sqpoll_threads = 1,
+            .ring_slots_capacity = 4096,
+            .index_inbox_capacity = 8,
+            .logging = .{
+                .method = .{ .json = {} },
+                .pool_capacity = 64,
+                .pool_frame_size = 1024,
+            },
+        };
+        try self.ctrl.init(std.testing.allocator, &self.cfg);
+        try self.ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
+    }
+
+    fn deinit(self: *TestController) void {
+        self.ctrl.deinit();
+    }
+};
+
+fn freeSessionData(sd: state.SessionData) void {
+    std.testing.allocator.free(sd.compensator);
+    std.testing.allocator.free(sd.data.backing);
+}
+
+test "uvarint round trips its edges" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    const values = [_]u64{ 0, 1, 127, 128, 255, 1 << 14, std.math.maxInt(u64) };
+    for (values) |value| {
+        var buf: [10]u8 = undefined;
+        const written = try ctx.ctrl.putUvarint(&buf, value);
+        const read = try ctx.ctrl.readUvarint(buf[0..written]);
+        try std.testing.expectEqual(value, read.value);
+        try std.testing.expectEqual(written, read.len);
+    }
+
+    var empty: [0]u8 = .{};
+    try std.testing.expectError(error.BufferTooSmall, ctx.ctrl.putUvarint(&empty, 1));
+    try std.testing.expectError(error.CorruptInput, ctx.ctrl.readUvarint(&.{}));
+    const overlong: [11]u8 = @splat(0x80);
+    try std.testing.expectError(error.CorruptInput, ctx.ctrl.readUvarint(&overlong));
+}
+
+test "session data codec matches the field table" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var backing = [_]u8{ 0xAA, 0xBB, 0xCC };
+    const sd: state.SessionData = .{
+        .original_id = 0x112233445566778899aabbccddeeff00,
+        .compensator = "marker",
+        .retry_count = 0x01020304,
+        .data = .{ .backing = &backing, .len = backing.len },
+    };
+
+    const encoded = try ctx.ctrl.encodeSessionData(&sd);
+    defer std.testing.allocator.free(encoded);
+
+    const expected = [_]u8{
+        0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        6,    'm',  'a',  'r',  'k',  'e',  'r',  0x04,
+        0x03, 0x02, 0x01, 3,    0xAA, 0xBB, 0xCC,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, encoded);
+
+    const decoded = try ctx.ctrl.decodeSessionData(encoded);
+    defer freeSessionData(decoded);
+    try std.testing.expectEqual(sd.original_id, decoded.original_id);
+    try std.testing.expectEqualStrings(sd.compensator, decoded.compensator);
+    try std.testing.expectEqual(sd.retry_count, decoded.retry_count);
+    try std.testing.expectEqualSlices(u8, backing[0..], decoded.data.backing[0..decoded.data.len]);
+}
+
+test "session data codec keeps hostile compensator bytes" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    const hostile = [_]u8{ 0x00, 0xff, '\n', 0x7f };
+    var chunk = [_]u8{ 0x82, 0x01, 'a', 'b' };
+    const sd: state.SessionData = .{
+        .original_id = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff,
+        .compensator = &hostile,
+        .retry_count = std.math.maxInt(u32),
+        .data = .{ .backing = &chunk, .len = chunk.len },
+    };
+
+    const encoded = try ctx.ctrl.encodeSessionData(&sd);
+    defer std.testing.allocator.free(encoded);
+    const decoded = try ctx.ctrl.decodeSessionData(encoded);
+    defer freeSessionData(decoded);
+
+    try std.testing.expectEqualSlices(u8, &hostile, decoded.compensator);
+    try std.testing.expectEqualSlices(u8, &chunk, decoded.data.backing[0..decoded.data.len]);
+}
+
+test "create append and overwrite shape the chunks" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 1;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "ab" } });
+    const session = st.sessions.get(1).?;
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'a', 'b' }, session.data.data.backing[0..session.data.data.len]);
+
+    st.state = 2;
+    try ctx.ctrl.applyIndexOp(&st, .{ .append = .{ .session_id = 1, .payload = "" } });
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'a', 'b', 0 }, session.data.data.backing[0..session.data.data.len]);
+
+    var big: [130]u8 = @splat('q');
+    st.state = 3;
+    try ctx.ctrl.applyIndexOp(&st, .{ .append = .{ .session_id = 1, .payload = &big } });
+    try std.testing.expectEqual(@as(u8, 0x82), session.data.data.backing[4]);
+    try std.testing.expectEqual(@as(u8, 0x01), session.data.data.backing[5]);
+
+    st.state = 4;
+    try ctx.ctrl.applyIndexOp(&st, .{ .overwrite = .{ .session_id = 1, .payload = "xyz" } });
+    try std.testing.expectEqualSlices(u8, &.{ 3, 'x', 'y', 'z' }, session.data.data.backing[0..session.data.data.len]);
+
+    const encoded = try ctx.ctrl.encodeSessionData(&session.data);
+    defer std.testing.allocator.free(encoded);
+    const decoded = try ctx.ctrl.decodeSessionData(encoded);
+    defer freeSessionData(decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 3, 'x', 'y', 'z' }, decoded.data.backing[0..decoded.data.len]);
+
+    // An empty payload is still one chunk: a zero length byte.
+    st.state = 5;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "" } });
+    const empty = st.sessions.get(5).?;
+    try std.testing.expectEqualSlices(u8, &.{0}, empty.data.data.backing[0..empty.data.data.len]);
+}
+
+test "create restart and drain preserve identity and retry count" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 0x0000_0000_0000_0001_0000_0000_0000_0100;
+    const original_id = st.state;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "body" } });
+    st.sessions.get(original_id).?.data.retry_count = 7;
+
+    st.state += 1;
+    try ctx.ctrl.applyIndexOp(&st, .{ .restart_in = .{ .session_id = original_id, .seconds = 0 } });
+    try std.testing.expectEqual(@as(usize, 0), st.sessions.count());
+    try std.testing.expectEqual(@as(usize, 1), st.replay_queue.count());
+    try std.testing.expect((try st.replay_queue.peekRetryTime()).? <= nowRealtimeNs());
+
+    st.state += 1;
+    const reactivated = (try ctx.ctrl.popReplayHead(&st)).?;
+    try std.testing.expectEqual(st.state, reactivated.new_id);
+    try std.testing.expectEqual(original_id, reactivated.session.data.original_id);
+    try std.testing.expectEqual(@as(u32, 7), reactivated.session.data.retry_count);
+    try std.testing.expectEqual(state.Session.State.ExpectOp, reactivated.session.state);
+    try std.testing.expectEqual(st.state, reactivated.session.index_idx);
+    try std.testing.expectEqual(@as(u16, 0), reactivated.session.consensus_progress.accepted);
+    try std.testing.expectEqual(@as(usize, 1), st.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), st.replay_queue.count());
+}
+
+test "two mints at two states produce two ids" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 10;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "a" } });
+    st.state = 11;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "b" } });
+
+    try std.testing.expectEqual(@as(usize, 2), st.sessions.count());
+    try std.testing.expect(st.sessions.get(10) != null);
+    try std.testing.expect(st.sessions.get(11) != null);
+}
+
+test "close removes an active session and then a queued one" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 20;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "x" } });
+
+    st.state = 21;
+    try ctx.ctrl.applyIndexOp(&st, .{ .restart_in = .{ .session_id = 20, .seconds = 60 } });
+    try std.testing.expectEqual(@as(usize, 1), st.replay_queue.count());
+
+    // A queued session is closed by id without an active entry.
+    try ctx.ctrl.applyIndexOp(&st, .{ .close = .{ .session_id = 20 } });
+    try std.testing.expectEqual(@as(usize, 0), st.replay_queue.count());
+    try std.testing.expectError(error.UnknownSession, ctx.ctrl.applyIndexOp(&st, .{ .close = .{ .session_id = 20 } }));
+}
+
+test "unknown compensators are rejected before any state change" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 30;
+    try std.testing.expectError(
+        error.UnknownCompensator,
+        ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "nobody", .payload = "x" } }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), st.sessions.count());
+
+    // Validation is by exact name bytes.
+    try std.testing.expectError(
+        error.UnknownCompensator,
+        ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "Marker", .payload = "x" } }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), st.sessions.count());
+}
+
+test "the drain is deterministic for the same queue and state" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var first: state.IndexState = undefined;
+    var second: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&first);
+    defer ctx.ctrl.deinitIndexState(&first);
+    try ctx.ctrl.initIndexState(&second);
+    defer ctx.ctrl.deinitIndexState(&second);
+
+    first.state = 100;
+    second.state = 100;
+    try ctx.ctrl.applyIndexOp(&first, .{ .create = .{ .compensator = "marker", .payload = "same" } });
+    try ctx.ctrl.applyIndexOp(&second, .{ .create = .{ .compensator = "marker", .payload = "same" } });
+
+    first.state = 101;
+    second.state = 101;
+    try ctx.ctrl.applyIndexOp(&first, .{ .restart_in = .{ .session_id = 100, .seconds = 60 } });
+    try ctx.ctrl.applyIndexOp(&second, .{ .restart_in = .{ .session_id = 100, .seconds = 60 } });
+
+    first.state = 102;
+    second.state = 102;
+    const a = (try ctx.ctrl.popReplayHead(&first)).?;
+    const b = (try ctx.ctrl.popReplayHead(&second)).?;
+
+    try std.testing.expectEqual(a.new_id, b.new_id);
+    try std.testing.expectEqual(a.session.data.original_id, b.session.data.original_id);
+    try std.testing.expectEqualSlices(
+        u8,
+        a.session.data.data.backing[0..a.session.data.data.len],
+        b.session.data.data.backing[0..b.session.data.data.len],
+    );
+}
+
+test "dump and load round trip the whole data set" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 40;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "first" } });
+    st.state = 41;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "second" } });
+    st.state = 42;
+    try ctx.ctrl.applyIndexOp(&st, .{ .restart_in = .{ .session_id = 41, .seconds = 60 } });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try ctx.ctrl.dumpIndexState(&st, &out);
+
+    var loaded = try ctx.ctrl.loadIndexState(out.items);
+    defer ctx.ctrl.deinitIndexState(&loaded);
+
+    try std.testing.expectEqual(@as(u128, 0), loaded.state);
+    try std.testing.expectEqual(st.sessions.count(), loaded.sessions.count());
+    try std.testing.expectEqual(st.replay_queue.count(), loaded.replay_queue.count());
+
+    var it = st.sessions.iterator();
+    while (it.next()) |bucket| {
+        const restored = loaded.sessions.get(bucket.key).?;
+        try std.testing.expectEqual(bucket.val.data.original_id, restored.data.original_id);
+        try std.testing.expectEqualStrings(bucket.val.data.compensator, restored.data.compensator);
+        try std.testing.expectEqual(bucket.val.data.retry_count, restored.data.retry_count);
+        try std.testing.expectEqualSlices(
+            u8,
+            bucket.val.data.data.backing[0..bucket.val.data.data.len],
+            restored.data.data.backing[0..restored.data.data.len],
+        );
+    }
+}
+
+test "an empty data set round trips and a future version is rejected" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try ctx.ctrl.dumpIndexState(&st, &out);
+
+    var loaded = try ctx.ctrl.loadIndexState(out.items);
+    defer ctx.ctrl.deinitIndexState(&loaded);
+    try std.testing.expectEqual(@as(usize, 0), loaded.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), loaded.replay_queue.count());
+
+    const future = [_]u8{ 0x02, 0x00, 0x00 };
+    try std.testing.expectError(error.UnsupportedVersion, ctx.ctrl.loadIndexState(&future));
+}
+
+test "the dump never contains the runtime state" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 51;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "x" } });
+    // The consensus driver moves the state on after the op; the new value is
+    // runtime-only and must not appear in the dump.
+    st.state = 0xDEAD_BEEF_0000_0000_0000_0000_0000_0001;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try ctx.ctrl.dumpIndexState(&st, &out);
+
+    var needle: [16]u8 = undefined;
+    std.mem.writeInt(u128, &needle, st.state, .little);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, &needle) == null);
+}
+
+test "an out-of-order queue section is rejected" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var later: [replay_queue.BLOB_HEAD + 1]u8 = undefined;
+    std.mem.writeInt(u64, later[0..8], 10, .little);
+    std.mem.writeInt(u128, later[8..24], 1, .little);
+    later[replay_queue.BLOB_HEAD] = 0;
+
+    var earlier: [replay_queue.BLOB_HEAD + 1]u8 = undefined;
+    std.mem.writeInt(u64, earlier[0..8], 5, .little);
+    std.mem.writeInt(u128, earlier[8..24], 2, .little);
+    earlier[replay_queue.BLOB_HEAD] = 0;
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try bytes.appendSlice(std.testing.allocator, &.{ 0x01, 0x00 }); // version 1
+    try bytes.append(std.testing.allocator, 0); // no sessions
+    try bytes.append(std.testing.allocator, 2); // two queue entries
+    try bytes.appendSlice(std.testing.allocator, &later);
+    try bytes.appendSlice(std.testing.allocator, &earlier);
+
+    try std.testing.expectError(error.CorruptInput, ctx.ctrl.loadIndexState(bytes.items));
+}
+
+test "cloneIndexState is a deep copy" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 50;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "live" } });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const clone = try ctx.ctrl.cloneIndexState(&st, arena.allocator());
+    const original = st.sessions.get(50).?;
+    const copied = clone.sessions.get(50).?;
+
+    try std.testing.expect(original != copied);
+    try std.testing.expect(original.data.compensator.ptr != copied.data.compensator.ptr);
+    try std.testing.expect(original.data.data.backing.ptr != copied.data.data.backing.ptr);
+
+    original.data.data.backing[0] ^= 0xff;
+    try std.testing.expect(original.data.data.backing[0] != copied.data.data.backing[0]);
+
+    // The clone's dump bytes ride the arena too; the arena releases both.
+    var out: std.ArrayList(u8) = .empty;
+    try ctx.ctrl.dumpIndexState(&clone, &out);
+    try std.testing.expect(out.items.len > 0);
+}
+
+test "the replay blob is the head plus the session bytes" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    const body = [_]u8{ 0x01, 0x02, 0x03 };
+    const session_id: u128 = 0x112233445566778899aabbccddeeff00;
+    const blob = try ctx.ctrl.makeReplayBlob(0x0102030405060708, session_id, &body);
+    defer std.testing.allocator.free(blob);
+
+    try std.testing.expectEqual(@as(usize, replay_queue.BLOB_HEAD + 1 + body.len), blob.len);
+    try std.testing.expectEqual(
+        @as(u64, 0x0102030405060708),
+        std.mem.readInt(u64, blob[replay_queue.RETRY_TIME_OFF..][0..8], .little),
+    );
+    try std.testing.expectEqual(
+        session_id,
+        std.mem.readInt(u128, blob[replay_queue.SESSION_ID_OFF..][0..16], .little),
+    );
+    try std.testing.expectEqual(@as(u8, body.len), blob[replay_queue.BLOB_HEAD]);
+    try std.testing.expectEqualSlices(u8, &body, blob[replay_queue.BLOB_HEAD + 1 ..]);
+}
+
+test "a queued session can be removed and re-armed with a new deadline" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 70;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "x" } });
+    st.state = 71;
+    try ctx.ctrl.applyIndexOp(&st, .{ .restart_in = .{ .session_id = 70, .seconds = 60 } });
+
+    const old = (try st.replay_queue.removeSessionId(70)).?;
+    defer std.testing.allocator.free(old);
+    try std.testing.expectEqual(@as(usize, 0), st.replay_queue.count());
+
+    std.mem.writeInt(u64, old[0..8], 12345, .little);
+    try st.replay_queue.push(old);
+    try std.testing.expectEqual(@as(?u64, 12345), try st.replay_queue.peekRetryTime());
+}
+
+test "dump and load preserve the queue order" {
+    var ctx: TestController = .{};
+    try ctx.init();
+    defer ctx.deinit();
+
+    var st: state.IndexState = undefined;
+    try ctx.ctrl.initIndexState(&st);
+    defer ctx.ctrl.deinitIndexState(&st);
+
+    st.state = 80;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "a" } });
+    st.state = 81;
+    try ctx.ctrl.applyIndexOp(&st, .{ .create = .{ .compensator = "marker", .payload = "b" } });
+
+    // The later-created session is due first; the dump must sort by due time.
+    st.state = 82;
+    try ctx.ctrl.applyIndexOp(&st, .{ .restart_in = .{ .session_id = 80, .seconds = 120 } });
+    st.state = 83;
+    try ctx.ctrl.applyIndexOp(&st, .{ .restart_in = .{ .session_id = 81, .seconds = 60 } });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try ctx.ctrl.dumpIndexState(&st, &out);
+
+    var loaded = try ctx.ctrl.loadIndexState(out.items);
+    defer ctx.ctrl.deinitIndexState(&loaded);
+    try std.testing.expectEqual(@as(usize, 2), loaded.replay_queue.count());
+
+    const head = (try loaded.replay_queue.pop()).?;
+    defer std.testing.allocator.free(head);
+    try std.testing.expectEqual(
+        @as(u128, 81),
+        std.mem.readInt(u128, head[replay_queue.SESSION_ID_OFF..][0..16], .little),
+    );
 }

@@ -43,9 +43,9 @@ Do **not** use this skill for quick one-shot questions. Those belong in chat.
   they are never reused.
 - Different subjects never share a directory. Cross-subject references are made
   by slug, not by copying content.
-- When a subject is closed, its **final letter** is copied (not moved) to the
-  canonical document location, e.g. `designs/<subject>.md`. The mailbox
-  directory stays as history.
+- When a subject is closed, the final letter is **compiled** (not copied) into
+  the canonical document location, e.g. `designs/<subject>.md`; see "Promotion
+  to a design document". The mailbox directory stays as history.
 
 ## Letter format
 
@@ -151,6 +151,9 @@ the earlier one, with the header noting the supersession.
   propose it **as a `U`** with a one-line rationale, and let the human confirm.
 - Do not mix subjects in one directory. If a letter touches two subjects, split
   it into two letters and cross-reference by slug.
+- Do not promote by copying the final letter. The design document is a
+  compilation: every resolved `U` is inlined as normative text, and no `U` id,
+  pad, or iteration number survives into it.
 - Do not use this skill for chat-shaped back-and-forth. If the human wants a
   quick answer, they will ask in chat; the mailbox is for work that accumulates.
 
@@ -159,9 +162,16 @@ the earlier one, with the header noting the supersession.
 When `U open` is empty and every `# Critical` item raised by the human has been
 resolved:
 
-1. Copy `.mailbox/<subject>/<N>.md` to `designs/<subject>.md`.
+1. **Compile, do not copy.** Write `designs/<subject>.md` as a fresh,
+   self-contained document composed from the final letter, rewording and
+   reordering freely while preserving every decision. Every resolved `U` is
+   **inlined**: stated as plain normative fact at the point in the plan where
+   the question was anchored.
 2. Strip the header, the `# Pad` section, and any resolved `# Critical`
-   section; keep the body and any resolved `U` restatements as normative text.
+   section; drop the `## Open questions` index and every `U<n>` marker. The
+   compiled document never refers to `U` ids, iteration numbers, or the pad;
+   each decision appears as a plain statement of fact where it belongs in the
+   design.
 3. Leave the mailbox directory in place as history. Optionally add a one-line
    pointer at the top of the promoted document: `Promoted from
 .mailbox/<subject>/<N>.md`.

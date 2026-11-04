@@ -324,18 +324,25 @@ fn waitOne(ring: *zigring.Ring) zigring.CQE {
     }
 }
 
-const Vzt = @import("verztable");
+const state = @import("state.zig");
 
 test "u128 high-bits collision" {
-    var t = Vzt.HashMap(u128, u32).init(std.testing.allocator);
+    var sessions: [3]state.Session = undefined;
+    var t = state.SessionsMap.init(std.testing.allocator);
     defer t.deinit();
 
-    // Ключи, различающиеся ТОЛЬКО в старших 64 битах
-    try t.put(0x0000_0000_0000_0001_0000_0000_0000_0001, 1);
-    try t.put(0x0000_0000_0000_0001_0000_0000_0000_0002, 2);
-    try t.put(0x0000_0000_0000_0002_0000_0000_0000_0001, 3);
+    // Keys differing ONLY in the high 64 bits. The vendored AutoHashFn would
+    // panic on these; the session map hashes the index slice and keeps
+    // full-width equality.
+    const first: u128 = 0x0000_0000_0000_0001_0000_0000_0000_0001;
+    const second: u128 = 0x0000_0000_0000_0001_0000_0000_0000_0002;
+    const third: u128 = 0x0000_0000_0000_0002_0000_0000_0000_0001;
 
-    try std.testing.expectEqual(@as(?u32, 1), t.get(0x0000_0000_0000_0001_0000_0000_0000_0001));
-    try std.testing.expectEqual(@as(?u32, 2), t.get(0x0000_0000_0000_0001_0000_0000_0000_0002));
-    try std.testing.expectEqual(@as(?u32, 3), t.get(0x0000_0000_0000_0002_0000_0000_0000_0001));
+    try t.put(first, &sessions[0]);
+    try t.put(second, &sessions[1]);
+    try t.put(third, &sessions[2]);
+
+    try std.testing.expectEqual(&sessions[0], t.get(first).?);
+    try std.testing.expectEqual(&sessions[1], t.get(second).?);
+    try std.testing.expectEqual(&sessions[2], t.get(third).?);
 }

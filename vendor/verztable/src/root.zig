@@ -378,7 +378,7 @@ pub fn HashMapWithFns(
         pub fn deinit(self: *Self) void {
             if (self.buckets_mask != 0) {
                 const alloc_size = self.totalAllocSize();
-                const ptr: [*]u8 = @ptrCast(self.buckets);
+                const ptr: [*]align(@alignOf(Bucket)) u8 = @ptrCast(self.buckets);
                 self.allocator.free(ptr[0..alloc_size]);
             }
             self.* = Self.init(self.allocator);
@@ -592,7 +592,7 @@ pub fn HashMapWithFns(
             }
 
             const alloc_size = self.totalAllocSize();
-            const new_mem = try self.allocator.alloc(u8, alloc_size);
+            const new_mem = try self.allocator.alignedAlloc(u8, .of(Bucket), alloc_size);
             const src_ptr: [*]const u8 = @ptrCast(self.buckets);
             @memcpy(new_mem, src_ptr[0..alloc_size]);
 
@@ -933,7 +933,7 @@ pub fn HashMapWithFns(
                 };
 
                 const alloc_size = new_table.totalAllocSizeForCount(new_count);
-                const new_mem = try self.allocator.alloc(u8, alloc_size);
+                const new_mem = try self.allocator.alignedAlloc(u8, .of(Bucket), alloc_size);
                 errdefer self.allocator.free(new_mem);
 
                 new_table.buckets = @ptrCast(@alignCast(new_mem.ptr));
@@ -969,7 +969,7 @@ pub fn HashMapWithFns(
                 // Free old allocation
                 if (self.buckets_mask != 0) {
                     const old_size = self.totalAllocSize();
-                    const old_ptr: [*]u8 = @ptrCast(self.buckets);
+                    const old_ptr: [*]align(@alignOf(Bucket)) u8 = @ptrCast(self.buckets);
                     self.allocator.free(old_ptr[0..old_size]);
                 }
 
