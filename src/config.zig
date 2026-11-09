@@ -66,6 +66,78 @@ pub const Config = struct {
 
     index_inbox_capacity: u32 = 1024, // TODO: validation, must be a pow of 2.
     ring_slots_capacity: u32 = 4096, // TODO: validation, must a pow of 2.
+
+    /// Write-ahead log parameters. Required: no valid document leaves the WAL
+    /// module unopened, so there is no default and no `null` to fall back to.
+    wal: Wal,
+};
+
+/// Write-ahead log parameters: the mode and the battery geometry.
+///
+/// `dir` is required in both modes and `device` only in `pmem`; `buffers`,
+/// `hosts` and `lba` are omittable and take the documented defaults.
+///
+/// ```text
+/// wal = plain { dir = "wal" buffers = 32 hosts = 1 lba = 4096 }
+/// wal = pmem  { dir = "wal" device = "/dev/dax0.0" }
+/// ```
+///
+/// `hosts` is the size of the index's replication group, which bounds the
+/// `host_idx: u8` of the WAL API; `lba` is the buffer size and the flush
+/// granularity; `buffers` is the ring depth inside one pair's battery area.
+pub const Wal = union(enum) {
+    /// Ordinary memory battery: the un-flushed tail is lost on a crash.
+    plain: struct {
+        dir: []const u8,
+        buffers: u32 = 32,
+        hosts: u32 = 1,
+        lba: u32 = 4096,
+    },
+    /// NVDIMM battery: the un-flushed tail survives a crash.
+    pmem: struct {
+        dir: []const u8,
+        device: []const u8,
+        buffers: u32 = 32,
+        hosts: u32 = 1,
+        lba: u32 = 4096,
+    },
+
+    /// The directory WAL files live in, shared by both modes.
+    pub fn dir(self: Wal) []const u8 {
+        return switch (self) {
+            .plain => |p| p.dir,
+            .pmem => |p| p.dir,
+        };
+    }
+
+    /// Ring depth inside one pair's battery area.
+    pub fn buffers(self: Wal) u32 {
+        return switch (self) {
+            .plain => |p| p.buffers,
+            .pmem => |p| p.buffers,
+        };
+    }
+
+    /// Size of the index's replication group.
+    pub fn hosts(self: Wal) u32 {
+        return switch (self) {
+            .plain => |p| p.hosts,
+            .pmem => |p| p.hosts,
+        };
+    }
+
+    /// Buffer size in bytes, also the flush granularity.
+    pub fn lba(self: Wal) u32 {
+        return switch (self) {
+            .plain => |p| p.lba,
+            .pmem => |p| p.lba,
+        };
+    }
+
+    /// Whether the battery is a mapped NVDIMM instead of ordinary memory.
+    pub fn isPmem(self: Wal) bool {
+        return self == .pmem;
+    }
 };
 
 /// Kinds of logging.
@@ -259,12 +331,29 @@ pub const ParseError = error{
     InvalidAcceptBacklog,
     InvalidFrontCoresMask,
     InvalidIndexCoresMask,
+    InvalidLba,
+    InvalidBuffers,
+    InvalidHosts,
+    InvalidHostIndex,
+    InvalidWalDir,
+    InvalidWalDevice,
     OutOfMemory,
+    MissingField,
     ParseSiggy,
 };
 
 /// CPU count used for the comptime validation of the default document.
 pub const check_cpu_cores: u16 = 8;
+
+/// The canonical document the build validates at comptime and `default()`
+/// renders.
+///
+/// `Config` has a required key (`wal`), so there is no `{}` value to validate
+/// or stringify: this literal spells the defaults plus the WAL block the dev
+/// document carries. A broken value here still fails the build.
+pub const canonical = Config{
+    .wal = .{ .plain = .{ .dir = "wal", .buffers = 32, .hosts = 1, .lba = 4096 } },
+};
 
 /// CPU count the tests validate against.
 pub const test_cpu_count: u16 = check_cpu_cores;
@@ -294,6 +383,14 @@ pub const test_cpu_count: u16 = check_cpu_cores;
 /// - `cross_task_slots` is a power of two
 /// - `accept_backlog` is a power of two
 ///
+/// Rules for `wal`:
+///
+/// - `lba` is a power of two in `[512, 1 MiB]` and divides 1 MiB exactly
+/// - `buffers >= 2` (the ring needs a current and a free buffer)
+/// - `1 <= hosts <= 256` (`host_idx: u8` bounds it)
+/// - `host_index < hosts`
+/// - `dir` is non-empty, and so is `device` in PMEM mode
+///
 /// Rules for `front_cores` and `index_cores`:
 ///
 /// - every core is less than `cpu_cores`
@@ -302,8 +399,8 @@ pub const test_cpu_count: u16 = check_cpu_cores;
 /// - the expanded length of each set matches `fronts` / `indexes` respectively
 pub fn Manager() type {
     comptime {
-        validate(Config{}, check_cpu_cores) catch |err| {
-            @compileError("default Config is invalid: " ++ @errorName(err));
+        validate(canonical, check_cpu_cores) catch |err| {
+            @compileError("canonical Config is invalid: " ++ @errorName(err));
         };
     }
 
@@ -348,6 +445,7 @@ pub fn Manager() type {
 
             const config = parser.parse(data) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.MissingField => return error.MissingField,
                 else => return error.ParseSiggy,
             };
 
@@ -377,7 +475,7 @@ pub fn Manager() type {
             var parser: ConfigParser = undefined;
             try parser.init(self.allocator, scratch.allocator(), self.printer);
 
-            const text = parser.stringify(.{});
+            const text = parser.stringify(canonical);
             if (parser.diagnostic != null) return error.OutOfMemory;
 
             return self.allocator.dupe(u8, text);
@@ -425,6 +523,8 @@ fn validate(config: Config, cpu_cores: u16) ParseError!void {
         return error.InvalidAcceptBacklog;
     }
 
+    try validateWal(config.wal, config.host_index);
+
     try validateCores(
         config.front_cores.cores,
         config.fronts,
@@ -440,6 +540,27 @@ fn validate(config: Config, cpu_cores: u16) ParseError!void {
 
     if (setsIntersect(config.front_cores.cores, config.index_cores.cores)) {
         return error.InvalidIndexCoresMask;
+    }
+}
+
+/// The 1 MiB WAL block every `lba` has to divide.
+const wal_block: u32 = 1 << 20;
+
+/// WAL rules: the battery geometry the whole write path is built on, plus the
+/// host slot the index group addresses. No allocation, so it serves both the
+/// comptime check and the runtime `fromText`.
+fn validateWal(wal: Wal, host_index: u16) ParseError!void {
+    const lba = wal.lba();
+    if (lba < 512 or lba > wal_block or !std.math.isPowerOfTwo(lba) or wal_block % lba != 0) {
+        return error.InvalidLba;
+    }
+    if (wal.buffers() < 2) return error.InvalidBuffers;
+    if (wal.hosts() < 1 or wal.hosts() > 256) return error.InvalidHosts;
+    if (host_index >= wal.hosts()) return error.InvalidHostIndex;
+    if (wal.dir().len == 0) return error.InvalidWalDir;
+    switch (wal) {
+        .plain => {},
+        .pmem => |pmem| if (pmem.device.len == 0) return error.InvalidWalDevice,
     }
 }
 
@@ -485,11 +606,15 @@ fn testManager() ManagerType {
     return manager;
 }
 
+/// `wal` is a required key, so every test document carries it; prepending the
+/// block keeps the text of each test focused on the rule it exercises.
+const wal_doc = "wal = plain { dir = \"wal\" }\n";
+
 test "core masks accept blocks of cores and ranges" {
     var manager = testManager();
     defer manager.deinit();
 
-    const text =
+    const text = wal_doc ++
         \\fronts = 2
         \\front_cores = { 0..1 }
         \\indexes = 2
@@ -512,7 +637,7 @@ test "core masks normalize order and duplicates" {
     var manager = testManager();
     defer manager.deinit();
 
-    const config = try manager.fromText(
+    const config = try manager.fromText(wal_doc ++
         \\fronts = 2
         \\front_cores = { 3 2 2..3 }
     );
@@ -524,45 +649,45 @@ test "scalar and core rules are enforced" {
     var manager = testManager();
     defer manager.deinit();
 
-    try testing.expectError(error.InvalidPort, manager.fromText("port = 0"));
+    try testing.expectError(error.InvalidPort, manager.fromText(wal_doc ++ "port = 0"));
 
     // fronts must be a power of two below the core count.
     try testing.expectError(
         error.InvalidFronts,
-        manager.fromText("fronts = 3"),
+        manager.fromText(wal_doc ++ "fronts = 3"),
     );
 
     // Malformed masks are parse errors, not validation errors.
     try testing.expectError(
         error.ParseSiggy,
-        manager.fromText("fronts = 1\nfront_cores = { 5..3 }"),
+        manager.fromText(wal_doc ++ "fronts = 1\nfront_cores = { 5..3 }"),
     );
     try testing.expectError(
         error.ParseSiggy,
-        manager.fromText("fronts = 1\nfront_cores = { abc }"),
+        manager.fromText(wal_doc ++ "fronts = 1\nfront_cores = { abc }"),
     );
     try testing.expectError(
         error.ParseSiggy,
-        manager.fromText("fronts = 1\nfront_cores = { 70000 }"),
+        manager.fromText(wal_doc ++ "fronts = 1\nfront_cores = { 70000 }"),
     );
 
     // Front and index sets must not intersect. The default fronts sit on
     // {2, 3} and the index set below includes 2.
     try testing.expectError(
         error.InvalidIndexCoresMask,
-        manager.fromText("indexes = 2\nindex_cores = { 2 5 }"),
+        manager.fromText(wal_doc ++ "indexes = 2\nindex_cores = { 2 5 }"),
     );
 
     // The expanded length has to match the thread count.
     try testing.expectError(
         error.InvalidFrontCoresMask,
-        manager.fromText("fronts = 2\nfront_cores = { 0 }"),
+        manager.fromText(wal_doc ++ "fronts = 2\nfront_cores = { 0 }"),
     );
 
     // Cores must exist on the host.
     try testing.expectError(
         error.InvalidFrontCoresMask,
-        manager.fromText("fronts = 2\nfront_cores = { 8..9 }"),
+        manager.fromText(wal_doc ++ "fronts = 2\nfront_cores = { 8..9 }"),
     );
 }
 
@@ -570,8 +695,139 @@ test "malformed documents are reported as parse errors" {
     var manager = testManager();
     defer manager.deinit();
 
-    try testing.expectError(error.ParseSiggy, manager.fromText("frobnicate = 1"));
-    try testing.expectError(error.ParseSiggy, manager.fromText("port = 1\nport = 2"));
-    try testing.expectError(error.ParseSiggy, manager.fromText("port = 1, bind = \"x\""));
-    try testing.expectError(error.ParseSiggy, manager.fromText(".port = 1"));
+    try testing.expectError(error.ParseSiggy, manager.fromText(wal_doc ++ "frobnicate = 1"));
+    try testing.expectError(error.ParseSiggy, manager.fromText(wal_doc ++ "port = 1\nport = 2"));
+    try testing.expectError(error.ParseSiggy, manager.fromText(wal_doc ++ "port = 1, bind = \"x\""));
+    try testing.expectError(error.ParseSiggy, manager.fromText(wal_doc ++ ".port = 1"));
+}
+
+test "the wal block is a required key" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    try testing.expectError(error.MissingField, manager.fromText("port = 7000"));
+    try testing.expectError(
+        error.MissingField,
+        manager.fromText("port = 7000\nwal = plain { buffers = 8 }"),
+    );
+    try testing.expectError(
+        error.MissingField,
+        manager.fromText("port = 7000\nwal = pmem { dir = \"wal\" }"),
+    );
+}
+
+test "the dev document parses" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    const dev =
+        \\bind = "localhost"
+        \\port = 60006
+        \\fronts = 2
+        \\front_cores = { 2 3 }
+        \\indexes = 4
+        \\index_cores = { 4..7 }
+        \\elephants = 1
+        \\host_index = 0
+        \\logging = { method = pretty { dark } pool_capacity = 1024 pool_frame_size = 2048 }
+        \\queue_depth = 4096
+        \\init_timeout_sec = 8
+        \\shutdown_timeout_sec = 8
+        \\cross_task_slots = 4096
+        \\accept_backlog = 1024
+        \\sqpoll_threads = 1
+        \\index_inbox_capacity = 1024
+        \\ring_slots_capacity = 4096
+        \\wal = plain { dir = "wal" buffers = 32 hosts = 1 lba = 4096 }
+    ;
+    const config = try manager.fromText(dev);
+
+    try testing.expect(config.wal == .plain);
+    try testing.expectEqualStrings("wal", config.wal.dir());
+    try testing.expectEqual(@as(u32, 32), config.wal.buffers());
+    try testing.expectEqual(@as(u32, 1), config.wal.hosts());
+    try testing.expectEqual(@as(u32, 4096), config.wal.lba());
+}
+
+test "wal geometry defaults to the documented values" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    const plain = try manager.fromText("wal = plain { dir = \"wal\" }");
+    try testing.expect(plain.wal == .plain);
+    try testing.expectEqual(@as(u32, 32), plain.wal.buffers());
+    try testing.expectEqual(@as(u32, 1), plain.wal.hosts());
+    try testing.expectEqual(@as(u32, 4096), plain.wal.lba());
+
+    const pmem = try manager.fromText("wal = pmem { dir = \"wal\" device = \"/dev/dax0.0\" lba = 512 }");
+    try testing.expect(pmem.wal.isPmem());
+    try testing.expectEqualStrings("/dev/dax0.0", pmem.wal.pmem.device);
+    try testing.expectEqual(@as(u32, 32), pmem.wal.buffers());
+    try testing.expectEqual(@as(u32, 512), pmem.wal.lba());
+}
+
+test "wal rules are enforced" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    // lba: power of two, inside [512, 1 MiB], dividing a block exactly.
+    try testing.expectError(
+        error.InvalidLba,
+        manager.fromText("wal = plain { dir = \"wal\" lba = 256 }"),
+    );
+    try testing.expectError(
+        error.InvalidLba,
+        manager.fromText("wal = plain { dir = \"wal\" lba = 3072 }"),
+    );
+    try testing.expectError(
+        error.InvalidLba,
+        manager.fromText("wal = plain { dir = \"wal\" lba = 2097152 }"),
+    );
+
+    // The ring needs a current and a free buffer.
+    try testing.expectError(
+        error.InvalidBuffers,
+        manager.fromText("wal = plain { dir = \"wal\" buffers = 1 }"),
+    );
+
+    // host_idx is a u8, so a group cannot be wider than 256.
+    try testing.expectError(
+        error.InvalidHosts,
+        manager.fromText("wal = plain { dir = \"wal\" hosts = 257 }"),
+    );
+    try testing.expectError(
+        error.InvalidHosts,
+        manager.fromText("wal = plain { dir = \"wal\" hosts = 0 }"),
+    );
+
+    // This bounds the own host slot, previously checked ad hoc in index.zig.
+    try testing.expectError(
+        error.InvalidHostIndex,
+        manager.fromText("wal = plain { dir = \"wal\" hosts = 1 }\nhost_index = 1"),
+    );
+
+    try testing.expectError(
+        error.InvalidWalDir,
+        manager.fromText("wal = plain { dir = \"\" }"),
+    );
+    try testing.expectError(
+        error.InvalidWalDevice,
+        manager.fromText("wal = pmem { dir = \"wal\" device = \"\" }"),
+    );
+}
+
+test "the rendered default document re-parses" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    const text = try manager.default();
+    defer testing.allocator.free(text);
+
+    const config = try manager.fromText(text);
+    try testing.expect(config.wal == .plain);
+    try testing.expectEqualStrings("wal", config.wal.dir());
+    try testing.expectEqual(@as(u32, 32), config.wal.buffers());
+    try testing.expectEqual(@as(u32, 1), config.wal.hosts());
+    try testing.expectEqual(@as(u32, 4096), config.wal.lba());
+    try testing.expectEqual(@as(u16, 60006), config.port);
 }

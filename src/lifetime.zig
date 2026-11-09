@@ -32,6 +32,7 @@ const slots = @import("slots.zig");
 const messages = @import("messages.zig");
 const state = @import("state.zig");
 const replay_queue = @import("replay_queue.zig");
+const wal = @import("wal.zig");
 
 /// The controller that owns all shared process resources.
 pub const Controller = struct {
@@ -79,6 +80,24 @@ pub const Controller = struct {
     /// How many of `threads` were actually spawned.
     spawned: usize,
 
+    /// How the WAL battery is backed.
+    wal_mode: wal.Mode,
+    /// Battery areas: one per `(host_idx, index_idx)` pair, `indexes × hosts`.
+    wal_pairs: usize,
+    /// Bytes between two pair areas, alignment padding included.
+    wal_area_stride: usize,
+    /// One live writer per pair area, `null` while the pair has none. This is
+    /// what makes a second open of one triple `error.WalOpen`.
+    wal_writers: []?*wal.WalWriteFile,
+    /// Every pair's area in one aligned slab. Acquired at the first index
+    /// thread start (plain) or by mapping the device (PMEM) and released in
+    /// `deinit`; it outlives every WAL file, since files rotate over the same
+    /// area epoch after epoch.
+    wal_battery: ?[]u8,
+    /// Guards the one-time battery acquisition: only the first index thread to
+    /// start allocates, the rest wait for it.
+    wal_battery_lock: std.atomic.Mutex,
+
     /// Allocates the shared arrays. Rings and inboxes stay `undefined` here:
     /// each thread publishes its own ring, and each index creates its own
     /// inbox, during its initialization.
@@ -100,6 +119,12 @@ pub const Controller = struct {
         const thread_ctx = try allocator.alloc(ThreadContext, subjects);
         errdefer allocator.free(thread_ctx);
 
+        // WAL geometry is pure config arithmetic; the battery itself is only
+        // acquired once an index thread starts or a file is opened.
+        const wal_writers = try allocator.alloc(?*wal.WalWriteFile, @as(usize, cfg.indexes) * cfg.wal.hosts());
+        errdefer allocator.free(wal_writers);
+        @memset(wal_writers, null);
+
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
@@ -113,6 +138,12 @@ pub const Controller = struct {
             .threads = threads,
             .thread_ctx = thread_ctx,
             .spawned = 0,
+            .wal_mode = wal.modeOf(cfg.wal),
+            .wal_pairs = @as(usize, cfg.indexes) * cfg.wal.hosts(),
+            .wal_area_stride = wal.areaStride(cfg.wal.buffers(), cfg.wal.lba(), std.heap.pageSize()),
+            .wal_writers = wal_writers,
+            .wal_battery = null,
+            .wal_battery_lock = .unlocked,
         };
         errdefer self.compensators.deinit();
 
@@ -134,6 +165,19 @@ pub const Controller = struct {
     /// because it may be the poller master every worker ring attaches to.
     pub fn deinit(self: *Self) void {
         for (self.inboxes) |*inbox| inbox.deinit();
+
+        // Live WAL writers outlive their index thread only in a failed
+        // shutdown; release whichever are still registered.
+        for (self.wal_writers) |maybe_writer| {
+            const writer = maybe_writer orelse continue;
+            _ = std.os.linux.close(writer.fd);
+            self.allocator.destroy(writer);
+        }
+        self.allocator.free(self.wal_writers);
+        if (self.wal_battery) |bytes| {
+            wal.closeBattery(self.allocator, self.cfg.wal, bytes, std.heap.pageSize());
+            self.wal_battery = null;
+        }
 
         self.allocator.free(self.thread_ctx);
         self.allocator.free(self.threads);
@@ -203,7 +247,12 @@ pub const Controller = struct {
             // The inbox is shared with the parent front, which may push into
             // it until it stops, so the controller releases it after every
             // thread has been joined; the index thread must not free it here.
-            .index => |r| self.initIndexInbox(r.inbox_idx, ring_idx) catch |err| fatal("index inbox initialization", ring_idx, err),
+            .index => |r| {
+                self.initIndexInbox(r.inbox_idx, ring_idx) catch |err| fatal("index inbox initialization", ring_idx, err);
+                // The battery belongs to the index threads: the first one to
+                // start acquires it for every pair, the rest find it there.
+                self.acquireWalBattery() catch |err| fatal("WAL battery acquisition", ring_idx, err);
+            },
             .front, .elephant => {},
         }
 
@@ -282,6 +331,187 @@ pub const Controller = struct {
         _ = std.os.linux.symlink(log_file, symlink_path);
 
         return @intCast(fd_raw);
+    }
+
+    /// The battery area of pair `pair`, acquiring the whole battery on first
+    /// use. Cold by construction: only an index thread start and the cold open
+    /// entries reach this.
+    fn walArea(self: *Self, pair: usize) ![]u8 {
+        try self.acquireWalBattery();
+        const stride = self.wal_area_stride;
+        return self.wal_battery.?[pair * stride ..][0..stride];
+    }
+
+    /// Acquires the battery once: plain mode allocates zeroed ordinary memory,
+    /// PMEM mode maps the configured device as found. The areas outlive every
+    /// WAL file, since files rotate over the same area epoch after epoch.
+    pub fn acquireWalBattery(self: *Self) !void {
+        while (!self.wal_battery_lock.tryLock()) std.Thread.yield() catch {};
+        defer self.wal_battery_lock.unlock();
+        if (self.wal_battery != null) return;
+
+        self.wal_battery = try wal.openBattery(
+            self.allocator,
+            self.cfg.wal,
+            self.wal_pairs,
+            self.wal_area_stride,
+            std.heap.pageSize(),
+        );
+    }
+
+    /// The battery area slot of one pair, thread-major.
+    fn walPairOf(self: *const Self, host_idx: u8, index_idx: u16) usize {
+        const pair = wal.areaIndex(host_idx, index_idx, self.cfg.wal.hosts());
+        std.debug.assert(pair < self.wal_pairs);
+        return pair;
+    }
+
+    /// Opens an existing WAL file. Creation belongs to the elephant threads
+    /// (designs/wal-impl.md §1.1), so a missing file surfaces the raw open
+    /// error: fatal at startup, never repaired here.
+    fn walOpenFile(self: *Self, path: [:0]const u8, write: bool) !posix.fd_t {
+        _ = self;
+        const flags: std.os.linux.O = .{ .ACCMODE = if (write) .RDWR else .RDONLY };
+        const fd_raw = std.os.linux.open(path, flags, 0);
+        const errno = std.os.linux.errno(fd_raw);
+        if (errno != .SUCCESS) return switch (errno) {
+            .NOENT => error.FileNotFound,
+            .ACCES, .PERM => error.AccessDenied,
+            else => |err| std.posix.unexpectedErrno(err),
+        };
+        return @intCast(fd_raw);
+    }
+
+    /// Opens the WAL of one data set for writing.
+    ///
+    /// Recovery and the walk are §C/§E: here the file is opened, the pair's
+    /// battery view is wired into the writer and — PMEM mode — the chain the
+    /// battery survived is walked, so `head`, the write position and the flush
+    /// frontier resume where the crash left them (§3.4). Plain mode has no
+    /// chain to walk: its battery is DRAM and gone, so the file's own parse is
+    /// the only source. A second open of a triple that already has a live
+    /// writer is `WalOpen`.
+    pub fn walOpenWrite(self: *Self, host_idx: u8, index_idx: u16, tag: u128) !*wal.WalWriteFile {
+        const pair = self.walPairOf(host_idx, index_idx);
+        if (self.wal_writers[pair] != null) return error.WalOpen;
+
+        const area = try self.walArea(pair);
+        const path = try wal.walPath(self.allocator, self.cfg.wal.dir(), host_idx, index_idx, tag);
+        defer self.allocator.free(path);
+
+        const fd = try self.walOpenFile(path, true);
+        errdefer _ = std.os.linux.close(fd);
+
+        const writer = try self.allocator.create(wal.WalWriteFile);
+        errdefer self.allocator.destroy(writer);
+
+        writer.* = wal.WalWriteFile.init(
+            fd,
+            wal.Area.init(area, self.cfg.wal.buffers(), self.cfg.wal.lba()),
+            self.cfg.wal,
+            host_idx,
+            index_idx,
+            tag,
+        );
+        try writer.walk(try wal.fileSize(fd));
+        self.wal_writers[pair] = writer;
+        return writer;
+    }
+
+    /// Adopts the WAL descriptor the elephant threads handed over after a
+    /// snapshot: the swap's last step, so the old writer is closed first.
+    ///
+    /// `close` drains the old writer's flush queue, which reclaims every buffer
+    /// of the pair and leaves its ring idle; only then is the battery cleanly
+    /// handable, and the ordering is structural — the pair owns one battery
+    /// area and one ring, so two live writers on it would collide.
+    ///
+    /// The ordinal-0 zero-terminator is published here, *before* the caller
+    /// appends the snapshot registry line: that ordering is what keeps "a
+    /// registry-visible file implies its base was persisted" true — publishing
+    /// after the append would leave a crash window where slot 0 still holds the
+    /// previous file's header.
+    pub fn walAdoptWrite(
+        self: *Self,
+        host_idx: u8,
+        index_idx: u16,
+        tag: u128,
+        fd: posix.fd_t,
+    ) !*wal.WalWriteFile {
+        const pair = self.walPairOf(host_idx, index_idx);
+        errdefer _ = std.os.linux.close(fd);
+
+        if (self.wal_writers[pair]) |old| {
+            try old.close();
+            self.allocator.destroy(old);
+            self.wal_writers[pair] = null;
+        }
+
+        const area = try self.walArea(pair);
+        const writer = try self.allocator.create(wal.WalWriteFile);
+        errdefer self.allocator.destroy(writer);
+
+        writer.* = wal.WalWriteFile.init(
+            fd,
+            wal.Area.init(area, self.cfg.wal.buffers(), self.cfg.wal.lba()),
+            self.cfg.wal,
+            host_idx,
+            index_idx,
+            tag,
+        );
+        // Ordinal 0 always opens block 0, whose fold starts at the CRC of
+        // nothing — zero, not the register seed (designs/wal-steps.md §B2's
+        // reconciliation: handing `composedCrc32C` the seed would cancel the
+        // register init and the block's stored CRC would stop verifying). The
+        // tag is the state the fresh file's first record chains from, and 0 is
+        // the brand-new data set's empty state.
+        writer.publishTerminator(0, tag, 0);
+
+        self.wal_writers[pair] = writer;
+        return writer;
+    }
+
+    /// Opens the WAL of one data set for reading: the fd wrapper plus the
+    /// pair's geometry, so a read operation walks the merged stream itself —
+    /// the file's flushed bytes and, in PMEM mode, the battery's chain behind
+    /// them (§5).
+    pub fn walOpenRead(self: *Self, host_idx: u8, index_idx: u16, tag: u128) !*wal.WalReadFile {
+        const pair = self.walPairOf(host_idx, index_idx);
+        const path = try wal.walPath(self.allocator, self.cfg.wal.dir(), host_idx, index_idx, tag);
+        defer self.allocator.free(path);
+
+        // Plain mode's battery is DRAM: after a restart it holds nothing the
+        // file does not, so the merged stream is the file alone there.
+        const area: ?wal.Area = if (self.cfg.wal.isPmem())
+            wal.Area.init(try self.walArea(pair), self.cfg.wal.buffers(), self.cfg.wal.lba())
+        else
+            null;
+
+        const fd = try self.walOpenFile(path, false);
+        errdefer _ = std.os.linux.close(fd);
+
+        const reader = try self.allocator.create(wal.WalReadFile);
+        errdefer self.allocator.destroy(reader);
+
+        reader.* = wal.WalReadFile.init(fd, self.cfg.wal, area, host_idx, index_idx, tag);
+        return reader;
+    }
+
+    /// Releases a reader acquired by `walOpenRead`.
+    pub fn walCloseRead(self: *Self, reader: *wal.WalReadFile) void {
+        _ = std.os.linux.close(reader.fd);
+        self.allocator.destroy(reader);
+    }
+
+    /// Removes one WAL file. Idempotent by construction: a missing file is
+    /// success, so retention never has to probe first.
+    pub fn delete(self: *Self, host_idx: u8, index_idx: u16, tag: u128) !void {
+        const path = try wal.walPath(self.allocator, self.cfg.wal.dir(), host_idx, index_idx, tag);
+        defer self.allocator.free(path);
+
+        const errno = std.os.linux.errno(std.os.linux.unlink(path));
+        if (errno == .SUCCESS or errno == .NOENT) return;
+        return std.posix.unexpectedErrno(errno);
     }
 
     /// Returned when `getRingIdx` is not used properly.
@@ -479,7 +709,7 @@ pub const Controller = struct {
                 const chunk_len = uvarintLen(create.payload.len) + create.payload.len;
                 const backing = try self.allocator.alloc(u8, chunk_len);
                 errdefer self.allocator.free(backing);
-                const written = self.putUvarint(backing, create.payload.len) catch unreachable;
+                const written = putUvarint(backing, create.payload.len) catch unreachable;
                 @memcpy(backing[written..][0..create.payload.len], create.payload);
 
                 const session = try self.allocator.create(state.Session);
@@ -520,7 +750,7 @@ pub const Controller = struct {
                 }
 
                 const at = session.data.data.len;
-                const written = self.putUvarint(session.data.data.backing[at..], append.payload.len) catch unreachable;
+                const written = putUvarint(session.data.data.backing[at..], append.payload.len) catch unreachable;
                 @memcpy(session.data.data.backing[at + written ..][0..append.payload.len], append.payload);
                 session.data.data.len = new_len;
             },
@@ -531,7 +761,7 @@ pub const Controller = struct {
                 const chunk_len = uvarintLen(overwrite.payload.len) + overwrite.payload.len;
                 const backing = try self.allocator.alloc(u8, chunk_len);
                 errdefer self.allocator.free(backing);
-                const written = self.putUvarint(backing, overwrite.payload.len) catch unreachable;
+                const written = putUvarint(backing, overwrite.payload.len) catch unreachable;
                 @memcpy(backing[written..][0..overwrite.payload.len], overwrite.payload);
 
                 self.allocator.free(session.data.data.backing);
@@ -579,7 +809,7 @@ pub const Controller = struct {
 
         if (blob.len < replay_queue.BLOB_HEAD + 1) return error.CorruptInput;
 
-        const sd_len_res = try self.readUvarint(blob[replay_queue.BLOB_HEAD..]);
+        const sd_len_res = try readUvarint(blob[replay_queue.BLOB_HEAD..]);
         const sd_len = std.math.cast(usize, sd_len_res.value) orelse return error.CorruptInput;
         const body_off = replay_queue.BLOB_HEAD + sd_len_res.len;
         if (body_off > blob.len or blob.len - body_off != sd_len) return error.CorruptInput;
@@ -623,7 +853,7 @@ pub const Controller = struct {
         try out.appendSlice(output_allocator, &version);
 
         var count_buf: [10]u8 = undefined;
-        const count_len = try self.putUvarint(&count_buf, st.sessions.count());
+        const count_len = try putUvarint(&count_buf, st.sessions.count());
         try out.appendSlice(output_allocator, count_buf[0..count_len]);
 
         var it = st.sessions.iterator();
@@ -636,7 +866,7 @@ pub const Controller = struct {
             try out.appendSlice(output_allocator, &id_buf);
 
             var len_buf: [10]u8 = undefined;
-            const len_len = try self.putUvarint(&len_buf, sd_bytes.len);
+            const len_len = try putUvarint(&len_buf, sd_bytes.len);
             try out.appendSlice(output_allocator, len_buf[0..len_len]);
             try out.appendSlice(output_allocator, sd_bytes);
         }
@@ -647,7 +877,7 @@ pub const Controller = struct {
         std.mem.sort([]u8, handles, {}, blobLessThan);
 
         var queue_count_buf: [10]u8 = undefined;
-        const queue_count_len = try self.putUvarint(&queue_count_buf, handles.len);
+        const queue_count_len = try putUvarint(&queue_count_buf, handles.len);
         try out.appendSlice(output_allocator, queue_count_buf[0..queue_count_len]);
         for (handles) |blob| try out.appendSlice(output_allocator, blob);
     }
@@ -668,7 +898,7 @@ pub const Controller = struct {
 
         var pos: usize = 2;
 
-        const count_res = try self.readUvarint(bytes[pos..]);
+        const count_res = try readUvarint(bytes[pos..]);
         pos += count_res.len;
         const count = std.math.cast(usize, count_res.value) orelse return error.CorruptInput;
 
@@ -678,7 +908,7 @@ pub const Controller = struct {
             const id = std.mem.readInt(u128, bytes[pos..][0..16], .little);
             pos += 16;
 
-            const len_res = try self.readUvarint(bytes[pos..]);
+            const len_res = try readUvarint(bytes[pos..]);
             pos += len_res.len;
             const sd_len = std.math.cast(usize, len_res.value) orelse return error.CorruptInput;
             if (bytes.len - pos < sd_len) return error.CorruptInput;
@@ -700,7 +930,7 @@ pub const Controller = struct {
             try st.sessions.put(id, session);
         }
 
-        const queue_count_res = try self.readUvarint(bytes[pos..]);
+        const queue_count_res = try readUvarint(bytes[pos..]);
         pos += queue_count_res.len;
         const queue_count = std.math.cast(usize, queue_count_res.value) orelse return error.CorruptInput;
 
@@ -709,7 +939,7 @@ pub const Controller = struct {
         while (q < queue_count) : (q += 1) {
             if (bytes.len - pos < replay_queue.BLOB_HEAD + 1) return error.CorruptInput;
 
-            const sd_len_res = try self.readUvarint(bytes[pos + replay_queue.BLOB_HEAD ..]);
+            const sd_len_res = try readUvarint(bytes[pos + replay_queue.BLOB_HEAD ..]);
             const sd_len = std.math.cast(usize, sd_len_res.value) orelse return error.CorruptInput;
             const blob_len = replay_queue.BLOB_HEAD + sd_len_res.len + sd_len;
             if (bytes.len - pos < blob_len) return error.CorruptInput;
@@ -770,46 +1000,6 @@ pub const Controller = struct {
         return self.compensators.contains(name);
     }
 
-    /// Writes a base-128 varint into `buf` and returns its length.
-    pub fn putUvarint(self: *const Self, buf: []u8, v: u64) !usize {
-        _ = self;
-        var value = v;
-        var i: usize = 0;
-        while (value >= 0x80) {
-            if (i >= buf.len) return error.BufferTooSmall;
-            buf[i] = @as(u8, @truncate(value)) | 0x80;
-            value >>= 7;
-            i += 1;
-        }
-        if (i >= buf.len) return error.BufferTooSmall;
-        buf[i] = @truncate(value);
-        return i + 1;
-    }
-
-    /// Reads one base-128 varint and returns its value and encoded length.
-    pub fn readUvarint(self: *const Self, buf: []const u8) !struct { value: u64, len: usize } {
-        _ = self;
-        var value: u64 = 0;
-        var shift: u32 = 0;
-        var i: usize = 0;
-
-        while (i < buf.len) : (i += 1) {
-            const byte = buf[i];
-            if (shift >= 64) return error.CorruptInput;
-
-            const bits: u64 = byte & 0x7f;
-            if (shift == 63 and bits > 1) return error.CorruptInput;
-            value |= bits << @as(u6, @intCast(shift));
-
-            if (byte & 0x80 == 0) {
-                return .{ .value = value, .len = i + 1 };
-            }
-            shift += 7;
-        }
-
-        return error.CorruptInput;
-    }
-
     /// Encodes the persisted part of a session: `original_id`,
     /// `uvarint(compensator.len) || compensator`, `retry_count`, and
     /// `uvarint(data.len) || data`.
@@ -825,14 +1015,14 @@ pub const Controller = struct {
         std.mem.writeInt(u128, buf[pos..][0..16], sd.original_id, .little);
         pos += 16;
 
-        pos += self.putUvarint(buf[pos..], sd.compensator.len) catch unreachable;
+        pos += putUvarint(buf[pos..], sd.compensator.len) catch unreachable;
         @memcpy(buf[pos..][0..sd.compensator.len], sd.compensator);
         pos += sd.compensator.len;
 
         std.mem.writeInt(u32, buf[pos..][0..4], sd.retry_count, .little);
         pos += 4;
 
-        pos += self.putUvarint(buf[pos..], sd.data.len) catch unreachable;
+        pos += putUvarint(buf[pos..], sd.data.len) catch unreachable;
         @memcpy(buf[pos..][0..sd.data.len], sd.data.backing[0..sd.data.len]);
         pos += sd.data.len;
 
@@ -849,7 +1039,7 @@ pub const Controller = struct {
         const original_id = std.mem.readInt(u128, bytes[pos..][0..16], .little);
         pos += 16;
 
-        const comp_res = try self.readUvarint(bytes[pos..]);
+        const comp_res = try readUvarint(bytes[pos..]);
         pos += comp_res.len;
         const comp_len = std.math.cast(usize, comp_res.value) orelse return error.CorruptInput;
         if (bytes.len - pos < comp_len) return error.CorruptInput;
@@ -861,7 +1051,7 @@ pub const Controller = struct {
         const retry_count = std.mem.readInt(u32, bytes[pos..][0..4], .little);
         pos += 4;
 
-        const data_res = try self.readUvarint(bytes[pos..]);
+        const data_res = try readUvarint(bytes[pos..]);
         pos += data_res.len;
         const data_len = std.math.cast(usize, data_res.value) orelse return error.CorruptInput;
         if (bytes.len - pos < data_len) return error.CorruptInput;
@@ -894,7 +1084,7 @@ pub const Controller = struct {
         std.mem.writeInt(u64, blob[replay_queue.RETRY_TIME_OFF..][0..8], retry_time, .little);
         std.mem.writeInt(u128, blob[replay_queue.SESSION_ID_OFF..][0..16], session_id, .little);
 
-        const written = self.putUvarint(blob[replay_queue.BLOB_HEAD..], sd_bytes.len) catch unreachable;
+        const written = putUvarint(blob[replay_queue.BLOB_HEAD..], sd_bytes.len) catch unreachable;
         const body = replay_queue.BLOB_HEAD + written;
         @memcpy(blob[body..][0..sd_bytes.len], sd_bytes);
 
@@ -910,14 +1100,56 @@ pub const Controller = struct {
     fn blobLessThan(_: void, a: []u8, b: []u8) bool {
         return replay_queue.blobOrder({}, a, b) == .lt;
     }
-
-    fn uvarintLen(v: u64) usize {
-        var value = v;
-        var len: usize = 1;
-        while (value >= 0x80) : (value >>= 7) len += 1;
-        return len;
-    }
 };
+
+/// Writes a base-128 varint into `buf` and returns its length.
+///
+/// This is the one uvarint implementation in the tree: the index-state codecs
+/// and the WAL record framing (`src/wal.zig`) both come through it.
+pub fn putUvarint(buf: []u8, v: u64) !usize {
+    var value = v;
+    var i: usize = 0;
+    while (value >= 0x80) {
+        if (i >= buf.len) return error.BufferTooSmall;
+        buf[i] = @as(u8, @truncate(value)) | 0x80;
+        value >>= 7;
+        i += 1;
+    }
+    if (i >= buf.len) return error.BufferTooSmall;
+    buf[i] = @truncate(value);
+    return i + 1;
+}
+
+/// Reads one base-128 varint and returns its value and encoded length.
+pub fn readUvarint(buf: []const u8) !struct { value: u64, len: usize } {
+    var value: u64 = 0;
+    var shift: u32 = 0;
+    var i: usize = 0;
+
+    while (i < buf.len) : (i += 1) {
+        const byte = buf[i];
+        if (shift >= 64) return error.CorruptInput;
+
+        const bits: u64 = byte & 0x7f;
+        if (shift == 63 and bits > 1) return error.CorruptInput;
+        value |= bits << @as(u6, @intCast(shift));
+
+        if (byte & 0x80 == 0) {
+            return .{ .value = value, .len = i + 1 };
+        }
+        shift += 7;
+    }
+
+    return error.CorruptInput;
+}
+
+/// The encoded length of `v` as a base-128 varint.
+pub fn uvarintLen(v: u64) usize {
+    var value = v;
+    var len: usize = 1;
+    while (value >= 0x80) : (value >>= 7) len += 1;
+    return len;
+}
 
 /// CLOCK_REALTIME nanoseconds. The queue's due times must survive a dump and
 /// reload across a restart, so monotonic is wrong here; zigring's
@@ -1026,6 +1258,7 @@ test "role distribution" {
     cfg.queue_depth = 64;
     cfg.cross_task_slots = 16;
     cfg.sqpoll_threads = 1;
+    cfg.wal = .{ .plain = .{ .dir = "wal" } };
     cfg.ring_slots_capacity = 4096;
     cfg.logging = .{
         .method = .{ .pretty = .dark },
@@ -1112,6 +1345,7 @@ test "roles map to the shared arrays" {
     cfg.queue_depth = 64;
     cfg.cross_task_slots = 8;
     cfg.sqpoll_threads = 1;
+    cfg.wal = .{ .plain = .{ .dir = "wal" } };
     cfg.ring_slots_capacity = 4096;
     cfg.index_inbox_capacity = 8;
     cfg.logging = .{
@@ -1154,6 +1388,7 @@ test "the derived role addresses the thread's own slot" {
     cfg.queue_depth = 64;
     cfg.cross_task_slots = 8;
     cfg.sqpoll_threads = 1;
+    cfg.wal = .{ .plain = .{ .dir = "wal" } };
     cfg.ring_slots_capacity = 4096;
     cfg.index_inbox_capacity = 8;
     cfg.logging = .{
@@ -1195,6 +1430,7 @@ const TestController = struct {
             .sqpoll_threads = 1,
             .ring_slots_capacity = 4096,
             .index_inbox_capacity = 8,
+            .wal = .{ .plain = .{ .dir = "wal" } },
             .logging = .{
                 .method = .{ .json = {} },
                 .pool_capacity = 64,
@@ -1216,24 +1452,20 @@ fn freeSessionData(sd: state.SessionData) void {
 }
 
 test "uvarint round trips its edges" {
-    var ctx: TestController = .{};
-    try ctx.init();
-    defer ctx.deinit();
-
     const values = [_]u64{ 0, 1, 127, 128, 255, 1 << 14, std.math.maxInt(u64) };
     for (values) |value| {
         var buf: [10]u8 = undefined;
-        const written = try ctx.ctrl.putUvarint(&buf, value);
-        const read = try ctx.ctrl.readUvarint(buf[0..written]);
+        const written = try putUvarint(&buf, value);
+        const read = try readUvarint(buf[0..written]);
         try std.testing.expectEqual(value, read.value);
         try std.testing.expectEqual(written, read.len);
     }
 
     var empty: [0]u8 = .{};
-    try std.testing.expectError(error.BufferTooSmall, ctx.ctrl.putUvarint(&empty, 1));
-    try std.testing.expectError(error.CorruptInput, ctx.ctrl.readUvarint(&.{}));
+    try std.testing.expectError(error.BufferTooSmall, putUvarint(&empty, 1));
+    try std.testing.expectError(error.CorruptInput, readUvarint(&.{}));
     const overlong: [11]u8 = @splat(0x80);
-    try std.testing.expectError(error.CorruptInput, ctx.ctrl.readUvarint(&overlong));
+    try std.testing.expectError(error.CorruptInput, readUvarint(&overlong));
 }
 
 test "session data codec matches the field table" {
@@ -1690,4 +1922,290 @@ test "dump and load preserve the queue order" {
         @as(u128, 81),
         std.mem.readInt(u128, head[replay_queue.SESSION_ID_OFF..][0..16], .little),
     );
+}
+
+// ============================================================================
+// WAL seam tests
+// ============================================================================
+
+/// A controller over a throwaway WAL directory. Every cold WAL entry point is
+/// synchronous, so these tests drive them straight from the test thread.
+const WalFixture = struct {
+    tmp: std.testing.TmpDir,
+    dir: []u8,
+    cfg: config.Config,
+    ctrl: Controller,
+
+    fn init(self: *WalFixture) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        self.dir = try std.fmt.allocPrint(
+            std.testing.allocator,
+            ".zig-cache/tmp/{s}",
+            .{self.tmp.sub_path[0..]},
+        );
+        self.cfg = .{
+            .fronts = 1,
+            .indexes = 2,
+            .elephants = 1,
+            .queue_depth = 64,
+            .cross_task_slots = 8,
+            .sqpoll_threads = 1,
+            .ring_slots_capacity = 4096,
+            .index_inbox_capacity = 8,
+            .wal = .{ .plain = .{ .dir = self.dir, .buffers = 2, .lba = 512 } },
+            .logging = .{
+                .method = .{ .json = {} },
+                .pool_capacity = 64,
+                .pool_frame_size = 1024,
+            },
+        };
+        try self.ctrl.init(std.testing.allocator, &self.cfg);
+    }
+
+    fn deinit(self: *WalFixture) void {
+        self.ctrl.deinit();
+        std.testing.allocator.free(self.dir);
+        self.tmp.cleanup();
+    }
+
+    /// Creates the empty file of one triple, standing in for the elephant side
+    /// that owns creation.
+    fn create(self: *WalFixture, host_idx: u8, index_idx: u16, tag: u128) !posix.fd_t {
+        const path = try wal.walPath(std.testing.allocator, self.dir, host_idx, index_idx, tag);
+        defer std.testing.allocator.free(path);
+
+        const fd_raw = std.os.linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644);
+        const errno = std.os.linux.errno(fd_raw);
+        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
+        return @intCast(fd_raw);
+    }
+};
+
+test "delete removes a wal file and treats a missing one as success" {
+    var fixture: WalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    // Retention never has to probe first: nothing to remove is success.
+    try fixture.ctrl.delete(0, 1, 0xAA);
+
+    const fd = try fixture.create(0, 1, 0xAA);
+    _ = std.os.linux.close(fd);
+
+    const reader = try fixture.ctrl.walOpenRead(0, 1, 0xAA);
+    try std.testing.expectEqual(@as(u128, 0xAA), reader.tag);
+    fixture.ctrl.walCloseRead(reader);
+
+    try fixture.ctrl.delete(0, 1, 0xAA);
+    try std.testing.expectError(error.FileNotFound, fixture.ctrl.walOpenRead(0, 1, 0xAA));
+
+    // Idempotent by construction.
+    try fixture.ctrl.delete(0, 1, 0xAA);
+}
+
+test "a missing wal file is an open error, never repaired" {
+    var fixture: WalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    try std.testing.expectError(error.FileNotFound, fixture.ctrl.walOpenWrite(0, 0, 0x99));
+    try std.testing.expectError(error.FileNotFound, fixture.ctrl.walOpenRead(0, 0, 0x99));
+}
+
+test "a triple owns at most one live writer" {
+    var fixture: WalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    const fd = try fixture.create(0, 0, 0x20);
+    _ = std.os.linux.close(fd);
+
+    const writer = try fixture.ctrl.walOpenWrite(0, 0, 0x20);
+    try std.testing.expectEqual(@as(u128, 0x20), writer.tag);
+    try std.testing.expectEqual(@as(u128, 0x20), writer.head);
+
+    // Reopening a triple that already has a live writer is refused; only the
+    // swap entry may replace one, and it closes the old writer first.
+    try std.testing.expectError(error.WalOpen, fixture.ctrl.walOpenWrite(0, 0, 0x20));
+
+    // Another pair of the same index thread is free.
+    const other_fd = try fixture.create(0, 1, 0x20);
+    _ = std.os.linux.close(other_fd);
+    const other = try fixture.ctrl.walOpenWrite(0, 1, 0x20);
+    try std.testing.expect(other != writer);
+}
+
+test "the swap closes the old writer before it takes the pair" {
+    var fixture: WalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    const opened = try fixture.create(0, 0, 0x60);
+    _ = std.os.linux.close(opened);
+    const old = try fixture.ctrl.walOpenWrite(0, 0, 0x60);
+    const old_fd = old.fd;
+
+    // The snapshot procedure's last step: the elephant handed the new
+    // descriptor over, and adoption closes the old writer first — `close`
+    // drains its queue, so the pair's ring is idle and the battery handover is
+    // clean. Two writers on one pair would share that ring and collide.
+    const writer = try fixture.ctrl.walAdoptWrite(0, 0, 0x61, try fixture.create(0, 0, 0x61));
+    try std.testing.expect(writer != old);
+    try std.testing.expectEqual(@as(u128, 0x61), writer.tag);
+    try std.testing.expectEqual(@as(u128, 0x61), writer.head);
+
+    // The old writer's descriptor is gone, not leaked over the handover.
+    const closed = std.os.linux.errno(std.os.linux.fcntl(old_fd, std.os.linux.F.GETFD, 0));
+    try std.testing.expectEqual(std.os.linux.E.BADF, closed);
+
+    // And the swapped-in writer is the pair's one live writer again.
+    try std.testing.expectError(error.WalOpen, fixture.ctrl.walOpenWrite(0, 0, 0x61));
+}
+
+test "adoption publishes the pair's ordinal-0 terminator" {
+    var fixture: WalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    // A rotated file: the tag is the state its first record chains from.
+    const writer = try fixture.ctrl.walAdoptWrite(0, 1, 0x40, try fixture.create(0, 1, 0x40));
+    try std.testing.expectEqual(@as(u128, 0x40), writer.tag);
+    try std.testing.expectEqual(@as(u128, 0x40), writer.head);
+
+    const header = writer.headers[0];
+    try std.testing.expectEqual(@as(u64, 0), header.buffer_seq);
+    try std.testing.expectEqual(@as(u32, 0), header.data_len);
+    try std.testing.expectEqual(@as(u32, 0), header.flags);
+    // The empty block's fold is the CRC of nothing, not the register seed.
+    try std.testing.expectEqual(@as(u32, 0), header.crc_running);
+    try std.testing.expectEqual(@as(u128, 0x40), header.last_state);
+
+    // A brand-new data set: the empty state is the base it resumes from.
+    const fresh = try fixture.ctrl.walAdoptWrite(0, 0, 0, try fixture.create(0, 0, 0));
+    try std.testing.expectEqual(@as(u128, 0), fresh.head);
+    try std.testing.expectEqual(@as(u128, 0), fresh.headers[0].last_state);
+    try std.testing.expectEqual(@as(u32, 0), fresh.headers[0].crc_running);
+
+    // The registry append is the snapshot procedure's commit point and runs
+    // after adoption returns, so a fake append reading the pair's control line
+    // at that moment must find the terminator — "registry-visible implies the
+    // ordinal-0 terminator was persisted".
+    const at_append = writer.headers[0];
+    try std.testing.expectEqual(@as(u64, 0), at_append.buffer_seq);
+    try std.testing.expectEqual(@as(u32, 0), at_append.data_len);
+    try std.testing.expectEqual(@as(u32, 0), at_append.flags);
+    try std.testing.expectEqual(@as(u128, 0x40), at_append.last_state);
+}
+
+test "the battery is one zeroed plain area per pair" {
+    var fixture: WalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    try std.testing.expectEqual(wal.Mode.plain, fixture.ctrl.wal_mode);
+    try std.testing.expectEqual(@as(usize, 2), fixture.ctrl.wal_pairs);
+
+    // A quarter-mebibyte-free geometry: 2 × 512 bytes of data plus headers,
+    // rounded up to a page so the next pair's data array stays aligned.
+    try std.testing.expectEqual(@as(usize, 4096), fixture.ctrl.wal_area_stride);
+    try std.testing.expectEqual(@as(usize, 0), fixture.ctrl.wal_area_stride % std.heap.pageSize());
+
+    try fixture.ctrl.acquireWalBattery();
+    const bytes = fixture.ctrl.wal_battery.?;
+    try std.testing.expectEqual(fixture.ctrl.wal_pairs * fixture.ctrl.wal_area_stride, bytes.len);
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "a pmem reopen maps the device and walks the chain the crash left" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer allocator.free(dir);
+
+    // A plain sized file stands in for the NVDIMM: PMEM mode maps the device as
+    // found, so nothing about the battery needs a real stick to be exercised.
+    const device = try std.fmt.allocPrint(allocator, "{s}/pmem0", .{dir});
+    defer allocator.free(device);
+
+    var cfg: config.Config = .{
+        .fronts = 1,
+        .indexes = 2,
+        .elephants = 1,
+        .queue_depth = 64,
+        .cross_task_slots = 8,
+        .sqpoll_threads = 1,
+        .ring_slots_capacity = 4096,
+        .index_inbox_capacity = 8,
+        .wal = .{ .pmem = .{ .dir = dir, .device = device, .buffers = 4, .lba = 4096 } },
+        .logging = .{
+            .method = .{ .json = {} },
+            .pool_capacity = 64,
+            .pool_frame_size = 1024,
+        },
+    };
+
+    const pairs = @as(usize, cfg.indexes) * cfg.wal.hosts();
+    const needed = pairs * wal.areaStride(cfg.wal.buffers(), cfg.wal.lba(), std.heap.pageSize());
+
+    const device_path = try std.fmt.allocPrintSentinel(allocator, "{s}/pmem0", .{dir}, 0);
+    defer allocator.free(device_path);
+    const device_raw = std.os.linux.open(device_path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644);
+    if (std.os.linux.errno(device_raw) != .SUCCESS) return error.TestUnexpectedResult;
+    const device_fd: posix.fd_t = @intCast(device_raw);
+    defer _ = std.os.linux.close(device_fd);
+    if (std.os.linux.errno(std.os.linux.ftruncate(device_fd, @intCast(needed))) != .SUCCESS) {
+        return error.TestUnexpectedResult;
+    }
+
+    // The first run opens the WAL file the elephant created, adopts it and
+    // writes one record: nothing fills a buffer, so no flush happens and the
+    // whole chain stays in the battery.
+    const tag: u128 = 0x900;
+    const path = try wal.walPath(allocator, dir, 0, 0, tag);
+    defer allocator.free(path);
+
+    const data = try allocator.alloc(u8, 700);
+    defer allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i *% 17);
+
+    {
+        var ctrl: Controller = undefined;
+        try ctrl.init(allocator, &cfg);
+        defer ctrl.deinit();
+
+        // The elephant created the empty file and the index thread adopts it,
+        // which is what publishes the pair's ordinal-0 terminator.
+        const file_raw = std.os.linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644);
+        if (std.os.linux.errno(file_raw) != .SUCCESS) return error.TestUnexpectedResult;
+        const writer = try ctrl.walAdoptWrite(0, 0, tag, @intCast(file_raw));
+        try std.testing.expectEqual(wal.Mode.pmem, ctrl.wal_mode);
+        try std.testing.expect(writer.pmem);
+        try std.testing.expectEqual(tag, writer.head);
+
+        try writer.write(0x901, tag, data);
+        try std.testing.expectEqual(@as(u64, 0), writer.flushed_upto);
+    }
+
+    // The second run maps the same device and resumes from the chain: the live
+    // tail's byte and its state, with the flush frontier still at what the file
+    // itself holds — nothing.
+    {
+        var ctrl: Controller = undefined;
+        try ctrl.init(allocator, &cfg);
+        defer ctrl.deinit();
+
+        const writer = try ctrl.walOpenWrite(0, 0, tag);
+        try std.testing.expectEqual(@as(u64, 0), writer.current);
+        try std.testing.expectEqual(@as(u32, @intCast(wal.framedLen(data.len))), writer.cursor);
+        try std.testing.expectEqual(@as(u128, 0x901), writer.head);
+        try std.testing.expectEqual(@as(u64, 0), writer.flushed_upto);
+
+        // And the chain continues from there instead of from the tag.
+        try std.testing.expectError(error.WalGap, writer.write(0x902, tag, data));
+        try writer.write(0x902, 0x901, data);
+        try std.testing.expectEqual(@as(u128, 0x902), writer.head);
+    }
 }

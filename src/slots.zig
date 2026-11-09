@@ -17,6 +17,7 @@
 const std = @import("std");
 const zigring = @import("zigring");
 const messages = @import("messages.zig");
+const wal = @import("wal.zig");
 
 /// Maximum number of slots a single ring may register. `zigring.Slots`
 /// requires a power of two of at least 4096, so this is also the smallest
@@ -63,6 +64,17 @@ pub const TaskCtx = union(enum) {
     },
     logging: struct {
         buf: []u8,
+    },
+    /// A read of one WAL file: the process that steps it, the offset the read
+    /// was armed at and the buffer it lands in (§F).
+    file_read: struct {
+        file_process: *wal.FileReadProcess,
+        offset: u64,
+        buf: []u8,
+    },
+    /// A WAL flush: the writer whose queue its completion advances (§D2).
+    wal_flush: struct {
+        writer: *wal.WalWriteFile,
     },
 
     /// A placeholder that never reaches the ring; used by tests and by slots
@@ -163,6 +175,37 @@ test "reserved control indices never resolve to a slot" {
         try expect(reserved >= max_capacity);
         try expect(slots.get(reserved) == null);
     }
+}
+
+test "wal contexts round-trip through the slot table" {
+    var slots: RingSlots = undefined;
+    try slots.init(std.testing.allocator, 4096);
+    defer slots.deinit();
+
+    // Both variants are plain data: a pointer plus scalars, no destructor.
+    var writer: wal.WalWriteFile = undefined;
+    var process: wal.FileReadProcess = undefined;
+    var buf: [512]u8 = undefined;
+
+    const flush = try slots.add(.{ .wal_flush = .{ .writer = &writer } });
+    const read = try slots.add(.{ .file_read = .{
+        .file_process = &process,
+        .offset = 4096,
+        .buf = &buf,
+    } });
+
+    try expectEqual(@as(*wal.WalWriteFile, &writer), slots.get(flush).?.wal_flush.writer);
+
+    const ctx = slots.get(read).?.file_read;
+    try expectEqual(@as(*wal.FileReadProcess, &process), ctx.file_process);
+    try expectEqual(@as(u64, 4096), ctx.offset);
+    try expectEqual(@as(usize, 512), ctx.buf.len);
+    try expect(@intFromPtr(ctx.buf.ptr) == @intFromPtr(&buf));
+
+    slots.del(flush);
+    slots.del(read);
+    try expect(slots.get(flush) == null);
+    try expect(slots.get(read) == null);
 }
 
 test "del on a reserved or already-freed index is a no-op" {

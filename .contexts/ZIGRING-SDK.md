@@ -39,9 +39,10 @@ Re-exported from `src/root.zig` (`file:line` is where the alias lives):
 | `Ring`                                           | struct            | The io_uring itself: submit, complete, park.              |
 | `Factory`                                        | struct            | Thread-safe ring allocator over bounded kernel pollers.   |
 | `CQE`                                            | extern struct     | A completion; byte-for-byte layout of `io_uring_cqe`.     |
-| `TaskFlags`                                      | packed struct(u8) | Per-SQE flags (`Link`, `Drain`, `SkipSuccess`, ...).      |
+| `TaskFlags`                                      | packed struct(u8) | Per-SQE flags (`link`, `drain`, `skip_success`, ...).      |
 | `BufferSizeClass`                                | enum(u16)         | Size classes for registered / provided buffers.           |
 | `BatchSQ`                                        | struct            | Batched submission window (`Ring.batchedSQ`).             |
+| `StreamSQ`                                       | struct            | Reusable submission window (`Ring.streamedSQ`).           |
 | `BatchCQ`                                        | struct            | Batched completion window (`Ring.batchedCQ`).             |
 | `ReorderBuffer`                                  | struct            | Restores in-order delivery from out-of-order completions. |
 | `Slots(T)`                                       | generic           | Dense `u64` index allocator for trivially copyable `T`.   |
@@ -78,7 +79,8 @@ fn waitOne(ring: *Ring) zigring.CQE {
 }
 
 pub fn main() !void {
-    var ring = try Ring.init(64, null); // queueDepth must be a power of two
+    var ring: Ring = undefined;
+    try ring.init(64, null); // queueDepth must be a power of two
     defer ring.deinit();
 
     // Arm an operation. `taskIdx` is opaque user data echoed back in the CQE.
@@ -95,7 +97,7 @@ pub fn main() !void {
 ## `Ring`: signatures and gotchas
 
 ```zig
-pub fn init(queueDepth: u32, attachFd: ?posix.fd_t) !Self;
+pub fn init(self: *Self, queueDepth: u32, attachFd: ?posix.fd_t) !void;
 pub fn deinit(self: *Self) void;
 ```
 
@@ -119,8 +121,9 @@ unchanged until the matching completion is consumed.
 
 | Signature                                                                | Operation              | Notes                                      |
 |--------------------------------------------------------------------------|------------------------|--------------------------------------------|
-| `pushWrite(targetFd, taskIdx, dataPtr, len, flags)`                      | `WRITE`                | Short writes possible; check `res`.        |
-| `pushWritev(targetFd, taskIdx, iovecs, flags)`                           | `WRITEV`               | Gathers `iovecs`; short writes possible.   |
+| `pushWrite(targetFd, taskIdx, dataPtr, len, flags, rw_flags)`                 | `WRITE`                | Short writes possible; check `res`.        |
+| `pushWriteOffset(targetFd, taskIdx, fileOffset, dataPtr, len, flags, rw_flags)` | `WRITE` at `fileOffset` | Leaves the file position untouched.       |
+| `pushWritev(targetFd, taskIdx, iovecs, flags, rw_flags)`                   | `WRITEV`               | Gathers `iovecs`; short writes possible.   |
 | `pushRead(targetFd, taskIdx, dst, flags)`                                | `READ`                 | Short reads possible; check `res`.         |
 | `pushReadv(targetFd, taskIdx, iovecs, flags)`                            | `READV`                | Scatters into `iovecs`; short reads possible. |
 | `pushSend(targetFd, taskIdx, dataPtr, len, flags)`                       | `SEND`                 | Copied send.                               |
@@ -147,6 +150,10 @@ unchanged until the matching completion is consumed.
 
 Gotchas:
 
+- **Write family `rw_flags`**: every write push (`pushWrite`, `pushWriteOffset`,
+  `pushWritev`, and their `BatchSQ`/`StreamSQ` mirrors) takes a trailing
+  `rw_flags: u32` forwarded verbatim into `sqe.rw_flags` — pass `0` for none,
+  `linux.RWF.DSYNC`/`RWF.SYNC` for persistence semantics, etc.
 - **Multishot ops**: while `CQE.hasMore()` is set the operation stays armed and
   keeps producing CQEs; the final CQE clears it (on error or cancel). Only one
   multishot receive per fd (a second fails with `-EBUSY`).
@@ -158,7 +165,7 @@ Gotchas:
   Push both in the *same* `batchedSQ` batch, otherwise the kernel rejects the
   SQE with `-EINVAL`. See "Linked timeout" below.
 - **`pushMsgRing`/`pushMsgRingFd`** never produce a local completion
-  (`SkipSuccess`); the target ring sees a CQE whose `res` is `msgResult` and
+  (`skip_success`); the target ring sees a CQE whose `res` is `msgResult` and
   whose `taskIdx` is this call's `taskIdx`.
 - Some operations are offloaded to io-wq internally (`pushOpenDir`,
   `pushOpenFile`, `pushClose`, `pushRename` use `IOSQE_ASYNC`), which keeps
@@ -269,12 +276,42 @@ if (batch.pushSend(fd, 1, ptr, len, .{}) == null) return error.BatchFull;
 try batch.commit();
 ```
 
-- `BatchSQ` exposes only `pushWrite`, `pushSend`, `pushSendZC`, `pushAccept` and
-  `pushTimeoutForOp`; each returns `?void` (null when full, nothing reserved).
+- `BatchSQ` exposes only `pushWrite`, `pushWriteOffset`, `pushSend`,
+  `pushSendZC`, `pushAccept` and `pushTimeoutForOp`; each returns `?void` (null
+  when full, nothing reserved). The write pushes take the same trailing
+  `rw_flags` as `Ring.pushWrite`.
   It has **no** read/recv/open/close/listen/bind/connect/msgring/standalone-timeout
   helpers.
 - `BatchCQ.popCQE()` returns null once the captured tail is reached.
 - `commit` on either batch may return an error from `posix.unexpectedErrno`.
+
+### Streaming submission
+
+`StreamSQ` is the long-lived counterpart of `BatchSQ`. It is initialized **in
+place** (no return value, matching the rest of the API) and its `commit`
+re-reads the ring's live head and tail, so the same handle survives many
+submission rounds instead of being a one-shot window:
+
+```zig
+var stream: zigring.StreamSQ = undefined;
+ring.streamedSQ(&stream);
+while (stream.pushSend(fd, 1, ptr, len, .{}) == null) try stream.commit();
+try stream.commit();
+```
+
+Its push surface and `?void` return convention match `BatchSQ`; every push
+returns null while the window is full, and `commit` slides the window forward.
+The write pushes take the same trailing `rw_flags` as `Ring.pushWrite`.
+
+`hasRoom` is the side-effect-free pre-check for the window:
+
+```zig
+if (!stream.hasRoom()) try stream.commit(); // make room before pushing
+```
+
+It applies exactly the occupancy test the pushes use against the head captured
+at open (or by the last `commit`): true means the next push reserves an SQE,
+false means it would return null.
 
 ### Linked timeout (canonical batch usage)
 
@@ -289,29 +326,37 @@ _ = batch.pushTimeoutForOp(&spec, 3, .{});
 try batch.commit();
 ```
 
-`TaskFlags.expectNext()` sets `Link` on the guarded op. On expiry the accept's
+`TaskFlags.expectNext()` sets `link` on the guarded op. On expiry the accept's
 CQE reports `-ECANCELED` and the timeout CQE reports success (`res == 0`).
 
 ## `Factory`: threads and pollers
 
 ```zig
-pub fn init(allocator: std.mem.Allocator, maxPollerThreads: u32) !Self;
+pub fn init(self: *Self, allocator: std.mem.Allocator, max_poller_threads: u32) !void;
 pub fn deinit(self: *Self) void;
-pub fn acquireRing(self: *Self, queueDepth: u32, weight: u32) !Ring;
+pub fn acquireRing(self: *Self, ring: *Ring, queueDepth: u32, weight: u32) !void;
 ```
 
 Thread-safe. `acquireRing` picks the poller with the least accumulated `weight`
 and attaches a new ring to it (`IORING_SETUP_ATTACH_WQ`); it starts a new poller
-only while fewer than `maxPollerThreads` exist and the best one still has load.
+only while fewer than `max_poller_threads` exist and the best one still has load.
 `weight` is your estimate of how much work the ring will do. The factory owns no
-rings; the caller owns and deinits each returned `Ring`. The **master ring**
-(the first one in a group) must outlive every ring attached to it, since
-attached rings share its kernel poller fd.
+rings; the caller owns the storage passed to `acquireRing` and deinits each
+`Ring`. The **master ring** (the first one in a group) must outlive every ring
+attached to it, since attached rings share its kernel poller fd.
+
+Every constructor in this library is in place: `init`/`spawn`/`acquireRing` take
+a `*Self` as their first argument and write into it, so the object is never
+returned by value. Declare the object (`undefined`) and pass its address. `init`
+on the factory is in place in particular because it embeds a `pthread.Mutex` and
+pthreads forbids copying an initialized mutex:
 
 ```zig
-var mgr = try Factory.init(allocator, 2);
+var mgr: Factory = undefined;
+try mgr.init(allocator, 2);
 defer mgr.deinit();
-var ring = try mgr.acquireRing(4096, 1);
+var ring: Ring = undefined;
+try mgr.acquireRing(&ring, 4096, 1);
 defer ring.deinit();
 ```
 
@@ -319,22 +364,22 @@ defer ring.deinit();
 
 ```zig
 pub const TaskFlags = packed struct(u8) {
-    FixedFile: bool = false,
-    Drain: bool = false,
-    Link: bool = false,
-    HardLink: bool = false,
-    ForceAsync: bool = false,
-    BufferSelect: bool = false,
-    SkipSuccess: bool = false,
+    fixed_file: bool = false,
+    drain: bool = false,
+    link: bool = false,
+    hard_link: bool = false,
+    force_async: bool = false,
+    buffer_select: bool = false,
+    skip_success: bool = false,
     pub inline fn flags(self: TaskFlags) u8;
-    pub inline fn expectNext() TaskFlags; // { .Link = true }
+    pub inline fn expectNext() TaskFlags; // { .link = true }
 };
 ```
 
-Pass `.{}` for defaults. `SkipSuccess` suppresses the completion on success;
+Pass `.{}` for defaults. `skip_success` suppresses the completion on success;
 use with care for operations whose buffer/pointer you must reclaim (e.g.
 timeouts), since it also hides the signal that the pointer is no longer needed.
-`BufferSelect` is set automatically by the `*ZC` buffer-select ops.
+`buffer_select` is set automatically by the `*ZC` buffer-select ops.
 
 ## Timers
 
@@ -372,7 +417,8 @@ multishot or concurrent ops). Items are tagged with an absolute sequence index
 and released only once every earlier index has arrived.
 
 ```zig
-var rb = try ReorderBuffer.init(allocator, 128, 21); // size pow2, <= 0xFFFF
+var rb: ReorderBuffer = undefined;
+try rb.init(allocator, 128, 21); // size pow2, <= 0xFFFF
 defer rb.deinit();
 
 rb.push(seqIdx, bytes) catch |err| switch (err) {
@@ -405,13 +451,15 @@ table of `capacity` slots plus up to `childCount` lazily created child tables,
 for `capacity * (1 + childCount)` values total.
 
 ```zig
-var slots = try Slots(u64).init(allocator, 4096, 1); // cap pow2, >= 4096
+var slots: Slots(u64) = undefined;
+try slots.init(allocator, 4096, 1); // cap pow2, >= 4096
 defer slots.deinit();
 const i = try slots.add(42);
 _ = slots.get(i); // ?u64
 slots.del(i);
 
-var bufs = try BufferSlots.init(allocator, 16384, 32, 4); // 16384 * 32-byte buffers, 4 children
+var bufs: BufferSlots = undefined;
+try bufs.init(allocator, 16384, 32, 4); // 16384 * 32-byte buffers, 4 children
 defer bufs.deinit();
 const add = try bufs.addSlot(); // { .idx, .slice } aliases backing memory
 @memcpy(add.slice, payload);
@@ -419,7 +467,7 @@ const j = try bufs.alloc(); // index only
 ```
 
 - `capacity` must be a power of two and at least 4096 (`error.CapacityMustBePowerOfTwo`, `error.CapacityTooSmall`);
-  `elementSize`
+  `element_size`
   must be non-zero (`error.ElementSizeCannotBeZero`). Full tables return
   `error.NoFreeSlots`.
 - `Slots(T)`: values are stored **by copy**, no destructor ever runs, so `T`
@@ -433,10 +481,10 @@ const j = try bufs.alloc(); // index only
 ## Threading wrappers
 
 ```zig
-pub const Mutex = struct { init/deinit, lock, unlock };
-pub const CondVar = struct { init/deinit, wait(mutex), signal, broadcast };
+pub const Mutex = struct { init(*Mutex)/deinit, lock, unlock };
+pub const CondVar = struct { init(*CondVar)/deinit, wait(mutex), signal, broadcast };
 pub const Thread = struct {
-    pub fn spawn(context: anytype, comptime f: anytype) !Thread;
+    pub fn spawn(self: *Thread, context: anytype, comptime f: anytype) !void;
     pub fn join(self: Thread) void;
     pub fn setAffinity(self: Thread, coreId: u32) !void;
     pub fn setSelfAffinity(coreId: u32) !void;
@@ -446,10 +494,13 @@ pub const Thread = struct {
 - `Mutex`/`CondVar` embed the raw pthread object inline: they must live at a
   stable address, matching init/lock/wait/destroy on the same memory. Do not
   copy or move them once possibly contended.
+- `init` takes the object by pointer and initializes it in place (there is no
+  value-returning form), so the pthread object is never returned by value.
+  Initialize a local or embedded field with `obj.init()`.
 - `CondVar.wait` must be called holding the mutex and always inside a loop that
   re-checks the predicate (wakeups may be spurious). `signal`/`broadcast` do
   not hand off the mutex.
-- `Thread.spawn(context, f)`: `context` may be a pointer (the pointee must
+- `Thread.spawn(self, context, f)`: `context` may be a pointer (the pointee must
   outlive the thread until `join`) or `void`/`null`. Failure returns
   `error.ThreadSpawnFailed`. Every successful spawn needs exactly one `join`
   (not from the thread itself), else resources leak.
@@ -460,7 +511,8 @@ pub const Thread = struct {
 const worker = struct {
     fn run(state: *Shared) void { /* ... */ }
 }.run;
-const t = try Thread.spawn(&state, worker);
+var t: Thread = undefined;
+try t.spawn(&state, worker);
 t.join();
 ```
 

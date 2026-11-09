@@ -29,11 +29,3 @@ mpy6a pmem-migrate cpu --old-index-count M
 ```shell
 mpy6a pmem-migrate replication --old-factor F
 ```
-
-## Опции команды WRITE при постановке задачи записи в WAL.
-
-Закрыто: реализовано в WAL, см. `designs/wal-impl.md` §2 и `wal.zig`. Сброс
-накопленных данных в физический WAL в PMEM-режиме идёт с
-`sqe.rw_flags = std.os.linux.RWF.DSYNC`, чтобы контроллер SSD сбросил свой
-внутренний кеш тоже. Для этого в `vendor/zigring` у семейства `pushWrite*`
-появился параметр `rw_flags`.

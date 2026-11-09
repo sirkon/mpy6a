@@ -1,6 +1,7 @@
 # WAL-файлы, работа с ними, формат данных.
 
 > Реализация: план и принятые решения — в [`designs/wal-impl.md`](../designs/wal-impl.md),
+> пошаговый рабочий план с приёмками — в [`designs/wal-steps.md`](../designs/wal-steps.md),
 > код — в `src/wal.zig` (формат, батарея, писалка, читалка), `src/config.zig`
 > (блок `wal`), `src/lifetime.zig` (ресурсы и привязка к ring) и `src/index.zig`
 > (диспетчеризация завершений).

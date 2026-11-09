@@ -40,8 +40,8 @@
             .hash = "jsonescape-0.0.2-AjQcMAgsAQDGi9rSvRrEsll7y0WlaIM6XcPTNC8Cd6kv",
         },
         .zigring = .{
-            .url = "git+https://github.com/sirkon/zigring.git?ref=master#6d42fd41658c9d83735a131828e0337b805e6fa2",
-            .hash = "zigring-0.0.14-Srja394aAwCDUAgv5pm2rQipUQ7EDu0HXtHytn3dg7Db",
+            .url = "git+https://github.com/sirkon/zigring.git?ref=master#60de2ada8d1609b4fcc0d49b06b471191febd8d7",
+            .hash = "zigring-0.0.15-Srja3xkvAwCRPqiod2LMZXBPlPPuA7Upu6qe7fwH_nCh",
         },
         .blog = .{
             .url = "git+https://github.com/sirkon/blog.git?ref=master#4843799a7d3e6c1156d3a671c276aef124d823c1",

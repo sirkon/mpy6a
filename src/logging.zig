@@ -159,14 +159,14 @@ pub const IouringSink = struct {
 
         // CQ processor should get .logging task on the completion and release
         // the buffer stored in the context.
-        _ = self.stream.pushWrite(self.fd, task_idx, buf.ptr, buf.len, .{});
+        _ = self.stream.pushWrite(self.fd, task_idx, buf.ptr, buf.len, .{}, 0);
 
         return buf.len;
     }
 };
 
 test "test logging" {
-    var cfg: config.Config = .{};
+    var cfg: config.Config = .{ .wal = .{ .plain = .{ .dir = "wal" } } };
     var lt: lifetime.Controller = undefined;
     try lt.init(std.testing.allocator, &cfg);
     defer lt.deinit();
