@@ -172,20 +172,21 @@ fn runShard(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
 
     try broadcastStartWork(&ctrl, total, listen_fd);
 
-    // The process thread now waits for a stop signal.
+    // The process thread now waits for a stop cause: a stop signal or a
+    // `ProcessStopRequestIdx` from an elephant's runtime fatality.
     const signal_fd = posix.signalfd(-1, &signal_mask, linux.SFD.CLOEXEC) catch |err| {
         std.debug.print("could not create the signal descriptor: {s}\n", .{@errorName(err)});
         return err;
     };
     defer _ = linux.close(signal_fd);
 
-    var info: linux.signalfd_siginfo = undefined;
-    const n = posix.read(signal_fd, std.mem.asBytes(&info)) catch |err| {
-        std.debug.print("signal read failed: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    if (n != @sizeOf(linux.signalfd_siginfo)) return error.SignalReadShort;
-    std.debug.print("stop requested by signal {d}\n", .{info.signo});
+    switch (try awaitStopCause(&ctrl, signal_fd)) {
+        .signal => |signo| std.debug.print("stop requested by signal {d}\n", .{signo}),
+        .process_stop => |ring_idx| std.debug.print(
+            "stop requested by {s}#{d}\n",
+            .{ ctrl.roleOf(ring_idx).name(), ring_idx },
+        ),
+    }
 
     shutdown(&ctrl, total) catch |err| {
         std.debug.print("shutdown failed: {s}\n", .{@errorName(err)});
@@ -194,6 +195,60 @@ fn runShard(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
 
     // Every worker has reported done, so joining cannot block.
     ctrl.joinThreads();
+}
+
+/// Why the process thread left its park.
+const StopCause = union(enum) {
+    /// A stop signal arrived; `signo` is its number.
+    signal: u32,
+    /// An elephant requested the process stop; the value is the sender's ring
+    /// index, the operator's breadcrumb beside the elephant's own log entry.
+    process_stop: u16,
+};
+
+/// Blocks until a stop cause arrives on the signalfd or the init ring
+/// (designs/SNAPSHOTS.md §2.4). The park does not spin: `poll` sleeps on both
+/// descriptors.
+///
+/// The init ring is idle after `waitForInitialized`, so its only expected
+/// completion is `ProcessStopRequestIdx`; anything else is dropped with a log
+/// line rather than trusted.
+fn awaitStopCause(ctrl: *lifetime.Controller, signal_fd: posix.fd_t) !StopCause {
+    var fds = [2]posix.pollfd{
+        // The signal descriptor first: a stop signal outranks a stop request.
+        .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = ctrl.init_ring.ring.fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+
+    while (true) {
+        _ = try posix.poll(&fds, -1);
+
+        // A broken descriptor would make `poll` return at once forever.
+        const broken = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
+        if (fds[0].revents & broken != 0) return error.SignalFdClosed;
+        if (fds[1].revents & broken != 0) return error.InitRingClosed;
+
+        if (fds[0].revents & posix.POLL.IN != 0) {
+            var info: linux.signalfd_siginfo = undefined;
+            const n = try posix.read(signal_fd, std.mem.asBytes(&info));
+            if (n != @sizeOf(linux.signalfd_siginfo)) return error.SignalReadShort;
+            return .{ .signal = info.signo };
+        }
+
+        if (fds[1].revents & posix.POLL.IN != 0) {
+            while (ctrl.init_ring.ring.popCQE()) |cqe| {
+                const task_idx = cqe.taskIdx();
+                if (task_idx == messages.ProcessStopRequestIdx) {
+                    if (cqe.res < 0 or cqe.res > std.math.maxInt(u16)) {
+                        std.debug.print("process-stop request has an invalid sender: {d}\n", .{cqe.res});
+                        continue;
+                    }
+                    return .{ .process_stop = @intCast(cqe.res) };
+                }
+                std.debug.print("dropping unexpected init-ring completion {d}\n", .{task_idx});
+            }
+        }
+    }
 }
 
 /// Upper bound for the number of working threads in one process.
@@ -325,6 +380,119 @@ fn waitOne(ring: *zigring.Ring) zigring.CQE {
 }
 
 const state = @import("state.zig");
+
+const StopFixture = struct {
+    cfg: config.Config = undefined,
+    ctrl: lifetime.Controller = undefined,
+
+    fn init(self: *StopFixture) !void {
+        self.cfg = .{
+            .fronts = 1,
+            .indexes = 1,
+            .elephants = 1,
+            .queue_depth = 64,
+            .cross_task_slots = 8,
+            .sqpoll_threads = 1,
+            .ring_slots_capacity = 4096,
+            .index_inbox_capacity = 8,
+            .wal = .{ .plain = .{ .dir = "wal" } },
+            .logging = .{
+                .method = .{ .json = {} },
+                .pool_capacity = 64,
+                .pool_frame_size = 1024,
+            },
+        };
+        try self.ctrl.init(std.testing.allocator, &self.cfg);
+    }
+
+    fn deinit(self: *StopFixture) void {
+        self.ctrl.deinit();
+    }
+};
+
+fn emptySignalFd() !posix.fd_t {
+    const mask = posix.sigemptyset();
+    return posix.signalfd(-1, &mask, linux.SFD.CLOEXEC);
+}
+
+test "awaitStopCause reports a process-stop request with its sender" {
+    var f: StopFixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    const signal_fd = try emptySignalFd();
+    defer _ = linux.close(signal_fd);
+
+    try f.ctrl.init_ring.ring.pushMsgRingFd(
+        f.ctrl.init_ring.ring.fd,
+        messages.ProcessStopRequestIdx,
+        2,
+        .{},
+    );
+
+    const cause = try awaitStopCause(&f.ctrl, signal_fd);
+    try std.testing.expect(std.meta.activeTag(cause) == .process_stop);
+    try std.testing.expectEqual(@as(u16, 2), cause.process_stop);
+}
+
+test "awaitStopCause reports a blocked stop signal" {
+    var f: StopFixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    var mask = posix.sigemptyset();
+    posix.sigaddset(&mask, posix.SIG.TERM);
+    var previous_mask: posix.sigset_t = undefined;
+    posix.sigprocmask(posix.SIG.BLOCK, &mask, &previous_mask);
+    defer posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
+
+    // The signal stays pending in the thread mask; ignoring it keeps a failed
+    // read from terminating the whole test run when the mask is restored.
+    const ignore: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    var previous_action: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.TERM, &ignore, &previous_action);
+    defer posix.sigaction(posix.SIG.TERM, &previous_action, null);
+
+    const signal_fd = try posix.signalfd(-1, &mask, linux.SFD.CLOEXEC);
+    defer _ = linux.close(signal_fd);
+
+    try posix.raise(posix.SIG.TERM);
+
+    const cause = try awaitStopCause(&f.ctrl, signal_fd);
+    try std.testing.expect(std.meta.activeTag(cause) == .signal);
+    try std.testing.expectEqual(@as(u32, @backingInt(posix.SIG.TERM)), cause.signal);
+}
+
+test "awaitStopCause drops a foreign init-ring completion" {
+    var f: StopFixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    const signal_fd = try emptySignalFd();
+    defer _ = linux.close(signal_fd);
+
+    try f.ctrl.init_ring.ring.pushMsgRingFd(
+        f.ctrl.init_ring.ring.fd,
+        messages.InitializedIdx,
+        0,
+        .{},
+    );
+    try f.ctrl.init_ring.ring.pushMsgRingFd(
+        f.ctrl.init_ring.ring.fd,
+        messages.ProcessStopRequestIdx,
+        1,
+        .{},
+    );
+
+    const cause = try awaitStopCause(&f.ctrl, signal_fd);
+    try std.testing.expect(std.meta.activeTag(cause) == .process_stop);
+    try std.testing.expectEqual(@as(u16, 1), cause.process_stop);
+    try std.testing.expect(f.ctrl.init_ring.ring.popCQE() == null);
+}
 
 test "u128 high-bits collision" {
     var sessions: [3]state.Session = undefined;

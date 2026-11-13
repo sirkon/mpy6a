@@ -70,6 +70,26 @@ pub const Config = struct {
     /// Write-ahead log parameters. Required: no valid document leaves the WAL
     /// module unopened, so there is no default and no `null` to fall back to.
     wal: Wal,
+
+    /// Snapshot procedure parameters. Every key is omittable.
+    snapshots: Snapshots = .{},
+};
+
+/// Snapshot procedure parameters.
+///
+/// `interval_s` is the ticker period; `size_barrier` is the pair-size bar a
+/// procedure needs to start; `slots` is the process-wide bound on parallel
+/// procedures; `registry_keep` is how many registry lines per hosted pair the
+/// rewrite keeps.
+///
+/// ```text
+/// snapshots = { interval_s = 60 size_barrier = 268435456 slots = 8 registry_keep = 8 }
+/// ```
+pub const Snapshots = struct {
+    interval_s: u32 = 60,
+    size_barrier: u64 = 268435456,
+    slots: u32 = 8,
+    registry_keep: u32 = 8,
 };
 
 /// Write-ahead log parameters: the mode and the battery geometry.
@@ -337,6 +357,10 @@ pub const ParseError = error{
     InvalidHostIndex,
     InvalidWalDir,
     InvalidWalDevice,
+    InvalidSnapshotInterval,
+    InvalidSizeBarrier,
+    InvalidSnapshotSlots,
+    InvalidRegistryKeep,
     OutOfMemory,
     MissingField,
     ParseSiggy,
@@ -386,10 +410,19 @@ pub const test_cpu_count: u16 = check_cpu_cores;
 /// Rules for `wal`:
 ///
 /// - `lba` is a power of two in `[512, 1 MiB]` and divides 1 MiB exactly
-/// - `buffers >= 2` (the ring needs a current and a free buffer)
+/// - `buffers >= 4` (a current buffer, a free buffer, and room for the
+///   bring-tail's flush-then-append)
 /// - `1 <= hosts <= 256` (`host_idx: u8` bounds it)
 /// - `host_index < hosts`
 /// - `dir` is non-empty, and so is `device` in PMEM mode
+/// - `dir` carries no `"` and no `\`: the registry embeds it verbatim in JSONL
+///
+/// Rules for `snapshots`:
+///
+/// - `interval_s >= 1`
+/// - `size_barrier >= 1`
+/// - `1 <= slots <= 65535` (the mark's `new_wal_buffer_idx: u16` bounds it)
+/// - `registry_keep >= 1`
 ///
 /// Rules for `front_cores` and `index_cores`:
 ///
@@ -524,6 +557,7 @@ fn validate(config: Config, cpu_cores: u16) ParseError!void {
     }
 
     try validateWal(config.wal, config.host_index);
+    try validateSnapshots(config.snapshots);
 
     try validateCores(
         config.front_cores.cores,
@@ -554,14 +588,31 @@ fn validateWal(wal: Wal, host_index: u16) ParseError!void {
     if (lba < 512 or lba > wal_block or !std.math.isPowerOfTwo(lba) or wal_block % lba != 0) {
         return error.InvalidLba;
     }
-    if (wal.buffers() < 2) return error.InvalidBuffers;
+    if (wal.buffers() < 4) return error.InvalidBuffers;
     if (wal.hosts() < 1 or wal.hosts() > 256) return error.InvalidHosts;
     if (host_index >= wal.hosts()) return error.InvalidHostIndex;
-    if (wal.dir().len == 0) return error.InvalidWalDir;
+    // The registry embeds these paths verbatim in JSONL, so a quote or a
+    // backslash would make every line unparseable.
+    if (wal.dir().len == 0 or
+        std.mem.indexOfScalar(u8, wal.dir(), '"') != null or
+        std.mem.indexOfScalar(u8, wal.dir(), '\\') != null)
+    {
+        return error.InvalidWalDir;
+    }
     switch (wal) {
         .plain => {},
         .pmem => |pmem| if (pmem.device.len == 0) return error.InvalidWalDevice,
     }
+}
+
+/// Snapshot procedure rules: the ticker period, the size bar, the process-wide
+/// slot bound and the registry compaction knob. No allocation, so it serves
+/// both the comptime check and the runtime `fromText`.
+fn validateSnapshots(snapshots: Snapshots) ParseError!void {
+    if (snapshots.interval_s < 1) return error.InvalidSnapshotInterval;
+    if (snapshots.size_barrier < 1) return error.InvalidSizeBarrier;
+    if (snapshots.slots < 1 or snapshots.slots > 65535) return error.InvalidSnapshotSlots;
+    if (snapshots.registry_keep < 1) return error.InvalidRegistryKeep;
 }
 
 /// Checks a single core set: bounds, uniqueness and expanded length.
@@ -739,6 +790,7 @@ test "the dev document parses" {
         \\index_inbox_capacity = 1024
         \\ring_slots_capacity = 4096
         \\wal = plain { dir = "wal" buffers = 32 hosts = 1 lba = 4096 }
+        \\snapshots = { interval_s = 60 size_barrier = 268435456 slots = 8 registry_keep = 8 }
     ;
     const config = try manager.fromText(dev);
 
@@ -747,6 +799,10 @@ test "the dev document parses" {
     try testing.expectEqual(@as(u32, 32), config.wal.buffers());
     try testing.expectEqual(@as(u32, 1), config.wal.hosts());
     try testing.expectEqual(@as(u32, 4096), config.wal.lba());
+    try testing.expectEqual(@as(u32, 60), config.snapshots.interval_s);
+    try testing.expectEqual(@as(u64, 268435456), config.snapshots.size_barrier);
+    try testing.expectEqual(@as(u32, 8), config.snapshots.slots);
+    try testing.expectEqual(@as(u32, 8), config.snapshots.registry_keep);
 }
 
 test "wal geometry defaults to the documented values" {
@@ -784,11 +840,17 @@ test "wal rules are enforced" {
         manager.fromText("wal = plain { dir = \"wal\" lba = 2097152 }"),
     );
 
-    // The ring needs a current and a free buffer.
+    // A file's ring keeps at least four buffers: a current one, a free one,
+    // and room for the bring-tail's flush-then-append.
     try testing.expectError(
         error.InvalidBuffers,
         manager.fromText("wal = plain { dir = \"wal\" buffers = 1 }"),
     );
+    try testing.expectError(
+        error.InvalidBuffers,
+        manager.fromText("wal = plain { dir = \"wal\" buffers = 3 }"),
+    );
+    _ = try manager.fromText("wal = plain { dir = \"wal\" buffers = 4 }");
 
     // host_idx is a u8, so a group cannot be wider than 256.
     try testing.expectError(
@@ -810,10 +872,74 @@ test "wal rules are enforced" {
         error.InvalidWalDir,
         manager.fromText("wal = plain { dir = \"\" }"),
     );
+    // The registry embeds the directory verbatim in JSONL.
+    try testing.expectError(
+        error.InvalidWalDir,
+        manager.fromText("wal = plain { dir = \"wa\\\"l\" }"),
+    );
+    try testing.expectError(
+        error.InvalidWalDir,
+        manager.fromText("wal = plain { dir = \"wa\\\\l\" }"),
+    );
     try testing.expectError(
         error.InvalidWalDevice,
         manager.fromText("wal = pmem { dir = \"wal\" device = \"\" }"),
     );
+}
+
+test "snapshots default to the documented values and accept every key" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    const defaults = try manager.fromText(wal_doc);
+    try testing.expectEqual(@as(u32, 60), defaults.snapshots.interval_s);
+    try testing.expectEqual(@as(u64, 268435456), defaults.snapshots.size_barrier);
+    try testing.expectEqual(@as(u32, 8), defaults.snapshots.slots);
+    try testing.expectEqual(@as(u32, 8), defaults.snapshots.registry_keep);
+
+    const tuned = try manager.fromText(wal_doc ++
+        \\snapshots = { interval_s = 5 size_barrier = 4096 slots = 16 registry_keep = 2 }
+    );
+    try testing.expectEqual(@as(u32, 5), tuned.snapshots.interval_s);
+    try testing.expectEqual(@as(u64, 4096), tuned.snapshots.size_barrier);
+    try testing.expectEqual(@as(u32, 16), tuned.snapshots.slots);
+    try testing.expectEqual(@as(u32, 2), tuned.snapshots.registry_keep);
+
+    const partial = try manager.fromText(wal_doc ++
+        \\snapshots = { slots = 2 }
+    );
+    try testing.expectEqual(@as(u32, 2), partial.snapshots.slots);
+    try testing.expectEqual(@as(u32, 60), partial.snapshots.interval_s);
+}
+
+test "snapshot rules are enforced" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    try testing.expectError(
+        error.InvalidSnapshotInterval,
+        manager.fromText(wal_doc ++ "snapshots = { interval_s = 0 }"),
+    );
+    try testing.expectError(
+        error.InvalidSizeBarrier,
+        manager.fromText(wal_doc ++ "snapshots = { size_barrier = 0 }"),
+    );
+    // The mark's `new_wal_buffer_idx: u16` bounds the slot pool.
+    try testing.expectError(
+        error.InvalidSnapshotSlots,
+        manager.fromText(wal_doc ++ "snapshots = { slots = 0 }"),
+    );
+    try testing.expectError(
+        error.InvalidSnapshotSlots,
+        manager.fromText(wal_doc ++ "snapshots = { slots = 65536 }"),
+    );
+    try testing.expectError(
+        error.InvalidRegistryKeep,
+        manager.fromText(wal_doc ++ "snapshots = { registry_keep = 0 }"),
+    );
+
+    const edge = try manager.fromText(wal_doc ++ "snapshots = { slots = 65535 }");
+    try testing.expectEqual(@as(u32, 65535), edge.snapshots.slots);
 }
 
 test "the rendered default document re-parses" {
@@ -823,11 +949,19 @@ test "the rendered default document re-parses" {
     const text = try manager.default();
     defer testing.allocator.free(text);
 
+    try testing.expect(std.mem.indexOf(u8, text, "snapshots") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "interval_s = 60") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "size_barrier = 268435456") != null);
+
     const config = try manager.fromText(text);
     try testing.expect(config.wal == .plain);
     try testing.expectEqualStrings("wal", config.wal.dir());
     try testing.expectEqual(@as(u32, 32), config.wal.buffers());
     try testing.expectEqual(@as(u32, 1), config.wal.hosts());
     try testing.expectEqual(@as(u32, 4096), config.wal.lba());
+    try testing.expectEqual(@as(u32, 60), config.snapshots.interval_s);
+    try testing.expectEqual(@as(u64, 268435456), config.snapshots.size_barrier);
+    try testing.expectEqual(@as(u32, 8), config.snapshots.slots);
+    try testing.expectEqual(@as(u32, 8), config.snapshots.registry_keep);
     try testing.expectEqual(@as(u16, 60006), config.port);
 }

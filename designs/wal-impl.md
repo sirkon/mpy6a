@@ -104,6 +104,14 @@ practice**:
 | `last_state: u128` | the `state_idx` of the last record ending within this buffer's committed extent — the writer's head after restart |
 | `reserved: u32`    | padding to 64                                                                                                     |
 
+**Snapshot-procedure amendment** (`designs/SNAPSHOTS.md` §2.2 and §11): the `reserved` word and part of the tail pad
+carry the adoption mark — `snapshot_in_progress: u8` @20 and `new_wal_buffer_idx: u16` @22 in the former `_pad_align`
+word, `target_state: u128 align(8)` @40 in the former `_pad_tail` — so the line stays 64 bytes. The mark lives only on
+the per-area control line; ring lines keep those fields zero forever. The area stride grows one 64-byte control line
+after the header array, and the battery gains an `N`-ring temp section (one area per snapshot slot), geometrically
+identical to a pair area. `designs/SNAPSHOTS.md` §2.2 is the layout's authority; this paragraph only records the
+amendment here.
+
 **The uniform publish rule**, sharpened at block boundaries: every header publish — commit, terminator, post-flush
 reclamation — writes `buffer_seq` as the absolute ordinal being published. A zero-terminator publish for ordinal `o`
 writes `data_len = 0`, `filled` clear, `buffer_seq = o`, and carries the values a resume from an empty buffer `o`

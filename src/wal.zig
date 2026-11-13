@@ -52,8 +52,8 @@ pub const FLAG_FILLED: u32 = 1;
 /// One buffer's control line: exactly 64 bytes, so one publish is one cache
 /// line write and is atomic in practice.
 ///
-/// The field order is pinned by designs/wal-impl.md §2; `_pad_align` puts
-/// `last_state` on a 16-byte boundary and `_pad_tail` fills the line.
+/// The field order is pinned by designs/wal-impl.md §2; the adoption fields
+/// fill the old pads without growing the line.
 pub const BufferHeader = extern struct {
     /// Valid bytes; the full LBA when filled, `0` for the zero-terminator.
     data_len: u32,
@@ -63,18 +63,27 @@ pub const BufferHeader = extern struct {
     buffer_seq: u64,
     /// Running CRC32C of the open block at this buffer's committed extent.
     crc_running: u32,
-    _pad_align: u32,
+    /// The adoption mark: set only on a pair area's control line, zero forever
+    /// on every ring line (designs/SNAPSHOTS.md §2.2).
+    snapshot_in_progress: u8,
+    /// The temp ring a migrating pair's new writer runs on.
+    new_wal_buffer_idx: u16,
     /// The `state_idx` of the last record ending in this committed extent.
     ///
-    /// The pinned layout puts it right after `crc_running` and `_pad_align`,
-    /// at offset 24, which is only 8-byte aligned; `align(8)` is what makes
-    /// offset 24 and the 64-byte total coexist.
+    /// The pinned layout puts it right after the adoption fields, at offset 24,
+    /// which is only 8-byte aligned; `align(8)` is what makes offset 24 and the
+    /// 64-byte total coexist.
     last_state: u128 align(8),
-    _pad_tail: [24]u8,
+    /// The migrating pair's tag: the state the adoption is replayed from.
+    target_state: u128 align(8),
+    _pad_tail: [8]u8,
 
     comptime {
         std.debug.assert(@sizeOf(BufferHeader) == HEADER);
+        std.debug.assert(@offsetOf(BufferHeader, "snapshot_in_progress") == 20);
+        std.debug.assert(@offsetOf(BufferHeader, "new_wal_buffer_idx") == 22);
         std.debug.assert(@offsetOf(BufferHeader, "last_state") == 24);
+        std.debug.assert(@offsetOf(BufferHeader, "target_state") == 40);
     }
 };
 
@@ -191,8 +200,9 @@ pub fn closesBlock(offset: u64) bool {
 /// 32 lowercase hex digits — symmetric with the snapshot convention.
 ///
 /// The result is sentinel-terminated so it feeds `open`/`unlink` directly. The
-/// tag is opaque: nothing parses it back except to hand it to the index state
-/// as the file's base.
+/// tag is an ordered marker, not a content binding: `walTagFromPath` reads it
+/// back for the adoption rule and the maintenance tool, while startup takes
+/// the base state from the walk (designs/SNAPSHOTS.md §2.3).
 pub fn walPath(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -206,6 +216,44 @@ pub fn walPath(
         .{ dir, host_idx, index_idx, state },
         0,
     );
+}
+
+/// Renders `snapshot.<host_idx>.<index_idx>.<state>` inside `dir`, the leaf
+/// symmetric with `walPath` (designs/SNAPSHOTS.md §2.3).
+///
+/// Equal tags pair the two names: `snapshot.h.i.X` belongs with
+/// `wal.h.i.X`, and a same-tag retry truncates its own orphan.
+pub fn snapshotPath(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    host_idx: u8,
+    index_idx: u16,
+    state: u128,
+) ![:0]u8 {
+    return std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/snapshot.{d}.{d}.{x:0>32}",
+        .{ dir, host_idx, index_idx, state },
+        0,
+    );
+}
+
+/// The tag a WAL leaf name carries, or `null` when `path` is not one.
+///
+/// The inverse of `walPath`'s leaf template: the `wal.` stem plus 32 lowercase
+/// hex digits after the last dot. Only the adoption rule's comparison and the
+/// maintenance tool read a name back; startup takes the head from the walk,
+/// never from a name (§2.3).
+pub fn walTagFromPath(path: []const u8) ?u128 {
+    const base = std.fs.path.basename(path);
+    if (!std.mem.startsWith(u8, base, "wal.")) return null;
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
+    const suffix = base[dot + 1 ..];
+    if (suffix.len != 32) return null;
+    for (suffix) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return null;
+    }
+    return std.fmt.parseInt(u128, suffix, 16) catch null;
 }
 
 // ============================================================================
@@ -227,13 +275,36 @@ pub fn areaGranule(lba: u32, page_size: usize) usize {
     return @max(@as(usize, lba), page_size);
 }
 
-/// Size of one pair's area: the data array (`buffers × lba`) followed by the
-/// header array (`buffers × 64`), rounded **up** to the granule so every pair's
-/// data array starts LBA-aligned wherever the previous one ended.
+/// Size of one area: the data array (`buffers × lba`), the header array
+/// (`buffers × 64`), then the 64-byte control line, rounded **up** to the
+/// granule so every area's data array starts LBA-aligned wherever the previous
+/// one ended.
+///
+/// A temp ring's area is geometrically identical — control line included, so
+/// the areas stay uniform (designs/SNAPSHOTS.md §2.2).
 pub fn areaStride(buffers: u32, lba: u32, page_size: usize) usize {
-    const raw = @as(usize, buffers) * (@as(usize, lba) + HEADER);
+    const raw = @as(usize, buffers) * (@as(usize, lba) + HEADER) + HEADER;
     const granule = areaGranule(lba, page_size);
     return std.mem.alignForward(usize, raw, granule);
+}
+
+/// Offset of an area's control line: right after the header array.
+pub fn controlLineOffsetInArea(buffers: u32, lba: u32) usize {
+    return @as(usize, buffers) * (@as(usize, lba) + HEADER);
+}
+
+/// An area's control line — the adoption mark's home (designs/SNAPSHOTS.md
+/// §2.2). No writer touches it: the mark's publish is the only rewrite.
+pub fn controlLineOf(area: []u8, buffers: u32, lba: u32) *BufferHeader {
+    const offset = controlLineOffsetInArea(buffers, lba);
+    std.debug.assert(area.len >= offset + HEADER);
+    return @ptrCast(@alignCast(area[offset..][0..HEADER].ptr));
+}
+
+/// The area a procedure's temp ring `k` lives in: the temp section is appended
+/// after the pair areas.
+pub fn tempAreaIdx(k: u32, pairs: usize) usize {
+    return pairs + k;
 }
 
 /// Offset of buffer `buffer_idx`'s data inside its pair's area: the data array
@@ -257,27 +328,30 @@ pub fn bufferIdx(ordinal: u64, buffers: u32) usize {
 // The battery
 // ============================================================================
 
-/// Size of the whole battery: one area per pair.
-pub fn batterySize(pairs: usize, stride: usize) usize {
-    return pairs * stride;
+/// Size of the whole battery: one area per hosted pair plus one per snapshot
+/// slot, the temp section (designs/SNAPSHOTS.md §2.2).
+pub fn batterySize(areas: usize, stride: usize) usize {
+    return areas * stride;
 }
 
-/// Acquires the battery every pair area is carved from: `pairs × stride` bytes,
-/// aligned to the area granule.
+/// Acquires the battery every area is carved from: `areas × stride` bytes,
+/// aligned to the area granule. `areas` is the pair count plus the snapshot
+/// slot count — the temp rings are geometrically identical areas.
 ///
 /// Plain mode allocates ordinary memory and zeroes it — a DRAM battery starts
 /// with empty headers. PMEM mode maps `device` instead and never zeroes: its
-/// headers are the chain that survived the restart.
+/// headers are the chain that survived the restart, and the temp rings are
+/// used as found until the adopt mints them.
 ///
 /// The caller owns the result and releases it with `closeBattery`.
 pub fn openBattery(
     allocator: std.mem.Allocator,
     wal_cfg: config.Wal,
-    pairs: usize,
+    areas: usize,
     stride: usize,
     page_size: usize,
 ) ![]u8 {
-    const total = batterySize(pairs, stride);
+    const total = batterySize(areas, stride);
     const alignment: std.mem.Alignment = .fromByteUnits(areaGranule(wal_cfg.lba(), page_size));
 
     switch (wal_cfg) {
@@ -341,8 +415,9 @@ pub fn fileSize(fd: posix.fd_t) !u64 {
     return stx.size;
 }
 
-/// One pair's area as its two columnar arrays: the data array first, the
-/// header array after it.
+/// One area as its two columnar arrays: the data array first, the header array
+/// after it. The 64-byte control line past the headers stays outside the view
+/// — no writer touches it (designs/SNAPSHOTS.md §2.2).
 pub const Area = struct {
     data: []u8,
     headers: []BufferHeader,
@@ -358,6 +433,45 @@ pub const Area = struct {
         };
     }
 };
+
+/// Mints an area before a writer is wired to it: a temp ring is reused
+/// procedure after procedure and the walk trusts `buffer_seq`, so a previous
+/// procedure's stale lines must never be reachable (designs/SNAPSHOTS.md §2.2).
+///
+/// The header array is zeroed, one barrier lands it, the reserved control line
+/// is zeroed, and only then is the ordinal-0 terminator published the
+/// `persistHeader` way — zeroed lines classify as stale at any nonzero ordinal,
+/// so the terminator is the one line the mint leaves reachable. The data array
+/// is untouched: stale bytes are unreachable behind stale headers.
+pub fn mintArea(area: []u8, buffers: u32, lba: u32, head_state: u128, pmem: bool) void {
+    const view = Area.init(area, buffers, lba);
+    @memset(std.mem.sliceAsBytes(view.headers), 0);
+    if (pmem) {
+        barrier.clwb(view.headers.ptr, @as(usize, buffers) * HEADER);
+        barrier.sfence();
+    }
+
+    controlLineOf(area, buffers, lba).* = std.mem.zeroes(BufferHeader);
+
+    const header = &view.headers[0];
+    header.* = .{
+        .data_len = 0,
+        .flags = 0,
+        .buffer_seq = 0,
+        // The empty block's fold is the CRC of nothing, not the register seed
+        // (designs/wal-steps.md §B2's reconciliation).
+        .crc_running = 0,
+        .snapshot_in_progress = 0,
+        .new_wal_buffer_idx = 0,
+        .last_state = head_state,
+        .target_state = 0,
+        ._pad_tail = @splat(0),
+    };
+    if (pmem) {
+        barrier.clwb(header, @sizeOf(BufferHeader));
+        barrier.sfence();
+    }
+}
 
 // ============================================================================
 // The walk
@@ -885,7 +999,8 @@ pub const WalWriteFile = struct {
     ///
     /// `filled` follows `data_len`: a full buffer is filled, a zero-terminator
     /// and a live tail are not. The whole line is rewritten, so a stale lap
-    /// cannot leak a field into the new one.
+    /// cannot leak a field into the new one — adoption state included: no ring
+    /// line ever carries a migration mark.
     fn writeHeader(
         self: *Self,
         ordinal: u64,
@@ -899,8 +1014,10 @@ pub const WalWriteFile = struct {
             .flags = if (data_len == self.lba) FLAG_FILLED else 0,
             .buffer_seq = ordinal,
             .crc_running = crc_running,
-            ._pad_align = 0,
+            .snapshot_in_progress = 0,
+            .new_wal_buffer_idx = 0,
             .last_state = last_state,
+            .target_state = 0,
             ._pad_tail = @splat(0),
         };
         return header;
@@ -1113,6 +1230,13 @@ pub const WalWriteFile = struct {
         self.publishTerminator(next, last_state, crc.*);
     }
 
+    /// The tracked write extent of this writer, buffered tail included: the
+    /// byte offset the next record starts at. Thread-local, no syscalls, no
+    /// statx — the tick's size metric (designs/SNAPSHOTS.md §1.2).
+    pub fn trackedExtent(self: *const Self) u64 {
+        return self.current * self.lba + self.cursor;
+    }
+
     /// Buffers a write can still take: no bytes committed and no flush
     /// outstanding. The fundamental rule keeps at least one of them free.
     fn freeBuffers(self: *const Self) usize {
@@ -1146,7 +1270,11 @@ pub const WalWriteFile = struct {
     /// Submits the oldest filled buffer's flush when nothing is in flight, and
     /// parks `flush_pending` when the sink has no room for it: backpressure is
     /// not an error, only a delay.
-    fn driveFlush(self: *Self) void {
+    ///
+    /// Public for the window's bounded drain (§3.4): a parked submission has no
+    /// completion owed to it, so the drain retries it as its own completions
+    /// reopen the ring.
+    pub fn driveFlush(self: *Self) void {
         if (self.flush_in_flight) return;
         if (!self.isFilled(self.flushed_upto)) {
             self.flush_pending = false;
@@ -1238,6 +1366,41 @@ pub const WalWriteFile = struct {
     fn awaitFlush(self: *Self) void {
         const stream = self.stream orelse return;
         while (self.flush_in_flight) {
+            const cqe = stream.ring.popCQE() orelse {
+                stream.ring.park();
+                continue;
+            };
+            if (self.ring_sink.inflight) |flush_task| {
+                if (cqe.taskIdx() == flush_task) {
+                    self.flushResult(cqe);
+                    continue;
+                }
+            }
+            self.ring_sink.slots.del(cqe.taskIdx());
+        }
+    }
+
+    /// Drives every filled buffer's flush to its completion: the bring-tail's
+    /// flush-then-append (designs/SNAPSHOTS.md §3.6).
+    ///
+    /// Startup-safe by contract: the caller is the thread that just opened the
+    /// writer, before service, so no other writer shares its ring and a
+    /// completion that is not this writer's flush can only be an already
+    /// retired slot. Like `close`, it retries a parked submission and waits on
+    /// the ring in flight; unlike `close`, it leaves the writer usable.
+    pub fn flushAndWait(self: *Self) void {
+        while (true) {
+            if (self.flush_pending and !self.flush_in_flight) self.driveFlush();
+            if (self.flush_in_flight) {
+                self.awaitFlush();
+                continue;
+            }
+            if (!self.flush_pending) return;
+
+            // Nothing is in flight and no room could be taken: publish what
+            // is pending and re-read the window, then wait for a completion.
+            const stream = self.stream orelse return;
+            stream.commit() catch return;
             const cqe = stream.ring.popCQE() orelse {
                 stream.ring.park();
                 continue;
@@ -1936,11 +2099,134 @@ test "buffer indexes wrap at the ring depth" {
     try testing.expectEqual(@as(usize, 0), bufferIdx(std.math.maxInt(u64), 3));
 }
 
+test "the area stride hosts a control line after the header array" {
+    const page_sizes = [_]usize{ 4096, 16384 };
+    const lbas = [_]u32{ 512, 1024, 4096, 16384, 1 << 20 };
+    const buffer_counts = [_]u32{ 4, 7, 32, 64 };
+    const pairs: usize = 3;
+    const slot_count: usize = 5;
+
+    for (page_sizes) |page| {
+        for (lbas) |lba| {
+            for (buffer_counts) |buffers| {
+                const stride = areaStride(buffers, lba, page);
+                const control_at = controlLineOffsetInArea(buffers, lba);
+
+                // The control line sits right after the header array and fits
+                // inside the area, 8-byte aligned like the struct it holds.
+                try testing.expectEqual(headerOffsetInArea(buffers, lba, buffers), control_at);
+                try testing.expectEqual(@as(usize, 0), control_at % 8);
+                try testing.expect(control_at + HEADER <= stride);
+
+                // The battery is one area per pair plus one per temp ring.
+                const last_temp = tempAreaIdx(@intCast(slot_count - 1), pairs);
+                try testing.expectEqual(pairs + slot_count, last_temp + 1);
+                try testing.expectEqual((pairs + slot_count) * stride, batterySize(last_temp + 1, stride));
+            }
+        }
+    }
+}
+
+test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
+    const page = std.heap.pageSize();
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 512 } };
+    const stride = areaStride(4, 512, page);
+
+    const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
+    defer closeBattery(testing.allocator, wal_cfg, bytes, page);
+
+    const area = Area.init(bytes, 4, 512);
+
+    // A used ring from a previous procedure: stale lines and a live mark.
+    @memset(std.mem.sliceAsBytes(area.headers), 0xFF);
+    @memset(area.data, 0x5A);
+    controlLineOf(bytes, 4, 512).* = .{
+        .data_len = 0,
+        .flags = 0,
+        .buffer_seq = 9,
+        .crc_running = 3,
+        .snapshot_in_progress = 1,
+        .new_wal_buffer_idx = 2,
+        .last_state = 0xDEAD,
+        .target_state = 0xBEEF,
+        ._pad_tail = @splat(0),
+    };
+
+    mintArea(bytes, 4, 512, 0x777, false);
+
+    for (0..4) |ordinal| {
+        switch (walkVerdict(&area.headers[ordinal], ordinal, 512)) {
+            .terminator => try testing.expectEqual(@as(usize, 0), ordinal),
+            .stale => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    const header = area.headers[0];
+    try testing.expectEqual(@as(u64, 0), header.buffer_seq);
+    try testing.expectEqual(@as(u32, 0), header.data_len);
+    try testing.expectEqual(@as(u32, 0), header.flags);
+    try testing.expectEqual(@as(u32, 0), header.crc_running);
+    try testing.expectEqual(@as(u128, 0x777), header.last_state);
+    try testing.expectEqual(@as(u128, 0), header.target_state);
+    try testing.expectEqual(@as(u8, 0), controlLineOf(bytes, 4, 512).snapshot_in_progress);
+    // The data array is not zeroed: stale bytes hide behind stale headers.
+    try testing.expectEqual(@as(u8, 0x5A), area.data[0]);
+
+    // A second mint over a ring the writer used re-kills every line it left.
+    var writer = WalWriteFile.init(-1, area, wal_cfg, 0, 0, 0x777);
+    var data: [3]u8 = .{ 1, 2, 3 };
+    try writer.write(0x778, 0x777, &data);
+    try testing.expectEqual(@as(u64, 0), area.headers[0].buffer_seq);
+
+    mintArea(bytes, 4, 512, 0x800, false);
+    try testing.expectEqual(@as(u128, 0x800), area.headers[0].last_state);
+    for (0..4) |ordinal| {
+        switch (walkVerdict(&area.headers[ordinal], ordinal, 512)) {
+            .terminator => try testing.expectEqual(@as(usize, 0), ordinal),
+            .stale => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "the walk never reaches the temp section" {
+    const page = std.heap.pageSize();
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 512 } };
+    const stride = areaStride(4, 512, page);
+
+    // Two areas: a minted pair area, then a temp ring carrying a chain that
+    // would look continuable if the walk crossed the area boundary.
+    const bytes = try openBattery(testing.allocator, wal_cfg, 2, stride, page);
+    defer closeBattery(testing.allocator, wal_cfg, bytes, page);
+
+    mintArea(bytes[0..stride], 4, 512, 0x10, false);
+    const temp = Area.init(bytes[stride..][0..stride], 4, 512);
+    for (temp.headers, 0..) |*header, ordinal| {
+        header.* = .{
+            .data_len = 512,
+            .flags = FLAG_FILLED,
+            .buffer_seq = ordinal,
+            .crc_running = 0,
+            .snapshot_in_progress = 0,
+            .new_wal_buffer_idx = 0,
+            .last_state = 0,
+            .target_state = 0,
+            ._pad_tail = @splat(0),
+        };
+    }
+
+    const pair_area = Area.init(bytes[0..stride], 4, 512);
+    const reader = WalReadFile.init(-1, wal_cfg, pair_area, 0, 0, 0x10);
+    // The pair's stream ends at its own terminator; the temp ring behind it is
+    // reached only through a writer wired to it or the adoption mark.
+    try testing.expectEqual(@as(u64, 0), chainLen(&reader, 0));
+}
+
 test "a plain battery is allocated zeroed and carved by stride" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 2, .lba = 4096 } };
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 4096 } };
     const pairs: usize = 3;
-    const stride = areaStride(2, 4096, page);
+    const stride = areaStride(4, 4096, page);
 
     const bytes = try openBattery(testing.allocator, wal_cfg, pairs, stride, page);
     defer closeBattery(testing.allocator, wal_cfg, bytes, page);
@@ -1951,9 +2237,9 @@ test "a plain battery is allocated zeroed and carved by stride" {
 
     // Every pair's area yields the two columnar arrays, headers empty.
     for (0..pairs) |pair| {
-        const area = Area.init(bytes[pair * stride ..][0..stride], 2, 4096);
-        try testing.expectEqual(@as(usize, 2 * 4096), area.data.len);
-        try testing.expectEqual(@as(usize, 2), area.headers.len);
+        const area = Area.init(bytes[pair * stride ..][0..stride], 4, 4096);
+        try testing.expectEqual(@as(usize, 4 * 4096), area.data.len);
+        try testing.expectEqual(@as(usize, 4), area.headers.len);
         try testing.expectEqual(@as(usize, 0), @intFromPtr(area.data.ptr) % 4096);
         for (area.headers) |header| {
             try testing.expectEqual(@as(u32, 0), header.data_len);
@@ -1964,27 +2250,57 @@ test "a plain battery is allocated zeroed and carved by stride" {
 
 test "a header publish overwrites the whole control line" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 2, .lba = 4096 } };
-    const stride = areaStride(2, 4096, page);
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 4096 } };
+    const stride = areaStride(4, 4096, page);
 
     const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
     defer closeBattery(testing.allocator, wal_cfg, bytes, page);
 
-    var writer = WalWriteFile.init(-1, Area.init(bytes, 2, 4096), wal_cfg, 0, 0, 0x1234);
+    var writer = WalWriteFile.init(-1, Area.init(bytes, 4, 4096), wal_cfg, 0, 0, 0x1234);
+
+    // A line that still carries a previous procedure's mark: the publish
+    // rewrites it whole, so no ring line can ever expose migration state.
+    writer.headers[bufferIdx(3, 4)] = .{
+        .data_len = 17,
+        .flags = 0,
+        .buffer_seq = 3,
+        .crc_running = 9,
+        .snapshot_in_progress = 1,
+        .new_wal_buffer_idx = 5,
+        .last_state = 0xDEAD,
+        .target_state = 0xBEEF,
+        ._pad_tail = @splat(0xFF),
+    };
 
     // Ordinal 3 sits inside block 0, so the resume pair carries a running
     // value, not the register seed.
     writer.publishTerminator(3, 0x5678, 0x1234_5678);
-    const header = writer.headers[bufferIdx(3, 2)];
+    const header = writer.headers[bufferIdx(3, 4)];
     try testing.expectEqual(@as(u32, 0), header.data_len);
     try testing.expectEqual(@as(u32, 0), header.flags);
     try testing.expectEqual(@as(u64, 3), header.buffer_seq);
     try testing.expectEqual(@as(u32, 0x1234_5678), header.crc_running);
     try testing.expectEqual(@as(u128, 0x5678), header.last_state);
+    // Adoption state is zero forever on a ring line.
+    try testing.expectEqual(@as(u8, 0), header.snapshot_in_progress);
+    try testing.expectEqual(@as(u16, 0), header.new_wal_buffer_idx);
+    try testing.expectEqual(@as(u128, 0), header.target_state);
 
     // The buffer's data lives at the offset its ordinal prescribes.
-    try testing.expectEqual(@as(usize, 4096), @intFromPtr(writer.bufferData(3).ptr) - @intFromPtr(writer.data.ptr));
+    try testing.expectEqual(@as(usize, 3 * 4096), @intFromPtr(writer.bufferData(3).ptr) - @intFromPtr(writer.data.ptr));
     try testing.expectEqual(@as(usize, 0), @intFromPtr(writer.bufferData(4).ptr) - @intFromPtr(writer.data.ptr));
+}
+
+test "the control line keeps its pinned layout with the adoption fields" {
+    try testing.expectEqual(@as(usize, HEADER), @sizeOf(BufferHeader));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(BufferHeader, "data_len"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(BufferHeader, "buffer_seq"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(BufferHeader, "crc_running"));
+    try testing.expectEqual(@as(usize, 20), @offsetOf(BufferHeader, "snapshot_in_progress"));
+    try testing.expectEqual(@as(usize, 22), @offsetOf(BufferHeader, "new_wal_buffer_idx"));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(BufferHeader, "last_state"));
+    try testing.expectEqual(@as(usize, 40), @offsetOf(BufferHeader, "target_state"));
+    try testing.expectEqual(@as(usize, 8), @sizeOf(@FieldType(BufferHeader, "_pad_tail")));
 }
 
 test "a fresh writer chains from its tag" {
@@ -2012,13 +2328,13 @@ test "a fresh writer chains from its tag" {
 
 test "the admission guards refuse without moving anything" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 2, .lba = 512 } };
-    const stride = areaStride(2, 512, page);
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 512 } };
+    const stride = areaStride(4, 512, page);
 
     const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
     defer closeBattery(testing.allocator, wal_cfg, bytes, page);
 
-    var writer = WalWriteFile.init(-1, Area.init(bytes, 2, 512), wal_cfg, 0, 0, 0x10);
+    var writer = WalWriteFile.init(-1, Area.init(bytes, 4, 512), wal_cfg, 0, 0, 0x10);
     writer.publishTerminator(0, 0x10, 0);
     const before = writer.headers[0];
 
@@ -2248,6 +2564,37 @@ test "a record lands in the current buffer and commits last" {
     try testing.expectEqual(@as(usize, 1), PublishLog.len);
     try testing.expectEqual(@as(u64, 0), PublishLog.entries[0].seq);
     try testing.expectEqual(@as(u32, @intCast(framed.len)), PublishLog.entries[0].data_len);
+}
+
+test "trackedExtent counts the buffered tail" {
+    var pair = try Pair.acquire(8, 512, 0x100);
+    defer pair.release();
+
+    TestSink.reset(false);
+    TestSink.install(&pair.writer);
+
+    try testing.expectEqual(@as(u64, 0), pair.writer.trackedExtent());
+
+    const small = try payload(testing.allocator, 5, 1);
+    defer testing.allocator.free(small);
+    try pair.writer.write(0x101, 0x100, small);
+    try testing.expectEqual(
+        @as(u64, @intCast(framedLen(small.len))),
+        pair.writer.trackedExtent(),
+    );
+
+    // A record spanning into the next buffer moves the extent with it.
+    const big = try payload(testing.allocator, 700, 2);
+    defer testing.allocator.free(big);
+    try pair.writer.write(0x102, 0x101, big);
+    try testing.expectEqual(
+        pair.writer.current * pair.writer.lba + pair.writer.cursor,
+        pair.writer.trackedExtent(),
+    );
+    try testing.expectEqual(
+        @as(u64, @intCast(framedLen(small.len) + framedLen(big.len))),
+        pair.writer.trackedExtent(),
+    );
 }
 
 test "a record spanning buffers publishes the successors first" {
@@ -3795,4 +4142,60 @@ test "a plain reopen drops the record straddling the flush frontier" {
     try testing.expectEqual(@as(u32, 0), reclaimed.flags);
     try testing.expectEqual(@as(u32, 0), reclaimed.crc_running);
     try testing.expectEqual(@as(u128, 0x8000), reclaimed.last_state);
+}
+
+// ============================================================================
+// Naming
+// ============================================================================
+
+test "the snapshot leaf mirrors the wal leaf" {
+    const allocator = testing.allocator;
+
+    const snap = try snapshotPath(allocator, "/root/index.3", 2, 7, 0xDEADBEEF);
+    defer allocator.free(snap);
+    try testing.expectEqualStrings(
+        "/root/index.3/snapshot.2.7.000000000000000000000000deadbeef",
+        snap,
+    );
+
+    const wal_leaf = try walPath(allocator, "/root/index.3", 2, 7, 0xDEADBEEF);
+    defer allocator.free(wal_leaf);
+
+    // Equal tags pair the two names: their 32-hex tails are byte-equal.
+    const tag = walTagFromPath(wal_leaf) orelse return error.UnparsedTag;
+    try testing.expectEqual(@as(u128, 0xDEADBEEF), tag);
+    try testing.expectEqualStrings(wal_leaf[wal_leaf.len - 32 ..], snap[snap.len - 32 ..]);
+
+    // A same-tag retry renders byte-equal names, so it truncates its own
+    // orphan instead of leaving a second one behind.
+    const again = try snapshotPath(allocator, "/root/index.3", 2, 7, 0xDEADBEEF);
+    defer allocator.free(again);
+    try testing.expectEqualStrings(snap, again);
+}
+
+test "walTagFromPath round-trips every edge of the state range" {
+    const allocator = testing.allocator;
+    const tags = [_]u128{ 0, 1, 0x2000, 0xDEADBEEF, std.math.maxInt(u128) };
+    for (tags) |tag| {
+        const path = try walPath(allocator, "wal", 255, 65535, tag);
+        defer allocator.free(path);
+        try testing.expectEqual(tag, walTagFromPath(path) orelse return error.UnparsedTag);
+    }
+}
+
+test "walTagFromPath rejects every other spelling" {
+    const rejected = [_][]const u8{
+        // The snapshot leaf is the other stem.
+        "wal/snapshot.0.0.000000000000000000000000deadbeef",
+        // Too short and too long.
+        "wal/wal.0.0.deadbeef",
+        "wal/wal.0.0.0000000000000000000000000deadbeef",
+        // Non-hex and uppercase digits.
+        "wal/wal.0.0.000000000000000000000000deadbeeg",
+        "wal/wal.0.0.000000000000000000000000DEADBEEF",
+        // No leaf at all.
+        "wal",
+        "",
+    };
+    for (rejected) |path| try testing.expectEqual(null, walTagFromPath(path));
 }

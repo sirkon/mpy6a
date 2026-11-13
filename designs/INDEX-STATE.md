@@ -605,9 +605,11 @@ populate the compensator registry directly, since the config grammar for the `co
   `cloneIndexState` (index thread, into the elephant's arena) plus `dumpIndexState` (elephant, over the clone) are the
   dumpable public interface that design's §12 prerequisite asks for — realized as Controller methods, which supersedes
   the method-on-IndexState shape of that sketch. The clone covers the **own** data set only (just index); mirror data
-  sets are never cloned by this path. The arena discipline: the elephant constructs the dump `ArrayList(u8)` with the
-  same arena's allocator, and after the file write and fdatasync a single `arena.reset(.free_all)` — the order's last
-  act — releases the cloned copy and the snapshot buffer together; nothing on the snapshot path is freed field by field.
+  sets are never cloned by this path. *(Amended by `designs/SNAPSHOTS.md` §1.2/§11: any hosted pair, own or mirror, is a
+  snapshot subject — the clone seam deep-copies whichever pair the tick chose.)* The arena discipline: the elephant
+  constructs the dump `ArrayList(u8)` with the same arena's allocator, and after the file write and fdatasync a single
+  `arena.reset(.free_all)` — the order's last act — releases the cloned copy and the snapshot buffer together; nothing
+  on the snapshot path is freed field by field.
 - **The compensator registry** is built from the config's `compensators` block at startup; the siggy grammar for the
   block is a follow-up, and until it lands the registry is built from whatever the config offers (empty today).
 - **Siblings by slug:** `wal-design` consumes the dump/load and the state layout; `consensus-driver` consumes the op

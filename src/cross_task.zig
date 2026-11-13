@@ -51,6 +51,57 @@ pub const CrossTask = union(enum) {
     IndexDrained: struct {
         ring_idx: u16,
     },
+
+    /// Index -> elephant: create the new WAL file.
+    SnapshotCreate: struct {
+        job: usize,
+    },
+
+    /// Index -> elephant: dump the clone and commit the registry line.
+    SnapshotDump: struct {
+        job: usize,
+    },
+
+    /// Index -> elephant: unwind cleanup.
+    SnapshotCleanup: struct {
+        job: usize,
+    },
+
+    /// Index -> elephant: final close of the old fd.
+    SnapshotClose: struct {
+        job: usize,
+    },
+
+    /// Elephant -> index: the create reply, the fd alone.
+    SnapshotFd: struct {
+        fd: posix.fd_t,
+    },
+
+    /// Elephant -> index: the create failed.
+    SnapshotCreateFailed: struct {},
+
+    /// Elephant -> index: the dump and its registry line are committed.
+    SnapshotDumped: struct {},
+
+    /// Elephant -> index: the dump failed.
+    SnapshotDumpFailed: struct {},
+
+    /// Elephant -> index: the registry rewrite failed.
+    SnapshotAbandon: struct {},
+
+    /// Elephant -> index: terminal reply; the in-flight flag clears on it.
+    SnapshotDone: struct {},
+};
+
+/// State of one snapshot slot: set by the index at the tick (`in_flight`) and
+/// when an unwind dispatches cleanup (`rollback`), cleared by the releasing
+/// elephant before `release(k)`.
+pub const SnapshotSlotStatus = enum(u8) { idle, in_flight, rollback };
+
+/// The snapshot slot payload: the procedure's status and its job handle.
+pub const SnapshotSlot = struct {
+    status: SnapshotSlotStatus,
+    job: usize,
 };
 
 comptime {
@@ -65,6 +116,7 @@ comptime {
         }
     }
     std.debug.assert(@sizeOf(CrossTask) <= 16);
+    std.debug.assert(@sizeOf(SnapshotSlot) <= 16);
 }
 
 const expect = std.testing.expect;
@@ -72,7 +124,7 @@ const expectEqual = std.testing.expectEqual;
 
 test "variants round-trip through a slot" {
     var slots: @import("cross_task_slots.zig").CrossTaskSlots = undefined;
-    try slots.init(std.testing.allocator, 4);
+    try slots.init(std.testing.allocator, 6);
     defer slots.deinit();
 
     const a = try slots.acquire();
@@ -91,7 +143,66 @@ test "variants round-trip through a slot" {
     slots.at(d).* = .{ .SoftShutdown = .{ .ring_idx = 2 } };
     try expectEqual(@as(u16, 2), slots.at(d).SoftShutdown.ring_idx);
 
+    // One snapshot request and one reply per direction.
+    const e = try slots.acquire();
+    slots.at(e).* = .{ .SnapshotCreate = .{ .job = @intFromPtr(&slots) } };
+    try expectEqual(@as(usize, @intFromPtr(&slots)), slots.at(e).SnapshotCreate.job);
+
+    const f = try slots.acquire();
+    slots.at(f).* = .{ .SnapshotFd = .{ .fd = 9 } };
+    try expectEqual(@as(posix.fd_t, 9), slots.at(f).SnapshotFd.fd);
+
     try std.testing.expectError(error.CrossTaskFull, slots.acquire());
+}
+
+test "the snapshot requests carry a job and the replies carry status alone" {
+    var slots: @import("cross_task_slots.zig").CrossTaskSlots = undefined;
+    try slots.init(std.testing.allocator, 16);
+    defer slots.deinit();
+
+    const requests = [_]CrossTask{
+        .{ .SnapshotCreate = .{ .job = 1 } },
+        .{ .SnapshotDump = .{ .job = 2 } },
+        .{ .SnapshotCleanup = .{ .job = 3 } },
+        .{ .SnapshotClose = .{ .job = 4 } },
+    };
+    for (requests, 0..) |request, i| {
+        const idx = try slots.acquire();
+        slots.at(idx).* = request;
+        const job = switch (slots.at(idx).*) {
+            .SnapshotCreate => |p| p.job,
+            .SnapshotDump => |p| p.job,
+            .SnapshotCleanup => |p| p.job,
+            .SnapshotClose => |p| p.job,
+            else => unreachable,
+        };
+        try expectEqual(std.meta.activeTag(request), std.meta.activeTag(slots.at(idx).*));
+        try expectEqual(i + 1, job);
+    }
+
+    const replies = [_]CrossTask{
+        .{ .SnapshotCreateFailed = .{} },
+        .{ .SnapshotDumped = .{} },
+        .{ .SnapshotDumpFailed = .{} },
+        .{ .SnapshotAbandon = .{} },
+        .{ .SnapshotDone = .{} },
+    };
+    for (replies) |reply| {
+        const idx = try slots.acquire();
+        slots.at(idx).* = reply;
+        // Stored by copy: the slot holds the variant's tag, not a destructor.
+        try expectEqual(std.meta.activeTag(reply), std.meta.activeTag(slots.at(idx).*));
+    }
+}
+
+test "the snapshot slot payload is two words" {
+    try expect(@sizeOf(SnapshotSlot) <= 16);
+    const slot = SnapshotSlot{ .status = .in_flight, .job = 42 };
+    try expectEqual(SnapshotSlotStatus.in_flight, slot.status);
+    try expectEqual(@as(usize, 42), slot.job);
+    try expectEqual(@as(usize, 1), @backingInt(SnapshotSlotStatus.in_flight));
+    try expectEqual(@as(usize, 2), @backingInt(SnapshotSlotStatus.rollback));
+    try expectEqual(@as(usize, 0), @backingInt(SnapshotSlotStatus.idle));
 }
 
 test "control codes stay out of the wakeup space" {

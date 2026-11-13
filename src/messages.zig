@@ -23,6 +23,8 @@
 //! | `ShutdownTickIdx`       | tick number                | the shutdown timer |
 //! | `InitTimeoutIdx`        | n/a                        | the init deadline  |
 //! | `IndexDrainedIdx`       | index's `ring_idx`         | index -> its front |
+//! | `SnapshotTickIdx`       | tick number                | the snapshot ticker|
+//! | `ProcessStopRequestIdx` | n/a                        | elephant -> init   |
 //!
 //! Payloads that do not fit into the two words a `MSG_RING` CQE carries go
 //! through a `CrossTaskSlots` slot and arrive as `CrossTaskMessageIdx`; the
@@ -73,6 +75,14 @@ pub const InitTimeoutIdx: u64 = std.math.maxInt(u64) - 9;
 /// own `ring_idx`, so the front can translate it into its child slot.
 pub const IndexDrainedIdx: u64 = std.math.maxInt(u64) - 10;
 
+/// Index ring: the repeating snapshot ticker. The CQE is the `IORING_OP.TIMEOUT`
+/// itself; `res` is the tick number.
+pub const SnapshotTickIdx: u64 = std.math.maxInt(u64) - 7;
+
+/// Elephant -> init ring: a runtime fatality demands a graceful process stop.
+/// Payload-free: the request is the whole signal.
+pub const ProcessStopRequestIdx: u64 = std.math.maxInt(u64) - 11;
+
 /// Every reserved `taskIdx`, in one place so the comptime block below can
 /// prove they are pairwise distinct and out of reach of `Slots`.
 pub const reserved_task_indices = [_]u64{
@@ -85,6 +95,8 @@ pub const reserved_task_indices = [_]u64{
     ShutdownTickIdx,
     InitTimeoutIdx,
     IndexDrainedIdx,
+    SnapshotTickIdx,
+    ProcessStopRequestIdx,
 };
 
 /// Upper bound on the number of slots any `Slots` table in this process can
@@ -156,7 +168,18 @@ test "the startup and shutdown indices are reserved" {
     try std.testing.expect(isReserved(ShutdownDemandIdx));
     try std.testing.expect(isReserved(ShutdownDoneIdx));
     try std.testing.expect(isReserved(ShutdownTickIdx));
+    try std.testing.expect(isReserved(SnapshotTickIdx));
+    try std.testing.expect(isReserved(ProcessStopRequestIdx));
     // A slotter index never reaches the reserved range.
     try std.testing.expect(!isReserved(0));
     try std.testing.expect(!isReserved(max_slot_capacity - 1));
+}
+
+test "the snapshot tick and stop request stay out of the shared space" {
+    try std.testing.expect(SnapshotTickIdx != CrossTaskMessageIdx);
+    try std.testing.expect(SnapshotTickIdx != IndexWakeupTaskIdx);
+    try std.testing.expect(SnapshotTickIdx != IndexDrainedIdx);
+    try std.testing.expect(ProcessStopRequestIdx != InitializedIdx);
+    try std.testing.expect(ProcessStopRequestIdx != ShutdownTickIdx);
+    try std.testing.expect(max_slot_capacity - 1 < ProcessStopRequestIdx);
 }
