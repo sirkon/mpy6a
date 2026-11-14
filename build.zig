@@ -44,6 +44,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("siggy");
+    const zunit_mod = b.dependency("zunit", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zunit");
 
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
@@ -76,6 +80,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verztable", .module = verztable_mod },
             .{ .name = "dap", .module = dap_mod },
             .{ .name = "siggy", .module = siggy_mod },
+            .{ .name = "zunit", .module = zunit_mod },
         },
         .link_libc = true,
     });
@@ -123,6 +128,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "verztable", .module = verztable_mod },
                 .{ .name = "dap", .module = dap_mod },
                 .{ .name = "siggy", .module = siggy_mod },
+                .{ .name = "zunit", .module = zunit_mod },
             },
         }),
     });
@@ -222,6 +228,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "jsonescape", .module = jsonescape_mod },
                 .{ .name = "dap", .module = dap_mod },
                 .{ .name = "siggy", .module = siggy_mod },
+                .{ .name = "zunit", .module = zunit_mod },
             },
         });
 

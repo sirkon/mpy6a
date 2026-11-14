@@ -15,7 +15,7 @@ const messages = @import("messages.zig");
 const state = @import("state.zig");
 const wal = @import("wal.zig");
 const cross_task = @import("cross_task.zig");
-const elephant = @import("elephant.zig");
+const snapshot = @import("snapshot.zig");
 
 /// A message that a front pushes into an index inbox.
 pub const FrontMessage = union(enum) {
@@ -38,18 +38,6 @@ pub const Inbox = idxinbox.IndexInbox(FrontMessage);
 
 const LoopConfig = idxinbox.LoopConfig;
 
-/// How this thread serves its pairs' write side (designs/SNAPSHOTS.md §4).
-///
-/// The front intake is denied whenever the state is not `serving`; the control
-/// plane (reserved `taskIdx` traffic and cross-task slots) always flows.
-/// `frozen` is the window's old-side refusal (§5), `stopped` the terminal
-/// WAL fault.
-pub const WalServe = enum { serving, frozen, stopped };
-
-/// One refused index→elephant `MSG_RING`: the slot is already acquired and its
-/// payload written, so only the push itself is retried (§4).
-pub const PendingPush = struct { slot_idx: u32, target_ring_idx: u16 };
-
 /// The index service loop's frame: the state the per-CQE drain, the tick pass
 /// and the snapshot dispatch share. It lives in `run`'s frame; tests drive the
 /// same functions with synthetic states.
@@ -63,185 +51,21 @@ const Frame = struct {
     index_idx: u16,
     data_sets: []state.IndexState,
     stream_io: wal.FileReadProcess.Io,
-    draining: bool = false,
-    /// The WAL service state replacing the old `faulted` bool.
-    wal_serve: WalServe = .serving,
-    /// The one in-flight procedure; null means none (the one-operation rule).
-    procedure: ?*lifetime.SnapshotJob = null,
-    /// The pending push, when an index→elephant `MSG_RING` was refused.
-    pending_push: ?PendingPush = null,
-    /// The live window's composite, once a procedure has adopted (§3.2).
-    window: ?lifetime.CompositeWriter = null,
-    /// Tick CQEs observed; the tests' routing spy.
-    snapshot_ticks: u32 = 0,
-};
+    soft_draining: bool = false,
+    /// The snapshot procedure's policy state.
+    snap: snapshot.State = .{},
 
-/// The startup replay's sink, the e2e `Replay` shape: the record's state
-/// becomes `st.state` before the op is applied — `applyIndexOp`'s contract.
-const StartupReplay = struct {
-    ctrl: *lifetime.Controller,
-    st: *state.IndexState,
-
-    fn apply(ctx: ?*anyopaque, state_idx: u128, op: []const u8) anyerror!void {
-        const self: *StartupReplay = @ptrCast(@alignCast(ctx.?));
-        self.st.state = state_idx;
-        try self.ctrl.applyIndexOp(self.st, .{ .create = .{ .compensator = "marker", .payload = op } });
+    fn host(self: *Frame) snapshot.Host {
+        return .{
+            .ctrl = self.ctrl,
+            .ring = self.ring,
+            .log = &self.logger.logger,
+            .ring_idx = self.ring_idx,
+            .index_idx = self.index_idx,
+            .data_sets = self.data_sets,
+        };
     }
 };
-
-/// One pair's cold startup sequence (designs/SNAPSHOTS.md §7.1), in the
-/// pinned order: the adoption rule before any open, the registry's last line,
-/// the snapshot, the writer, the bring-tail, the replay.
-///
-/// The registry's `error.RegistryCorrupt` is returned unchanged so the wiring
-/// can turn it into the process fatality and tests can assert the error; a
-/// missing or otherwise unreadable registry starts the pair empty (§7.3).
-///
-/// The replay floor is the snapshot's base state — the registry line's
-/// `"state"` key — not the walked head: the walk lands on the *last* record,
-/// and the records a restart must apply are exactly the ones between the
-/// snapshot and that head. The sink moves `st.state` through each of them, so
-/// the pair ends at the walked head.
-fn recoverPair(
-    ctrl: *lifetime.Controller,
-    ring: *lifetime.RingStuff,
-    logger: *lifetime.LoggerStuff,
-    index_idx: u16,
-    host_idx: u8,
-    st: *state.IndexState,
-) !void {
-    const log = &logger.logger;
-
-    // The INITIALIZED report left through a direct submission and moved the
-    // ring's tail past the stream window captured at ring creation. Re-capture
-    // it before this pair's first flush or read goes through the window.
-    ring.ring.streamedSQ(&ring.sqstream);
-
-    const adoption = ctrl.runAdoptionRule(host_idx, index_idx) catch |err| switch (err) {
-        error.RegistryCorrupt => return error.RegistryCorrupt,
-        else => {
-            log.warn("index recovery could not read the registry; starting the pair empty", .{
-                .index_idx = index_idx,
-                .host_idx = host_idx,
-                .err = @errorName(err),
-            });
-            st.state = 0;
-            return;
-        },
-    };
-
-    const entries = ctrl.loadRegistry(index_idx) catch |err| switch (err) {
-        error.RegistryCorrupt => return error.RegistryCorrupt,
-        else => {
-            log.warn("index recovery could not read the registry; starting the pair empty", .{
-                .index_idx = index_idx,
-                .host_idx = host_idx,
-                .err = @errorName(err),
-            });
-            st.state = 0;
-            return;
-        },
-    };
-    defer if (entries) |list| ctrl.freeRegistry(list);
-
-    const entry = if (entries) |list| lifetime.Controller.lastLineFor(list, host_idx) else null;
-    const winning = entry orelse {
-        log.warn("no registry line names the pair; starting it empty", .{
-            .index_idx = index_idx,
-            .host_idx = host_idx,
-        });
-        st.state = 0;
-        return;
-    };
-
-    // The snapshot: the whole dump, loaded into a fresh state that replaces
-    // the thread's empty placeholder (§7.1 step 3).
-    const snapshot_bytes = try readWholeFile(ctrl.allocator, winning.snapshot_path);
-    defer ctrl.allocator.free(snapshot_bytes);
-    const loaded = try ctrl.loadIndexState(snapshot_bytes);
-    ctrl.deinitIndexState(st);
-    st.* = loaded;
-
-    // The writer: the walk supersedes the name tag's head (§7.1 step 4).
-    const tag = wal.walTagFromPath(winning.wal_path) orelse {
-        log.err("registry line names a WAL leaf without a state tag", .{
-            .index_idx = index_idx,
-            .host_idx = host_idx,
-            .wal_path = winning.wal_path,
-        });
-        return error.RegistryCorrupt;
-    };
-    const writer = try ctrl.walOpenWrite(host_idx, index_idx, tag);
-
-    switch (ctrl.wal_mode) {
-        .pmem => st.state = writer.head,
-        .plain => {
-            // An empty new file under a tag `X < Y` walks to `X` and is
-            // corrected by the line's state; a non-empty file walks past `Y`
-            // and the key is inert (§7.1).
-            const head = @max(writer.head, winning.state);
-            writer.head = head;
-            st.state = head;
-        },
-    }
-    writer.attachStream(&ring.sqstream, &ring.slots);
-
-    // The bring-tail after the attach, since it flushes (§7.1 step 5).
-    switch (adoption) {
-        .aborted => |abort| {
-            if (ctrl.cfg.wal.isPmem()) {
-                var tail = lifetime.Controller.TailSink.init(ctrl.allocator);
-                defer tail.deinit();
-                try ctrl.bringTail(host_idx, index_idx, abort.k, abort.tag, writer, writer.head, &tail);
-            }
-        },
-        else => {},
-    }
-    // The bring may have advanced the writer's head; the pair follows it.
-    st.state = writer.head;
-
-    // The replay: the snapshot first, then the WAL over it (§7.1 step 6).
-    const reader = try ctrl.walOpenRead(host_idx, index_idx, tag);
-    defer ctrl.walCloseRead(reader);
-
-    var replay = StartupReplay{ .ctrl = ctrl, .st = st };
-    const process = try reader.beginRead(ctrl.allocator, .{ .seek_then_read = winning.state }, .{
-        .ctx = &replay,
-        .apply = StartupReplay.apply,
-    });
-    defer reader.endRead(ctrl.allocator, process);
-    try process.drive(.{ .stream = &ring.sqstream, .slots = &ring.slots });
-}
-
-/// Reads `path` whole, raw: the snapshot's bytes before `loadIndexState`.
-fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const path_z = try allocator.dupeSentinel(u8, path, 0);
-    defer allocator.free(path_z);
-
-    const fd_raw = std.os.linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
-    const errno = std.os.linux.errno(fd_raw);
-    if (errno != .SUCCESS) return switch (errno) {
-        .NOENT => error.FileNotFound,
-        else => std.posix.unexpectedErrno(errno),
-    };
-    const fd: posix.fd_t = @intCast(fd_raw);
-    defer _ = std.os.linux.close(fd);
-
-    const size = try wal.fileSize(fd);
-    const bytes = try allocator.alloc(u8, @intCast(size));
-    errdefer allocator.free(bytes);
-
-    var got: usize = 0;
-    while (got < bytes.len) {
-        const at: posix.off_t = @intCast(got);
-        const res = std.os.linux.pread(fd, bytes[got..].ptr, bytes.len - got, at);
-        const read_errno = std.os.linux.errno(res);
-        if (read_errno != .SUCCESS) return std.posix.unexpectedErrno(read_errno);
-        if (res == 0) return error.EndOfStream;
-        got += res;
-    }
-    return bytes;
-}
 
 /// Runs the index thread to completion. `role` is the role the thread derived
 /// from its `ring_idx` before reporting `INITIALIZED`; the service loop ends
@@ -292,7 +116,7 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
     // snapshot, writer, bring-tail and replay. It runs before the service loop
     // and before any open of a pair; a failed pair is a startup fatality.
     for (0..ctrl.cfg.wal.hosts()) |host| {
-        recoverPair(ctrl, ring, logger, role.index.inbox_idx, @intCast(host), &data_sets[host]) catch |err| {
+        snapshot.recoverPair(ctrl, ring, log, role.index.inbox_idx, @intCast(host), &data_sets[host]) catch |err| {
             log.err("index recovery failed", .{
                 .ring_idx = role.index.ring_idx,
                 .host_idx = host,
@@ -306,21 +130,6 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
 
     const cfg = LoopConfig{};
 
-    // The repeating snapshot ticker (§1.1): one timeout CQE per period, armed
-    // once here. The kernel reads the spec asynchronously, so it lives in the
-    // ring's own storage; a failed arm disables snapshots on this thread only,
-    // and the thread keeps serving.
-    ring.tick_spec = .{ .sec = ctrl.cfg.snapshots.interval_s, .nsec = 0 };
-    ring.ring.pushTicker(messages.SnapshotTickIdx, &ring.tick_spec, 0, .{}) catch |err| {
-        log.err("snapshot ticker arm failed; snapshots disabled on this thread", .{
-            .ring_idx = role.index.ring_idx,
-            .err = @errorName(err),
-        });
-    };
-    // The arm is a direct submission like the INITIALIZED report: re-capture
-    // the stream window before the loop's first flush uses it.
-    ring.ring.streamedSQ(&ring.sqstream);
-
     var frame = Frame{
         .ctrl = ctrl,
         .ring = ring,
@@ -331,16 +140,17 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
         .data_sets = data_sets,
         .stream_io = stream_io,
     };
+    snapshot.armTicker(frame.host());
 
     while (true) {
         // One pending push per pass: a procedure's pushes are sequential, so a
         // single op suffices (§4).
-        retryPendingPush(&frame);
+        frame.snap.retryPending(frame.host());
 
         const batch = inbox.batch(cfg.batch_k, cfg.batch_k) orelse {
             // A pending push must not park: the loop keeps passing until the
             // `MSG_RING` lands.
-            if (frame.pending_push != null) {
+            if (frame.snap.pending_push != null) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -355,16 +165,24 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
             std.process.exit(1);
         };
 
+        // A reply armed a continuation: finish it now that the batch cursor is
+        // published, and before any front task. The pump's raw `popCQE` must
+        // never run inside the batch window (§5, D1).
+        if (frame.snap.drainPending()) {
+            drainPump(&frame);
+            continue;
+        }
+
         while (batch.front.next()) |task| switch (task) {
             .create => |create| {
                 // A stopped thread takes no front work at all: the session is
                 // refused by closing its descriptor at once, the skeleton's own
                 // shape. The refusal's wire form is the consensus design's.
-                if (frame.wal_serve != .serving) {
+                if (frame.snap.serve != .serving) {
                     log.warn("index refused a session: the WAL stopped this thread", .{
                         .ring_idx = role.index.ring_idx,
                         .fd = create.fd,
-                        .wal_serve = @tagName(frame.wal_serve),
+                        .wal_serve = @tagName(frame.snap.serve),
                     });
                     _ = std.os.linux.close(create.fd);
                     continue;
@@ -378,11 +196,11 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
                 // Refused before a WAL is ever reached (§3.5). A frozen window
                 // denies the front exactly like a stop; only the front intake
                 // is denied.
-                if (frame.wal_serve != .serving) continue;
+                if (frame.snap.serve != .serving) continue;
             },
             .shutdown_soft => {
-                if (!frame.draining) {
-                    frame.draining = true;
+                if (!frame.soft_draining) {
+                    frame.soft_draining = true;
                     log.info("index soft shutdown", .{ .ring_idx = role.index.ring_idx });
                 }
                 if (own_state.sessions.count() == 0) {
@@ -405,7 +223,7 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
         // still open; once it closes, the index is done. The replay queue does
         // not gate shutdown: its contents are dump-persistent state that
         // survives the restart.
-        if (frame.draining and own_state.sessions.count() == 0) {
+        if (frame.soft_draining and own_state.sessions.count() == 0) {
             reportDrained(ring, front_ring, role.index.ring_idx);
             return;
         }
@@ -433,11 +251,11 @@ fn stepCQE(frame: *Frame, cqe: zigring.CQE) void {
             // elephant's thread, so it moved the SQ tail past the stream
             // window's cursors. Re-capture them before the pass (and any WAL
             // flush it triggers) submits through the same window (§4).
-            resyncStream(frame);
-            dispatchSnapshotReply(frame, task);
+            frame.snap.resync(frame.host());
+            frame.snap.onReply(frame.host(), task);
         },
         // The repeating snapshot ticker's own timeout completion (§1.1).
-        messages.SnapshotTickIdx => tickPass(frame),
+        messages.SnapshotTickIdx => frame.snap.onTick(frame.host()),
         else => {
             // A tracked operation's completion: the slot says what it was and
             // what steps it (§6). Reserved control indices and already-retired
@@ -452,8 +270,8 @@ fn stepCQE(frame: *Frame, cqe: zigring.CQE) void {
                     // The window's completions follow both sides' frontiers:
                     // an event is durable only once the last of the two has
                     // covered it (§5).
-                    if (frame.window) |*window| window.noteFlush(flush.writer);
-                    onWriterFault(flush.writer, frame);
+                    frame.snap.onFlush(frame.host(), flush.writer);
+                    frame.snap.onWriterFault(frame.host(), flush.writer);
                 },
                 // One block of a read walk: its completion delivers the records
                 // and arms the next block.
@@ -467,7 +285,7 @@ fn stepCQE(frame: *Frame, cqe: zigring.CQE) void {
                         // A negative `res` on a WAL read is the stop's second
                         // trigger; backpressure or a refused op only stops this
                         // walk.
-                        if (err == error.IO) frame.wal_serve = .stopped;
+                        if (err == error.IO) frame.snap.onReadFault();
                     };
                 },
                 else => {},
@@ -476,263 +294,15 @@ fn stepCQE(frame: *Frame, cqe: zigring.CQE) void {
     }
 }
 
-/// The `wal_flush` arm's fault consequence (§5).
-///
-/// A fault on the window's old side freezes the front: the migration can still
-/// finish on the new file, and the swap revives the thread. Everything else is
-/// the landed rule unchanged — a new-side fault, or any fault outside a window,
-/// stops the thread, and a relapse after revival finds `window == null` and
-/// stops terminally.
-fn onWriterFault(writer: *wal.WalWriteFile, frame: *Frame) void {
-    if (!writer.faulted) return;
-
-    if (frame.window) |*window| {
-        if (writer == window.old and frame.wal_serve != .stopped) {
-            frame.wal_serve = .frozen;
-            frame.logger.logger.warn("the window's old WAL faulted; the front is frozen", .{
-                .ring_idx = frame.ring_idx,
-                .host_idx = writer.host_idx,
-                .index_idx = writer.index_idx,
-            });
-            return;
+/// Steps the armed continuation outside the batch window (§5, D1). A reply
+/// only records the continuation; the pump is the sole reader that finishes
+/// it, and it never runs while `inbox.batch` holds an uncommitted cursor.
+fn drainPump(frame: *Frame) void {
+    while (frame.snap.drainPending()) {
+        if (frame.snap.drainQuiet()) {
+            frame.snap.onDrained(frame.host());
+            continue;
         }
-    }
-
-    frame.wal_serve = .stopped;
-    frame.logger.logger.err("wal flush failed; the thread stops taking front work", .{
-        .ring_idx = frame.ring_idx,
-        .host_idx = writer.host_idx,
-        .index_idx = writer.index_idx,
-    });
-}
-
-/// Dispatches one elephant→index reply by variant.
-///
-/// `SnapshotDone` is the terminal reply: the in-flight flag clears here, which
-/// enforces the one-operation rule to the true end of the procedure (§4). The
-/// create reply opens the window (G3), the dump's completion closes it (G4),
-/// and the two failure replies are §8's rungs 2, 5 and 6.
-fn dispatchSnapshotReply(frame: *Frame, task: cross_task.CrossTask) void {
-    const log = &frame.logger.logger;
-    switch (task) {
-        .SnapshotFd => |reply| snapshotFdPass(frame, reply.fd),
-        .SnapshotDumped => snapshotDumpedPass(frame),
-        .SnapshotCreateFailed => {
-            // Rung 2: the handler pass never ran, so the unwind is markless.
-            const job = frame.procedure orelse {
-                log.warn("snapshot create failure without a procedure", .{ .ring_idx = frame.ring_idx });
-                return;
-            };
-            unwindA(frame, job, .{ .mark_published = false, .writer_built = null });
-        },
-        .SnapshotDumpFailed, .SnapshotAbandon => {
-            // Rungs 5 and 6: the dump or its registry line failed after the
-            // arena reset; the window reverts to the old writer.
-            const job = frame.procedure orelse {
-                log.warn("snapshot failure reply without a procedure", .{ .ring_idx = frame.ring_idx });
-                return;
-            };
-            unwindB(frame, job);
-        },
-        .SnapshotDone => {
-            frame.procedure = null;
-        },
-        else => log.warn("index read a cross-task message it does not handle", .{
-            .ring_idx = frame.ring_idx,
-        }),
-    }
-}
-
-/// The `SnapshotFd` reply's pass: mark, clone, adopt, composite, re-dispatch
-/// (§3.2). One synchronous pass — no front message is processed inside it, so
-/// nothing slips between its steps.
-fn snapshotFdPass(frame: *Frame, fd: posix.fd_t) void {
-    const log = &frame.logger.logger;
-    const job = frame.procedure orelse {
-        // Defensive: the one-procedure invariant makes this unreachable, and the
-        // descriptor would leak if it were dropped.
-        log.warn("snapshot fd reply without a procedure; closing the descriptor", .{
-            .ring_idx = frame.ring_idx,
-            .fd = fd,
-        });
-        _ = std.os.linux.close(fd);
-        return;
-    };
-
-    // The index owns the descriptor from here on; the job is its one owner.
-    job.fd = fd;
-    const host = job.host_idx;
-    const index = job.index_idx;
-
-    // Step 1: the mark. Publishing after the create reply and before the
-    // composite serves widens the guarded window — every crash from here to the
-    // swap lands in one of the two restart branches (§3.5).
-    frame.ctrl.publishAdoptionMark(host, index, job.k, job.tag) catch |err| {
-        log.err("snapshot mark publish failed; unwinding", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = host,
-            .index_idx = index,
-            .err = @errorName(err),
-        });
-        unwindA(frame, job, .{ .mark_published = false, .writer_built = null });
-        return;
-    };
-
-    // Step 2: the clone. Any hosted pair is a snapshot subject, own or mirror
-    // (§1.2). Its state is `Y`, at or ahead of the tag `X`: the pair kept
-    // serving, so there is no pin. Rung 3 unwinds quietly.
-    job.clone = frame.ctrl.cloneIndexState(&frame.data_sets[host], job.arena.allocator()) catch |err| {
-        log.warn("snapshot clone allocation failed; unwinding", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = host,
-            .index_idx = index,
-            .err = @errorName(err),
-        });
-        unwindA(frame, job, .{ .mark_published = true, .writer_built = null });
-        return;
-    };
-
-    // Step 3: the adopt. Temp ring `k` is minted, the writer opens over the
-    // transferred fd, publishes the ordinal-0 terminator carrying `Y` and
-    // chains from it. Rung 4 is memory-only.
-    const new_writer = frame.ctrl.walAdoptWrite(host, index, job.k, job.clone.state, job.fd) catch |err| {
-        // The adopt owns the descriptor from the moment it is called and
-        // closes it on every failure path, so the job must not hand a stale
-        // number to the cleanup elephant.
-        job.fd = -1;
-        log.warn("snapshot adopt failed; unwinding", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = host,
-            .index_idx = index,
-            .err = @errorName(err),
-        });
-        unwindA(frame, job, .{ .mark_published = true, .writer_built = null });
-        return;
-    };
-    // The writer owns the descriptor now.
-    job.fd = -1;
-    new_writer.attachStream(&frame.ring.sqstream, &frame.ring.slots);
-
-    // Step 4: the composite. The pair's write interface is new-first, then
-    // old, for the window's duration; the old writer stays registered.
-    const pair = wal.areaIndex(host, index, frame.ctrl.cfg.wal.hosts());
-    const old_writer = frame.ctrl.wal_writers[pair] orelse {
-        // No pair writer to fall back to: a bug, and the only rung the design
-        // does not name. Tear the new writer down and unwind quietly.
-        log.err("snapshot adopt found no pair writer; unwinding", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = host,
-            .index_idx = index,
-        });
-        new_writer.close() catch {};
-        frame.ctrl.allocator.destroy(new_writer);
-        unwindA(frame, job, .{ .mark_published = true, .writer_built = null });
-        return;
-    };
-    frame.window = .{
-        .new = new_writer,
-        .old = old_writer,
-        .allocator = frame.ctrl.allocator,
-    };
-
-    // Step 5: cursor pick 2. A refused push parks in the pending op and the
-    // pass ends — the window keeps serving.
-    job.phase = .dump_sent;
-    dispatchSnapshot(.{ .SnapshotDump = .{ .job = @intFromPtr(job) } }, frame.ctrl.nextElephantRing(), frame);
-}
-
-/// The `SnapshotDumped` reply's pass: the swap and the final close (§3.4).
-///
-/// Memory only and unable to fail in its defined steps: the drain, the copy,
-/// the clear, the revival and the retirement. Its crash cases are §3.5's table,
-/// which the mark and the copy's idempotence already cover.
-fn snapshotDumpedPass(frame: *Frame) void {
-    const log = &frame.logger.logger;
-    const job = frame.procedure orelse {
-        log.warn("snapshot completion without a procedure", .{ .ring_idx = frame.ring_idx });
-        return;
-    };
-
-    // Step 1: the bounded drain. Both writers' in-flight flushes land before
-    // the copy — a late completion would publish a terminator into the pair
-    // area after the copy clobbered it — and a new-side DMA finishes before
-    // temp ring `k` can be reused.
-    drainUntilQuiet(frame);
-
-    const pair = wal.areaIndex(job.host_idx, job.index_idx, frame.ctrl.cfg.wal.hosts());
-    const window = if (frame.window) |*w| w else {
-        log.err("snapshot completion found no window; cleaning up", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = job.host_idx,
-            .index_idx = job.index_idx,
-        });
-        frame.ctrl.snapshot_slots.at(job.k).status = .rollback;
-        job.phase = .cleanup_sent;
-        dispatchSnapshot(.{ .SnapshotCleanup = .{ .job = @intFromPtr(job) } }, frame.ctrl.nextElephantRing(), frame);
-        return;
-    };
-
-    // Step 2: the copy of temp ring `k`'s data and header arrays, then the
-    // rewire. The areas are geometrically identical, so the surviving writer
-    // only changes addresses; its ordinals and cursor continue unchanged.
-    const area = frame.ctrl.copyTempIntoPair(pair, job.k) catch |err| {
-        log.err("snapshot swap copy failed; unwinding", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = job.host_idx,
-            .index_idx = job.index_idx,
-            .err = @errorName(err),
-        });
-        unwindB(frame, job);
-        return;
-    };
-    window.new.data = area.data;
-    window.new.headers = area.headers;
-
-    // Step 3: the clear. The mark is over; the pair area is the new chain.
-    frame.ctrl.clearAdoptionMark(job.host_idx, job.index_idx) catch |err| {
-        log.err("snapshot mark clear failed", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = job.host_idx,
-            .index_idx = job.index_idx,
-            .err = @errorName(err),
-        });
-    };
-
-    // Step 4: revival, if the old side had frozen the front (§5). It is
-    // computed from live writers only, and the old one is about to retire.
-    reviveIfHealthy(frame);
-
-    // Step 5: the retirement and the final close. The old writer is quiet; its
-    // descriptor moves to the terminal elephant and the object dies without a
-    // close. The index stops dereferencing the job here; the flag clears on
-    // `SnapshotDone`.
-    const new_writer = window.new;
-    const old_writer = window.old;
-    job.old_fd = old_writer.fd;
-    frame.ctrl.allocator.destroy(old_writer);
-    frame.ctrl.wal_writers[pair] = new_writer;
-    window.pending.deinit(frame.ctrl.allocator);
-    frame.window = null;
-
-    job.phase = .close_sent;
-    dispatchSnapshot(.{ .SnapshotClose = .{ .job = @intFromPtr(job) } }, frame.ctrl.nextElephantRing(), frame);
-}
-
-/// The bounded drain of §3.4: step the thread's ordinary completions until both
-/// window writers are quiet.
-///
-/// Not `close`'s `awaitFlush`: that retires and drops foreign completions,
-/// which mid-service would strand another pair's writer with its flush flag
-/// stuck. At most one flush is ever in flight per writer, and a parked
-/// submission is retried as the drain's own completions reopen the window, so
-/// the loop terminates.
-fn drainUntilQuiet(frame: *Frame) void {
-    while (true) {
-        const window = if (frame.window) |*w| w else return;
-        retryParkedFlush(window.new);
-        retryParkedFlush(window.old);
-        if (window.quiet()) return;
-
         if (frame.ring.ring.popCQE()) |cqe| {
             stepCQE(frame, cqe);
             continue;
@@ -741,142 +311,19 @@ fn drainUntilQuiet(frame: *Frame) void {
     }
 }
 
-/// Retries a submission backpressure parked: its own writer cannot re-drive it
-/// without a write, and no completion is owed for it.
-fn retryParkedFlush(writer: *wal.WalWriteFile) void {
-    if (writer.flush_pending and !writer.flush_in_flight) writer.driveFlush();
-}
-
-/// Unwind A (§8): the pre-composite rungs — create failure, clone allocation,
-/// adopt allocation.
-///
-/// Memory only: a half-built writer object is destroyed (the adopt's failure
-/// path has already closed the descriptor it was handed) and the mark, if it
-/// was published, is cleared. The cleanup elephant owns the files, the
-/// descriptor and the slot from the dispatch on.
-fn unwindA(
-    frame: *Frame,
-    job: *lifetime.SnapshotJob,
-    opts: struct { mark_published: bool, writer_built: ?*wal.WalWriteFile },
-) void {
-    if (opts.writer_built) |writer| frame.ctrl.allocator.destroy(writer);
-
-    if (opts.mark_published) {
-        frame.ctrl.clearAdoptionMark(job.host_idx, job.index_idx) catch |err| {
-            frame.logger.logger.err("snapshot mark clear failed", .{
-                .ring_idx = frame.ring_idx,
-                .host_idx = job.host_idx,
-                .index_idx = job.index_idx,
-                .err = @errorName(err),
-            });
-        };
-    }
-
-    frame.ctrl.snapshot_slots.at(job.k).status = .rollback;
-    job.phase = .cleanup_sent;
-    dispatchSnapshot(.{ .SnapshotCleanup = .{ .job = @intFromPtr(job) } }, frame.ctrl.nextElephantRing(), frame);
-}
-
-/// Unwind B (§8): the composite is installed — the dump failed or its registry
-/// line did.
-///
-/// Revert to the old single writer, drain both, close the new writer, clear the
-/// mark, dispatch cleanup. A frozen thread stays frozen: the failed procedure
-/// brings no swap, so no revival is coming (§5, §8 rung 10).
-fn unwindB(frame: *Frame, job: *lifetime.SnapshotJob) void {
-    const log = &frame.logger.logger;
-    var window = frame.window orelse {
-        // No window to revert: nothing was installed, but the procedure's files
-        // and slot still need their terminal elephant.
-        frame.ctrl.snapshot_slots.at(job.k).status = .rollback;
-        job.phase = .cleanup_sent;
-        dispatchSnapshot(.{ .SnapshotCleanup = .{ .job = @intFromPtr(job) } }, frame.ctrl.nextElephantRing(), frame);
-        return;
-    };
-
-    // The drain runs before the window is torn down: it is what makes the close
-    // safe, both writers quiet (§3.4).
-    drainUntilQuiet(frame);
-    frame.window = null;
-
-    // The close is safe precisely because the drain made the writer quiet. The
-    // descriptor comes back through the sentinel: after the close the writer
-    // holds `-1`, so the job's field does too.
-    window.new.close() catch |err| {
-        log.warn("snapshot unwind close failed", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = job.host_idx,
-            .index_idx = job.index_idx,
-            .err = @errorName(err),
-        });
-    };
-    job.fd = window.new.fd;
-    window.pending.deinit(frame.ctrl.allocator);
-    frame.ctrl.allocator.destroy(window.new);
-
-    frame.ctrl.clearAdoptionMark(job.host_idx, job.index_idx) catch |err| {
-        log.err("snapshot mark clear failed", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = job.host_idx,
-            .index_idx = job.index_idx,
-            .err = @errorName(err),
-        });
-    };
-
-    frame.ctrl.snapshot_slots.at(job.k).status = .rollback;
-    job.phase = .cleanup_sent;
-    dispatchSnapshot(.{ .SnapshotCleanup = .{ .job = @intFromPtr(job) } }, frame.ctrl.nextElephantRing(), frame);
-}
-
-/// The swap's revival rule (§5): the front reopens iff no **live** writer of
-/// the thread's pairs is faulted.
-///
-/// The window's old writer is retiring, so it is not part of the live set: the
-/// frozen window's events were written new-first and the registry line is
-/// committed, which is exactly what makes serving safe again. A relapse after
-/// this finds no window and stops terminally.
-fn reviveIfHealthy(frame: *Frame) void {
-    if (frame.wal_serve != .frozen) return;
-
-    const retiring = if (frame.window) |*window| window.old else null;
-    for (frame.ctrl.wal_writers) |maybe_writer| {
-        const writer = maybe_writer orelse continue;
-        if (writer == retiring) continue;
-        if (writer.faulted) return;
-    }
-    frame.wal_serve = .serving;
-}
-
-/// Classifies a composite write's refusal (§5, §6).
-///
-/// In a window, the old side's `WalFull` is exactly "cannot serve into the
-/// fallback" and freezes the front — the swap retires the old file shortly, so
-/// the freeze is brief. A fault on the new side is the ordinary terminal stop.
-/// `RecordTooLarge` and `WalGap` are protocol answers, never triggers, and pure
-/// submission backpressure parks in the pending op instead of returning.
-fn onCompositeWriteError(frame: *Frame, err: wal.WalError) void {
-    if (err != error.WalFull and err != error.WalFaulted) return;
-
-    const window = if (frame.window) |*w| w else {
-        if (err == error.WalFaulted) frame.wal_serve = .stopped;
-        return;
-    };
-    if (frame.wal_serve == .stopped) return;
-
-    if (window.failed_side == .old) {
-        frame.wal_serve = .frozen;
-        frame.logger.logger.warn("the window's old side refused; the front is frozen", .{
-            .ring_idx = frame.ring_idx,
-            .err = @errorName(err),
-        });
-        return;
-    }
-
-    if (err == error.WalFaulted) {
-        frame.wal_serve = .stopped;
-        frame.logger.logger.err("the window's new side faulted; the thread stops", .{
-            .ring_idx = frame.ring_idx,
-        });
+/// Test helper: drain the window and any continuation a completion arms.
+fn pumpWindow(frame: *Frame) void {
+    while (true) {
+        if (frame.snap.drainPending()) {
+            drainPump(frame);
+            continue;
+        }
+        if (frame.snap.drainQuiet()) return;
+        if (frame.ring.ring.popCQE()) |cqe| {
+            stepCQE(frame, cqe);
+            continue;
+        }
+        frame.ring.ring.park();
     }
 }
 
@@ -891,114 +338,6 @@ fn onCompositeWriteError(frame: *Frame, err: wal.WalError) void {
 /// buffers.
 fn recordFits(lba: u32, op_len: usize) bool {
     return wal.framedLen(op_len) <= lba;
-}
-
-/// One tick of the snapshot ticker (§1.2).
-///
-/// The tick never queues and never retries: a skip simply ends the pass. The
-/// candidates are every pair this thread hosts — own data set and mirrors
-/// alike — and the metric is the live writer's tracked extent.
-fn tickPass(frame: *Frame) void {
-    frame.snapshot_ticks +%= 1;
-
-    // Rung 10: a stopped thread's files do not grow, and a window or a pending
-    // push is one operation already in flight (§1.2, §4).
-    if (frame.wal_serve != .serving) return;
-    if (frame.procedure != null) return;
-    if (frame.pending_push != null) return;
-
-    const hosts = frame.ctrl.cfg.wal.hosts();
-    const barrier = frame.ctrl.cfg.snapshots.size_barrier;
-    var best_host: u8 = 0;
-    var best_extent: u64 = 0;
-    var found = false;
-    var host: u32 = 0;
-    while (host < hosts) : (host += 1) {
-        const host_idx: u8 = @intCast(host);
-        const pair = wal.areaIndex(host_idx, frame.index_idx, hosts);
-        const writer = frame.ctrl.wal_writers[pair] orelse continue;
-        const extent = writer.trackedExtent();
-        if (!found or extent > best_extent) {
-            found = true;
-            best_host = host_idx;
-            best_extent = extent;
-        }
-    }
-    if (!found or best_extent < barrier) return;
-
-    // The tag: the pair's state at this moment, fixed for the procedure (§2.3).
-    const tag = frame.data_sets[best_host].state;
-
-    // Rung 0: the process-wide limit is the design working, not a failure.
-    const k = frame.ctrl.snapshot_slots.acquire() catch return;
-    const job = frame.ctrl.mintSnapshotJob(best_host, frame.index_idx, tag, k, frame.ring_idx) catch |err| {
-        // A quiet unwind-before-start: nothing was dispatched, and the tick
-        // retries on its own schedule.
-        frame.ctrl.snapshot_slots.release(k);
-        frame.logger.logger.warn("snapshot job allocation failed; the tick ends", .{
-            .ring_idx = frame.ring_idx,
-            .host_idx = best_host,
-            .err = @errorName(err),
-        });
-        return;
-    };
-
-    frame.ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
-    frame.procedure = job;
-    dispatchSnapshot(.{ .SnapshotCreate = .{ .job = @intFromPtr(job) } }, frame.ctrl.nextElephantRing(), frame);
-}
-
-/// Sends one snapshot payload to an elephant ring through the ordinary
-/// `cross_slots` pool (§3.1).
-///
-/// A refused push never drops and never spins: the slot stays acquired with
-/// its payload written and the loop retries the `MSG_RING` once per pass (§4).
-fn dispatchSnapshot(payload: cross_task.CrossTask, target_ring_idx: u16, frame: *Frame) void {
-    const slot_idx = frame.ctrl.cross_slots.acquire() catch |err| {
-        frame.logger.logger.err("snapshot dispatch found no cross-task slot", .{
-            .ring_idx = frame.ring_idx,
-            .target_ring_idx = target_ring_idx,
-            .err = @errorName(err),
-        });
-        return;
-    };
-    frame.ctrl.cross_slots.at(slot_idx).* = payload;
-    frame.ring.ring.pushMsgRingFd(
-        frame.ctrl.rings[target_ring_idx].ring.fd,
-        messages.CrossTaskMessageIdx,
-        slot_idx,
-        .{},
-    ) catch |err| switch (err) {
-        error.RingFull => {
-            frame.pending_push = .{ .slot_idx = slot_idx, .target_ring_idx = target_ring_idx };
-            return;
-        },
-    };
-    resyncStream(frame);
-}
-
-/// Re-captures the ring's WAL stream window after a direct submission (§4).
-///
-/// The two submission paths share one SQ: a direct `MSG_RING` moves the ring's
-/// tail past the stream's cursor, and the stream's next commit would rewind it.
-/// The window's flushes and the procedure's dispatches both run on this ring,
-/// so the cursors are re-captured as the ring's own.
-fn resyncStream(frame: *Frame) void {
-    frame.ring.ring.streamedSQ(&frame.ring.sqstream);
-}
-
-/// Retries the pending push, if any. Called once at the top of every loop pass:
-/// the slot is already acquired and written, so only the `MSG_RING` repeats.
-fn retryPendingPush(frame: *Frame) void {
-    const pending = frame.pending_push orelse return;
-    frame.ring.ring.pushMsgRingFd(
-        frame.ctrl.rings[pending.target_ring_idx].ring.fd,
-        messages.CrossTaskMessageIdx,
-        pending.slot_idx,
-        .{},
-    ) catch return;
-    frame.pending_push = null;
-    resyncStream(frame);
 }
 
 /// Drains every replay-queue head whose recorded retry time is already due.
@@ -1112,11 +451,11 @@ test "plain-mode records replay into a fresh data set after a reopen" {
         .sqpoll_threads = 1,
         .ring_slots_capacity = 4096,
         .index_inbox_capacity = 8,
-        .wal = .{ .plain = .{ .dir = dir, .buffers = 32, .lba = 512 } },
+        .wal = .{ .plain = .{ .dir = dir, .buffers = 32, .lba = config.kib(1) } },
         .logging = .{
             .method = .{ .json = {} },
             .pool_capacity = 64,
-            .pool_frame_size = 1024,
+            .pool_frame_size = config.bytes(1024),
         },
     };
 
@@ -1218,12 +557,12 @@ fn testConfig(dir: []const u8, hosts: u32, elephants: u16, snapshots: config.Sna
         .sqpoll_threads = 1,
         .ring_slots_capacity = 4096,
         .index_inbox_capacity = 8,
-        .wal = .{ .plain = .{ .dir = dir, .buffers = 8, .lba = 512, .hosts = hosts } },
+        .wal = .{ .plain = .{ .dir = dir, .buffers = 8, .lba = config.kib(1), .hosts = hosts } },
         .snapshots = snapshots,
         .logging = .{
             .method = .{ .json = {} },
             .pool_capacity = 64,
-            .pool_frame_size = 1024,
+            .pool_frame_size = config.bytes(1024),
         },
     };
 }
@@ -1289,7 +628,7 @@ test "the cross-task arm releases the slot it read" {
 
     // A synthetic in-flight procedure: `SnapshotDone` is its terminal reply.
     var job: lifetime.SnapshotJob = undefined;
-    frame.procedure = &job;
+    frame.snap.procedure = &job;
 
     const full = ctrl.cross_slots.freeCount();
     const slot_idx = try ctrl.cross_slots.acquire();
@@ -1312,7 +651,7 @@ test "the cross-task arm releases the slot it read" {
     // The arm released the slot on read and the terminal reply cleared the
     // procedure.
     try testing.expectEqual(full, ctrl.cross_slots.freeCount());
-    try testing.expect(frame.procedure == null);
+    try testing.expect(frame.snap.procedure == null);
 }
 
 test "the repeating ticker produces SnapshotTickIdx completions" {
@@ -1382,12 +721,12 @@ test "the drain routes the snapshot tick to the tick pass" {
     var frame = testFrame(&ctrl, 1, logger, &.{});
     // A stopped thread makes the pass end after its skip guard: the counter is
     // the routing spy.
-    frame.wal_serve = .stopped;
+    frame.snap.serve = .stopped;
 
     stepCQE(&frame, .{ .user_data = messages.SnapshotTickIdx, .res = 0, .flags = 0 });
 
-    try testing.expectEqual(@as(u32, 1), frame.snapshot_ticks);
-    try testing.expect(frame.procedure == null);
+    try testing.expectEqual(@as(u32, 1), frame.snap.ticks);
+    try testing.expect(frame.snap.procedure == null);
 }
 
 /// Opens the pair at `host` with the given tag and writes `records` one after
@@ -1416,246 +755,6 @@ fn testWriter(
     while (i < records) : (i += 1) {
         try writer.write(tag + 1 + i, tag + i, data);
     }
-}
-
-test "the tick pass ends on each skip guard" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 0, .{ .size_barrier = 1, .interval_s = 1, .slots = 2, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    try ctrl.ensureIndexDir(0);
-    try testWriter(&ctrl, 0, 0x300, 1, 100);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-    sets[0].state = 0x301;
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    const slots_full = ctrl.snapshot_slots.freeCount();
-
-    // A stopped thread's files do not grow.
-    frame.wal_serve = .stopped;
-    tickPass(&frame);
-    try testing.expectEqual(@as(u32, 1), frame.snapshot_ticks);
-    try testing.expectEqual(slots_full, ctrl.snapshot_slots.freeCount());
-    try testing.expect(frame.procedure == null);
-
-    // A frozen window denies the tick just the same.
-    frame.wal_serve = .frozen;
-    tickPass(&frame);
-    try testing.expectEqual(@as(u32, 2), frame.snapshot_ticks);
-    try testing.expectEqual(slots_full, ctrl.snapshot_slots.freeCount());
-    try testing.expect(frame.procedure == null);
-
-    // One procedure per index: its own flag ends the pass.
-    var job: lifetime.SnapshotJob = undefined;
-    frame.wal_serve = .serving;
-    frame.procedure = &job;
-    tickPass(&frame);
-    try testing.expectEqual(@as(u32, 3), frame.snapshot_ticks);
-    try testing.expectEqual(slots_full, ctrl.snapshot_slots.freeCount());
-    try testing.expect(frame.procedure == &job);
-
-    // A pending push ends the pass too; the tick never queues.
-    frame.procedure = null;
-    frame.pending_push = .{ .slot_idx = 0, .target_ring_idx = 2 };
-    tickPass(&frame);
-    try testing.expectEqual(@as(u32, 4), frame.snapshot_ticks);
-    try testing.expectEqual(slots_full, ctrl.snapshot_slots.freeCount());
-    try testing.expect(frame.procedure == null);
-    frame.pending_push = null;
-}
-
-test "the tick picks the largest pair and dispatches the create" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 2, 1, .{ .size_barrier = 1, .interval_s = 1, .slots = 2, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    // The elephant's ring: the dispatch lands there.
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    try ctrl.ensureIndexDir(0);
-    try testWriter(&ctrl, 0, 0x300, 1, 100);
-    try testWriter(&ctrl, 1, 0x400, 2, 100);
-
-    var sets = [_]state.IndexState{ undefined, undefined };
-    for (&sets) |*st| try ctrl.initIndexState(st);
-    defer for (&sets) |*st| ctrl.deinitIndexState(st);
-    sets[0].state = 0x301;
-    sets[1].state = 0x402;
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    tickPass(&frame);
-
-    const job = frame.procedure orelse return error.SnapshotNotStarted;
-    defer {
-        frame.ctrl.snapshot_slots.at(job.k).* = .{ .status = .idle, .job = 0 };
-        frame.ctrl.snapshot_slots.release(job.k);
-        frame.ctrl.releaseSnapshotJob(job);
-        frame.procedure = null;
-    }
-
-    // Host 1 wrote more, so it wins; the tag is its state at the tick.
-    try testing.expectEqual(@as(u8, 1), job.host_idx);
-    try testing.expectEqual(@as(u128, 0x402), job.tag);
-    try testing.expectEqual(@as(u32, 0), job.k);
-    try testing.expectEqual(@as(u16, 1), job.ring_idx);
-
-    // The create request rides an ordinary cross-task slot into the elephant's
-    // ring, carrying the job handle.
-    const cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    try testing.expectEqual(messages.CrossTaskMessageIdx, cqe.taskIdx());
-    const slot_idx: u32 = @intCast(cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(slot_idx).SnapshotCreate.job);
-    ctrl.cross_slots.release(slot_idx);
-}
-
-test "an exhausted snapshot pool ends the tick quietly" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 0, .{ .size_barrier = 1, .interval_s = 1, .slots = 1, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    try ctrl.ensureIndexDir(0);
-    try testWriter(&ctrl, 0, 0x300, 1, 100);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-    sets[0].state = 0x301;
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-
-    // Rung 0: the process-wide limit is the design working, not a failure.
-    const held = try ctrl.snapshot_slots.acquire();
-    defer ctrl.snapshot_slots.release(held);
-
-    tickPass(&frame);
-
-    try testing.expectEqual(@as(usize, 0), ctrl.snapshot_slots.freeCount());
-    try testing.expect(frame.procedure == null);
-}
-
-test "a refused dispatch parks in the pending op and the retry lands it" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{});
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var frame = testFrame(&ctrl, 1, logger, &.{});
-    const cross_full = ctrl.cross_slots.freeCount();
-    const fake_job: usize = 0x5a5a;
-
-    // A refused push is a race with the kernel's SQPOLL thread: the producer
-    // outruns it in a tight run, but the poller may drain an entry before the
-    // dispatch. Retry the run until the dispatch observes the full queue, and
-    // consume the messages of the attempts that won the race.
-    const spec = std.os.linux.kernel_timespec{ .sec = 0, .nsec = 0 };
-    var parked = false;
-    var attempt: u32 = 0;
-    while (!parked and attempt < 2048) : (attempt += 1) {
-        const base: u32 = @truncate(attempt *% cfg.queue_depth);
-        var i: u32 = 0;
-        var sq_full = false;
-        while (i < 4 * cfg.queue_depth) : (i += 1) {
-            ctrl.rings[1].ring.pushTimeout(base +% i, &spec, .{}) catch |err| {
-                if (err != error.RingFull) return err;
-                sq_full = true;
-                break;
-            };
-        }
-        try testing.expect(sq_full);
-
-        dispatchSnapshot(.{ .SnapshotCreate = .{ .job = fake_job } }, 2, &frame);
-        if (frame.pending_push != null) {
-            parked = true;
-            break;
-        }
-
-        // The push won: consume its message and slot before trying again.
-        const sent = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-            return error.SnapshotDispatchTimeout;
-        try testing.expectEqual(messages.CrossTaskMessageIdx, sent.taskIdx());
-        ctrl.cross_slots.release(@intCast(sent.res));
-        while (ctrl.rings[1].ring.popCQE()) |_| {}
-    }
-    try testing.expect(parked);
-
-    // The push was refused: the slot stayed acquired with its payload written,
-    // and the op waits for the next pass.
-    try testing.expectEqual(cross_full - 1, ctrl.cross_slots.freeCount());
-
-    // The loop is not parked: draining the completed timeouts frees the SQ and
-    // the next pass retries the same slot.
-    const deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
-    while (frame.pending_push != null) {
-        if (zigring.monotonicNs() >= deadline) return error.PendingPushTimeout;
-        while (ctrl.rings[1].ring.popCQE()) |_| {}
-        retryPendingPush(&frame);
-        std.atomic.spinLoopHint();
-    }
-    try testing.expectEqual(cross_full - 1, ctrl.cross_slots.freeCount());
-
-    const cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    try testing.expectEqual(messages.CrossTaskMessageIdx, cqe.taskIdx());
-    const slot_idx: u32 = @intCast(cqe.res);
-    try testing.expectEqual(fake_job, ctrl.cross_slots.at(slot_idx).SnapshotCreate.job);
-    ctrl.cross_slots.release(slot_idx);
 }
 
 /// Creates the WAL file the elephant would have created and opens its writer:
@@ -1693,11 +792,11 @@ fn adoptWindowWriter(
 /// Tears a synthetic window down without an elephant: the new writer is the
 /// caller's, the pair's writer stays registered.
 fn dropWindow(frame: *Frame) void {
-    if (frame.window) |*window| {
+    if (frame.snap.window) |*window| {
         _ = std.os.linux.close(window.new.fd);
         frame.ctrl.allocator.destroy(window.new);
         window.pending.deinit(frame.ctrl.allocator);
-        frame.window = null;
+        frame.snap.window = null;
     }
 }
 
@@ -1742,327 +841,6 @@ fn readFileBytes(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
     return bytes[0..got];
 }
 
-test "unwind A clears a published mark, rolls the slot back and dispatches cleanup" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    _ = try openPairWriter(&ctrl, 0, 0, 0x100);
-
-    const k = try ctrl.snapshot_slots.acquire();
-    const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
-    defer dropTestJob(&ctrl, job);
-    ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.procedure = job;
-
-    try ctrl.publishAdoptionMark(0, 0, k, 0x100);
-    try testing.expectEqual(@as(u8, 1), pairControlLine(&ctrl).snapshot_in_progress);
-
-    unwindA(&frame, job, .{ .mark_published = true, .writer_built = null });
-
-    // The line is clear again: the old pair is the one serving.
-    const line = pairControlLine(&ctrl);
-    try testing.expectEqual(@as(u8, 0), line.snapshot_in_progress);
-    try testing.expectEqual(@as(u16, 0), line.new_wal_buffer_idx);
-    try testing.expectEqual(@as(u128, 0), line.target_state);
-
-    // The slot rolls back and the procedure's phase names its dispatch.
-    try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
-
-    // The flag stays until the terminal `SnapshotDone` (§4).
-    try testing.expectEqual(job, frame.procedure.?);
-
-    const cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    try testing.expectEqual(messages.CrossTaskMessageIdx, cqe.taskIdx());
-    const slot_idx: u32 = @intCast(cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(slot_idx).SnapshotCleanup.job);
-    ctrl.cross_slots.release(slot_idx);
-}
-
-test "unwind B reverts to the old writer, closes the new one and dispatches cleanup" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    const old = try openPairWriter(&ctrl, 0, 0, 0x100);
-    const k = try ctrl.snapshot_slots.acquire();
-    const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x100, 0x100);
-    const new_fd = new.fd;
-
-    const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
-    defer dropTestJob(&ctrl, job);
-    job.fd = -1;
-    ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.procedure = job;
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
-    try ctrl.publishAdoptionMark(0, 0, k, 0x100);
-
-    unwindB(&frame, job);
-
-    // The pair serves through the old writer again: no window, and a write
-    // lands on the old side only.
-    try testing.expect(frame.window == null);
-    try testing.expectEqual(old, ctrl.wal_writers[0].?);
-    var op: [494]u8 = undefined;
-    @memset(&op, 0x11);
-    try old.write(0x101, 0x100, &op);
-    try testing.expectEqual(@as(u128, 0x101), old.head);
-
-    // The new writer is closed and gone; its descriptor went back through the
-    // sentinel, so the job holds nothing.
-    try testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(
-        std.os.linux.fcntl(new_fd, std.os.linux.F.GETFD, 0),
-    ));
-    try testing.expectEqual(@as(posix.fd_t, -1), job.fd);
-
-    const line = pairControlLine(&ctrl);
-    try testing.expectEqual(@as(u8, 0), line.snapshot_in_progress);
-    try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
-
-    const cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    try testing.expectEqual(messages.CrossTaskMessageIdx, cqe.taskIdx());
-    const slot_idx: u32 = @intCast(cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(slot_idx).SnapshotCleanup.job);
-    ctrl.cross_slots.release(slot_idx);
-}
-
-test "the handler pass marks, clones, adopts, composites and re-dispatches the dump" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2, .size_barrier = 1, .interval_s = 1, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-    try ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    // The pair has history: its writer chains from the file's tag, with one
-    // record that ends on a buffer boundary so the window's own flush is the
-    // one that reaches the file.
-    try ctrl.ensureIndexDir(0);
-    try testWriter(&ctrl, 0, 0x100, 1, 494);
-    sets[0].state = 0x101;
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    tickPass(&frame);
-
-    const job = frame.procedure orelse return error.SnapshotNotStarted;
-    defer {
-        if (frame.window != null) dropWindow(&frame);
-        dropTestJob(&ctrl, job);
-        frame.procedure = null;
-    }
-    try testing.expectEqual(@as(u128, 0x101), job.tag);
-
-    // The elephant's create task, and F1's stand-in: create the file and hand
-    // its descriptor back.
-    const create_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    const create_slot: u32 = @intCast(create_cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(create_slot).SnapshotCreate.job);
-    ctrl.cross_slots.release(create_slot);
-    const fd = try createWalFile(job.wal_path);
-
-    // The pair kept serving between the tick and the reply: Y is ahead of X.
-    sets[0].state = 0x102;
-    try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = "served" } });
-    try testing.expectEqual(@as(u128, 0x102), frame.data_sets[0].state);
-
-    dispatchSnapshotReply(&frame, .{ .SnapshotFd = .{ .fd = fd } });
-
-    // The mark carries (1, k, X) on the pair's control line.
-    const line = pairControlLine(&ctrl);
-    try testing.expectEqual(@as(u8, 1), line.snapshot_in_progress);
-    try testing.expectEqual(@as(u16, @intCast(job.k)), line.new_wal_buffer_idx);
-    try testing.expectEqual(@as(u128, 0x101), line.target_state);
-
-    // The clone is a deep copy taken at the pair's state; the adopt chained the
-    // new writer from Y and put it on temp ring k.
-    try testing.expectEqual(@as(u128, 0x102), job.clone.state);
-    try testing.expectEqual(@as(u128, 0x102), job.clone.sessions.get(0x102).?.id);
-    try testing.expectEqual(@as(posix.fd_t, -1), job.fd);
-
-    const window = &frame.window.?;
-    try testing.expectEqual(@as(u128, 0x102), window.new.head);
-    try testing.expectEqual(ctrl.wal_writers[0].?, window.old);
-    // Both sides flush through the thread's ring, so the assertion below reads
-    // what the composite's flushes actually committed.
-    window.old.attachStream(&ctrl.rings[1].sqstream, &ctrl.rings[1].slots);
-    const temp_start = wal.tempAreaIdx(job.k, ctrl.wal_pairs) * ctrl.wal_area_stride;
-    const temp = wal.Area.init(
-        ctrl.wal_battery.?[temp_start..][0..ctrl.wal_area_stride],
-        cfg.wal.buffers(),
-        cfg.wal.lba(),
-    );
-    try testing.expectEqual(@intFromPtr(temp.data.ptr), @intFromPtr(window.new.data.ptr));
-    try testing.expectEqual(@intFromPtr(temp.headers.ptr), @intFromPtr(window.new.headers.ptr));
-
-    // A write through the composite lands on both sides, new first.
-    var op: [494]u8 = undefined;
-    for (&op, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% 3);
-    try window.write(0x103, &op);
-    const deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
-    while (!window.quiet()) {
-        if (zigring.monotonicNs() >= deadline) return error.SnapshotFlushTimeout;
-        if (frame.ring.ring.popCQE()) |cqe| {
-            stepCQE(&frame, cqe);
-        } else {
-            std.atomic.spinLoopHint();
-        }
-    }
-    try testing.expectEqual(@as(u128, 0x103), window.new.head);
-    try testing.expectEqual(@as(u128, 0x103), window.old.head);
-
-    const old_dir = try ctrl.indexDirPath(0);
-    defer testing.allocator.free(old_dir);
-    const old_path = try wal.walPath(testing.allocator, old_dir, 0, 0, 0x100);
-    defer testing.allocator.free(old_path);
-    const old_bytes = try readFileBytes(testing.allocator, old_path);
-    defer testing.allocator.free(old_bytes);
-    const new_bytes = try readFileBytes(testing.allocator, job.wal_path);
-    defer testing.allocator.free(new_bytes);
-    try testing.expect(std.mem.indexOf(u8, old_bytes, &op) != null);
-    try testing.expect(std.mem.indexOf(u8, new_bytes, &op) != null);
-
-    // The dump is re-dispatched, cursor pick 2.
-    try testing.expectEqual(lifetime.SnapshotPhase.dump_sent, job.phase);
-    const dump_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    const dump_slot: u32 = @intCast(dump_cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(dump_slot).SnapshotDump.job);
-    ctrl.cross_slots.release(dump_slot);
-}
-
-test "a clone allocation failure unwinds A, clears the mark and dispatches cleanup" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2, .size_barrier = 1, .interval_s = 1, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-    try ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    try ctrl.ensureIndexDir(0);
-    try testWriter(&ctrl, 0, 0x100, 1, 100);
-    sets[0].state = 0x101;
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    tickPass(&frame);
-
-    const job = frame.procedure orelse return error.SnapshotNotStarted;
-    defer {
-        if (frame.window != null) dropWindow(&frame);
-        dropTestJob(&ctrl, job);
-        frame.procedure = null;
-    }
-
-    const create_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    ctrl.cross_slots.release(@intCast(create_cqe.res));
-    const fd = try createWalFile(job.wal_path);
-
-    // A served session makes the clone allocate; the poisoned arena refuses it.
-    sets[0].state = 0x102;
-    try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = "served" } });
-    job.arena.deinit();
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    job.arena = std.heap.ArenaAllocator.init(failing.allocator());
-
-    dispatchSnapshotReply(&frame, .{ .SnapshotFd = .{ .fd = fd } });
-
-    // Rung 3: the mark was published and is cleared again, the descriptor
-    // stays with the job for the cleanup elephant, and no window opens.
-    const line = pairControlLine(&ctrl);
-    try testing.expectEqual(@as(u8, 0), line.snapshot_in_progress);
-    try testing.expect(frame.window == null);
-    try testing.expectEqual(fd, job.fd);
-    try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(job.k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
-
-    const cleanup_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    const cleanup_slot: u32 = @intCast(cleanup_cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(cleanup_slot).SnapshotCleanup.job);
-    ctrl.cross_slots.release(cleanup_slot);
-}
-
 test "the bounded drain waits for both writers' in-flight flushes" {
     const testing = std.testing;
 
@@ -2092,47 +870,29 @@ test "the bounded drain waits for both writers' in-flight flushes" {
     new.attachStream(&ctrl.rings[1].sqstream, &ctrl.rings[1].slots);
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
+    frame.snap.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
     defer {
         dropWindow(&frame);
         ctrl.snapshot_slots.release(k);
     }
 
-    var op: [494]u8 = undefined;
+    var op: [1006]u8 = undefined;
     @memset(&op, 0x22);
-    try frame.window.?.write(0x101, &op);
-    try testing.expect(!frame.window.?.quiet());
+    try frame.snap.window.?.write(0x101, &op);
+    try testing.expect(!frame.snap.window.?.quiet());
     try testing.expect(old.flush_in_flight and new.flush_in_flight);
 
-    drainUntilQuiet(&frame);
+    pumpWindow(&frame);
 
     // Both completions were stepped through the ordinary dispatch; the writers
     // are quiet and the events they carried are complete.
-    try testing.expect(frame.window.?.quiet());
+    try testing.expect(frame.snap.window.?.quiet());
     try testing.expect(!old.flush_in_flight and !old.flush_pending);
     try testing.expect(!new.flush_in_flight and !new.flush_pending);
     try testing.expectEqual(@as(u64, 1), old.flushed_upto);
     try testing.expectEqual(@as(u64, 1), new.flushed_upto);
-    try testing.expectEqual(@as(usize, 0), frame.window.?.pending.items.len);
+    try testing.expectEqual(@as(usize, 0), frame.snap.window.?.pending.items.len);
 }
-
-/// A sink that holds every submission: the test decides when a flush completes.
-const HoldFlush = struct {
-    fn room(ctx: ?*anyopaque, writer: *wal.WalWriteFile) wal.WalError!void {
-        _ = ctx;
-        _ = writer;
-    }
-
-    fn submit(ctx: ?*anyopaque, writer: *wal.WalWriteFile, ordinal: u64) void {
-        _ = ctx;
-        _ = writer;
-        _ = ordinal;
-    }
-
-    fn install(writer: *wal.WalWriteFile) void {
-        writer.sink = .{ .room = room, .submit = submit };
-    }
-};
 
 test "the completion pass drains, copies, rewires, clears, revives and closes" {
     const testing = std.testing;
@@ -2168,14 +928,14 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.procedure = job;
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
+    frame.snap.procedure = job;
+    frame.snap.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
     try ctrl.publishAdoptionMark(0, 0, k, 0x100);
 
     // A window event: both sides' synchronous sinks make it durable at once.
     var op: [494]u8 = undefined;
     for (&op, 0..) |*byte, i| byte.* = @truncate(i *% 13 +% 5);
-    try frame.window.?.write(0x101, &op);
+    try frame.snap.window.?.write(0x101, &op);
 
     // The pair area's arrays before the copy: what the swap must reproduce.
     const buffers = cfg.wal.buffers();
@@ -2189,10 +949,11 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
 
     // An old-side fault had frozen the front before the completion arrived.
     old.faulted = true;
-    frame.wal_serve = .frozen;
+    frame.snap.serve = .frozen;
     const old_fd = old.fd;
 
-    snapshotDumpedPass(&frame);
+    frame.snap.onReply(frame.host(), .{ .SnapshotDumped = .{} });
+    pumpWindow(&frame);
 
     // The pair area is temp ring k's data and header arrays, byte for byte.
     const pair_bytes = ctrl.wal_battery.?[0..ctrl.wal_area_stride];
@@ -2217,7 +978,7 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
         std.os.linux.fcntl(old_fd, std.os.linux.F.GETFD, 0),
     ));
     try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
-    try testing.expect(frame.window == null);
+    try testing.expect(frame.snap.window == null);
 
     const close_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotDispatchTimeout;
@@ -2228,182 +989,16 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
 
     // The swap revived the frozen front: the old writer is retired from the
     // live set, and the surviving one is healthy.
-    try testing.expectEqual(WalServe.serving, frame.wal_serve);
+    try testing.expectEqual(snapshot.Serve.serving, frame.snap.serve);
 
     // A relapse after the swap finds no window and stops terminally.
     registered.faulted = true;
-    onWriterFault(registered, &frame);
-    try testing.expectEqual(WalServe.stopped, frame.wal_serve);
+    frame.snap.onWriterFault(frame.host(), registered);
+    try testing.expectEqual(snapshot.Serve.stopped, frame.snap.serve);
 
     // The terminal reply clears the in-flight flag.
-    dispatchSnapshotReply(&frame, .{ .SnapshotDone = .{} });
-    try testing.expect(frame.procedure == null);
-}
-
-test "an old-side flush fault freezes the front and a new-side fault stops it" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    const old = try openPairWriter(&ctrl, 0, 0, 0x100);
-    const k = try ctrl.snapshot_slots.acquire();
-    const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x100, 0x100);
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
-    defer {
-        dropWindow(&frame);
-        ctrl.snapshot_slots.release(k);
-    }
-
-    // Rung: an old-side flush fault mid-window freezes; the front guard is the
-    // state itself, and the control plane keeps flowing regardless (§5).
-    old.faulted = true;
-    onWriterFault(old, &frame);
-    try testing.expectEqual(WalServe.frozen, frame.wal_serve);
-    try testing.expect(frame.wal_serve != .serving);
-
-    // A new-side fault is the ordinary terminal stop.
-    new.faulted = true;
-    onWriterFault(new, &frame);
-    try testing.expectEqual(WalServe.stopped, frame.wal_serve);
-}
-
-test "the window's old side hitting capacity freezes the front" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    // Fill the old pair up to its one-free-buffer floor: held completions keep
-    // the ring the file's.
-    const old = try openPairWriter(&ctrl, 0, 0, 0x100);
-    HoldFlush.install(old);
-    var op: [494]u8 = undefined;
-    @memset(&op, 0x33);
-    var pair_state: u128 = 0x100;
-    var written: u32 = 0;
-    while (written < cfg.wal.buffers() - 1) : (written += 1) {
-        try old.write(pair_state + 1, pair_state, &op);
-        pair_state += 1;
-    }
-    try testing.expectError(error.WalFull, old.write(pair_state + 1, pair_state, &op));
-
-    // The new side is empty, so the same event is accepted there first and
-    // refused by the old side: exactly "cannot serve into the fallback".
-    const k = try ctrl.snapshot_slots.acquire();
-    const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x200, pair_state);
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
-    defer {
-        dropWindow(&frame);
-        ctrl.snapshot_slots.release(k);
-    }
-
-    try testing.expectError(error.WalFull, frame.window.?.write(pair_state + 1, &op));
-    try testing.expectEqual(lifetime.CompositeWriter.Side.old, frame.window.?.failed_side.?);
-    try testing.expectEqual(pair_state + 1, frame.window.?.new.head);
-    try testing.expectEqual(pair_state, frame.window.?.old.head);
-
-    onCompositeWriteError(&frame, error.WalFull);
-    try testing.expectEqual(WalServe.frozen, frame.wal_serve);
-
-    // A protocol answer is never a trigger, and outside a window a fault stops.
-    frame.wal_serve = .serving;
-    onCompositeWriteError(&frame, error.RecordTooLarge);
-    try testing.expectEqual(WalServe.serving, frame.wal_serve);
-    onCompositeWriteError(&frame, error.WalGap);
-    try testing.expectEqual(WalServe.serving, frame.wal_serve);
-}
-
-test "a failed procedure while frozen leaves the stop standing" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(testing.allocator, &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    const old = try openPairWriter(&ctrl, 0, 0, 0x100);
-    const k = try ctrl.snapshot_slots.acquire();
-    const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x100, 0x100);
-
-    const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
-    defer dropTestJob(&ctrl, job);
-    job.fd = -1;
-    ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.procedure = job;
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
-    try ctrl.publishAdoptionMark(0, 0, k, 0x100);
-
-    // The old side froze the front; the dump then failed. No swap is coming,
-    // so the freeze stands (§8 rung 10).
-    old.faulted = true;
-    frame.wal_serve = .frozen;
-    unwindB(&frame, job);
-
-    try testing.expectEqual(WalServe.frozen, frame.wal_serve);
-    try testing.expect(frame.window == null);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
-    try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(k).status);
-
-    const cleanup_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    const cleanup_slot: u32 = @intCast(cleanup_cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(cleanup_slot).SnapshotCleanup.job);
-    ctrl.cross_slots.release(cleanup_slot);
+    frame.snap.onReply(frame.host(), .{ .SnapshotDone = .{} });
+    try testing.expect(frame.snap.procedure == null);
 }
 
 test "recordFits is the pair's lba boundary" {
@@ -2421,76 +1016,6 @@ test "recordFits is the pair's lba boundary" {
     try testing.expect(recordFits(lba, fits_op));
     try testing.expect(!recordFits(lba, fits_op + 1));
     try testing.expect(wal.framedLen(fits_op) > wal.BLOCK_CONTENT);
-}
-
-test "an adopt allocation failure unwinds A and the descriptor is already closed" {
-    const testing = std.testing;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer testing.allocator.free(dir);
-
-    // The controller's own allocator is the poisoned one: the adopt's writer
-    // object is its next allocation.
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
-    var cfg = testConfig(dir, 1, 1, .{ .slots = 2, .size_barrier = 1, .interval_s = 1, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
-    try ctrl.init(failing.allocator(), &cfg);
-    defer ctrl.deinit();
-    try ctrl.initRing(1, 1);
-    defer ctrl.rings[1].deinit();
-    try ctrl.initRing(2, 1);
-    defer ctrl.rings[2].deinit();
-
-    const logger = try ctrl.getLogger(1);
-    defer dropTestLogger(&ctrl, logger);
-
-    var sets = [_]state.IndexState{undefined};
-    try ctrl.initIndexState(&sets[0]);
-    defer ctrl.deinitIndexState(&sets[0]);
-
-    try ctrl.ensureIndexDir(0);
-    try testWriter(&ctrl, 0, 0x100, 1, 494);
-    sets[0].state = 0x101;
-
-    var frame = testFrame(&ctrl, 1, logger, &sets);
-    tickPass(&frame);
-
-    const job = frame.procedure orelse return error.SnapshotNotStarted;
-    defer {
-        if (frame.window != null) dropWindow(&frame);
-        dropTestJob(&ctrl, job);
-        frame.procedure = null;
-    }
-
-    const create_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    ctrl.cross_slots.release(@intCast(create_cqe.res));
-    const fd = try createWalFile(job.wal_path);
-
-    // The clone of an empty data set allocates nothing; the adopt's writer
-    // object is the next allocation and the one refused.
-    failing.fail_index = failing.alloc_index;
-    dispatchSnapshotReply(&frame, .{ .SnapshotFd = .{ .fd = fd } });
-    failing.fail_index = std.math.maxInt(usize);
-
-    // Rung 4: no window opened, the mark is cleared, and the descriptor the
-    // adopt closed is not left in the job for a second close.
-    try testing.expect(frame.window == null);
-    try testing.expectEqual(@as(posix.fd_t, -1), job.fd);
-    try testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(
-        std.os.linux.fcntl(fd, std.os.linux.F.GETFD, 0),
-    ));
-    try testing.expectEqual(@as(u8, 0), pairControlLine(&ctrl).snapshot_in_progress);
-    try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(job.k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
-
-    const cleanup_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
-        return error.SnapshotDispatchTimeout;
-    const cleanup_slot: u32 = @intCast(cleanup_cqe.res);
-    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(cleanup_slot).SnapshotCleanup.job);
-    ctrl.cross_slots.release(cleanup_slot);
 }
 
 /// A sink whose admission pre-check passes once and then refuses once: the
@@ -2546,7 +1071,7 @@ test "the drain retries a flush backpressure parked" {
     const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x100, 0x100);
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
+    frame.snap.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
     defer {
         dropWindow(&frame);
         ctrl.snapshot_slots.release(k);
@@ -2556,21 +1081,137 @@ test "the drain retries a flush backpressure parked" {
     ParkOnceSink.reset();
     ParkOnceSink.install(old);
 
-    var op: [494]u8 = undefined;
+    var op: [1006]u8 = undefined;
     @memset(&op, 0x44);
-    try frame.window.?.write(0x101, &op);
+    try frame.snap.window.?.write(0x101, &op);
     try testing.expect(old.flush_pending);
     try testing.expect(!old.flush_in_flight);
-    try testing.expect(!frame.window.?.quiet());
+    try testing.expect(!frame.snap.window.?.quiet());
 
-    drainUntilQuiet(&frame);
+    pumpWindow(&frame);
 
     // The retry took the parked submission, which completed synchronously: no
     // completion was owed to the drain.
     try testing.expectEqual(@as(u32, 3), ParkOnceSink.calls);
     try testing.expect(!old.flush_pending);
     try testing.expectEqual(@as(u64, 1), old.flushed_upto);
-    try testing.expect(frame.window.?.quiet());
+    try testing.expect(frame.snap.window.?.quiet());
+}
+
+test "a reply-triggered drain waits for the committed batch cursor" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
+    var ctrl: lifetime.Controller = undefined;
+    try ctrl.init(testing.allocator, &cfg);
+    defer ctrl.deinit();
+    try ctrl.initRing(1, 1);
+    defer ctrl.rings[1].deinit();
+    try ctrl.initRing(2, 1);
+    defer ctrl.rings[2].deinit();
+
+    const logger = try ctrl.getLogger(1);
+    defer dropTestLogger(&ctrl, logger);
+
+    var sets = [_]state.IndexState{undefined};
+    try ctrl.initIndexState(&sets[0]);
+    defer ctrl.deinitIndexState(&sets[0]);
+
+    // A live window and a procedure, exactly as the completion test builds
+    // them, but on the real ring so the batch window is exercised.
+    const old = try openPairWriter(&ctrl, 0, 0, 0x100);
+    old.attachStream(&ctrl.rings[1].sqstream, &ctrl.rings[1].slots);
+    const k = try ctrl.snapshot_slots.acquire();
+    const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x100, 0x100);
+    new.attachStream(&ctrl.rings[1].sqstream, &ctrl.rings[1].slots);
+
+    const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
+    defer dropTestJob(&ctrl, job);
+    job.fd = -1;
+    job.phase = .dump_sent;
+    ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
+
+    var frame = testFrame(&ctrl, 1, logger, &sets);
+    frame.snap.procedure = job;
+    frame.snap.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
+    try ctrl.publishAdoptionMark(0, 0, k, 0x100);
+
+    // The dump reply lands first: wait for its completion before the window
+    // submits anything, so the CQ order is deterministic.
+    const slot_idx = try ctrl.cross_slots.acquire();
+    ctrl.cross_slots.at(slot_idx).* = .{ .SnapshotDumped = .{} };
+    try ctrl.rings[2].ring.pushMsgRingFd(
+        ctrl.rings[1].ring.fd,
+        messages.CrossTaskMessageIdx,
+        slot_idx,
+        .{},
+    );
+    const reply_deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
+    while (ctrl.rings[1].ring.cq_tail.* -% ctrl.rings[1].ring.cq_head.* == 0) {
+        if (zigring.monotonicNs() >= reply_deadline) return error.SnapshotReplyTimeout;
+        std.atomic.spinLoopHint();
+    }
+
+    // One event through the window, so the CQ now holds
+    // [reply, flush-completion].
+    var op: [1006]u8 = undefined;
+    @memset(&op, 0x66);
+    try frame.snap.window.?.write(0x101, &op);
+    try testing.expect(old.flush_in_flight and new.flush_in_flight);
+    const flush_deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
+    while (ctrl.rings[1].ring.cq_tail.* -% ctrl.rings[1].ring.cq_head.* < 3) {
+        if (zigring.monotonicNs() >= flush_deadline) return error.SnapshotFlushTimeout;
+        std.atomic.spinLoopHint();
+    }
+
+    var inbox: Inbox = undefined;
+    try inbox.init(testing.allocator, 8, &ctrl.rings[1].ring);
+    defer inbox.deinit();
+
+    // The batch window consumes the reply but does not publish its cursor yet.
+    const before = ctrl.rings[1].ring.cq_head.*;
+    const batch = inbox.batch(64, 0) orelse return error.MissingBatch;
+    const reply = batch.ring.popCQE() orelse return error.MissingCqe;
+    try testing.expectEqual(messages.CrossTaskMessageIdx, reply.taskIdx());
+    stepCQE(&frame, reply);
+    try batch.ring.commit();
+
+    // The reply armed the continuation and was handled once: the head moved
+    // exactly one completion forward, and the swap waits for the pump.
+    try testing.expectEqual(before + 1, ctrl.rings[1].ring.cq_head.*);
+    try testing.expectEqual(snapshot.Drain.swap, frame.snap.drain.?);
+    try testing.expectEqual(lifetime.SnapshotPhase.dump_sent, job.phase);
+    try testing.expectEqual(cross_task.SnapshotSlotStatus.in_flight, ctrl.snapshot_slots.at(k).status);
+    try testing.expect(!ctrl.rings[2].ring.checkCQNotEmpty());
+
+    // A duplicate completion of the same event is ignored, never re-entered.
+    frame.snap.onReply(frame.host(), .{ .SnapshotDumped = .{} });
+    try testing.expectEqual(snapshot.Drain.swap, frame.snap.drain.?);
+    try testing.expectEqual(lifetime.SnapshotPhase.dump_sent, job.phase);
+
+    // The pump finishes the swap outside the batch: each flush is consumed
+    // once and exactly one final close is sent.
+    drainPump(&frame);
+    try testing.expect(frame.snap.drain == null);
+    try testing.expect(frame.snap.window == null);
+    try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
+    // The retired old writer is gone; the surviving one carries the event and
+    // the single flush the pump consumed.
+    try testing.expectEqual(new, ctrl.wal_writers[0].?);
+    try testing.expectEqual(@as(u64, 1), new.flushed_upto);
+    try testing.expectEqual(@as(u128, 0x101), new.head);
+
+    const close_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
+        return error.SnapshotDispatchTimeout;
+    const close_slot: u32 = @intCast(close_cqe.res);
+    try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(close_slot).SnapshotClose.job);
+    ctrl.cross_slots.release(close_slot);
+    try testing.expect(ctrl.rings[2].ring.popCQE() == null);
 }
 
 // ============================================================================
@@ -2624,7 +1265,7 @@ const StartupPmem = struct {
             .dir = self.dir,
             .device = self.device,
             .buffers = 8,
-            .lba = 512,
+            .lba = config.kib(1),
             .hosts = hosts,
         } };
 
@@ -2666,372 +1307,6 @@ const StartupPmem = struct {
     }
 };
 
-const StartupPlain = struct {
-    tmp: std.testing.TmpDir,
-    dir: []u8,
-    cfg: config.Config,
-    ctrl: lifetime.Controller,
-
-    fn init(self: *StartupPlain) !void {
-        const allocator = std.testing.allocator;
-        self.tmp = std.testing.tmpDir(.{});
-        self.dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{self.tmp.sub_path[0..]});
-        errdefer allocator.free(self.dir);
-        self.cfg = testConfig(self.dir, 1, 0, .{ .registry_keep = 2 });
-        try self.ctrl.init(allocator, &self.cfg);
-        try self.ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
-    }
-
-    fn deinit(self: *StartupPlain) void {
-        self.ctrl.deinit();
-        std.testing.allocator.free(self.dir);
-        self.tmp.cleanup();
-    }
-};
-
-/// A small op: a handful of records fit one buffer's live tail, so a PMEM
-/// restart recovers them from the battery chain without a file flush.
-const post_op_len: usize = 6;
-
-fn postOp(byte: u8) [post_op_len]u8 {
-    return @splat(byte);
-}
-
-test "startup recovers a snapshotted pair: snapshot, walked head and replay" {
-    const allocator = std.testing.allocator;
-
-    var f: StartupPmem = undefined;
-    try f.init(1);
-    defer f.deinit();
-
-    const host: u8 = 0;
-    const index: u16 = 0;
-    const x: u128 = 0x10;
-    const y: u128 = 0x12;
-
-    // The clone at the handler pass: two pre-snapshot sessions, state Y.
-    var live: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&live);
-    defer f.ctrl.deinitIndexState(&live);
-    live.state = 0x10;
-    try f.ctrl.applyIndexOp(&live, .{ .create = .{ .compensator = "marker", .payload = "pre-a" } });
-    live.state = 0x11;
-    try f.ctrl.applyIndexOp(&live, .{ .create = .{ .compensator = "marker", .payload = "pre-b" } });
-    live.state = y;
-
-    try f.ctrl.ensureIndexDir(index);
-    const dir = try f.ctrl.indexDirPath(index);
-    defer allocator.free(dir);
-
-    // The elephant's snapshot file, named with the minted tag X.
-    const snapshot_path = try wal.snapshotPath(allocator, dir, host, index, x);
-    defer allocator.free(snapshot_path);
-    var dump: std.ArrayList(u8) = .empty;
-    defer dump.deinit(allocator);
-    try f.ctrl.dumpIndexState(&live, &dump);
-    try writeFileBytes(snapshot_path, dump.items);
-
-    // The window's new writer: temp ring `k` over the new WAL file, named X
-    // and chained from Y. Two post-snapshot records land there, and the mark
-    // still stands at the crash — the crash table's adoption row.
-    const wal_path = try wal.walPath(allocator, dir, host, index, x);
-    defer allocator.free(wal_path);
-    const created = try createWalFile(wal_path);
-    _ = std.os.linux.close(created);
-    const writer = try f.ctrl.walAdoptWrite(host, index, 0, y, try createWalFile(wal_path));
-    var op_a = postOp(0x41);
-    var op_b = postOp(0x42);
-    try writer.write(y + 1, y, &op_a);
-    try writer.write(y + 2, y + 1, &op_b);
-    try f.ctrl.publishAdoptionMark(host, index, 0, x);
-    _ = std.os.linux.close(writer.fd);
-    f.ctrl.allocator.destroy(writer);
-
-    // The registry: two compacted predecessors and the winning line. With
-    // `registry_keep = 2` the file holds keep + 1 lines, last one wins.
-    const snap_prev = try wal.snapshotPath(allocator, dir, host, index, 0x1);
-    defer allocator.free(snap_prev);
-    const wal_prev = try wal.walPath(allocator, dir, host, index, 0x1);
-    defer allocator.free(wal_prev);
-    try f.ctrl.rewriteRegistry(index, .{
-        .host_idx = host,
-        .snapshot_path = snap_prev,
-        .wal_path = wal_prev,
-        .state = 1,
-    });
-    try f.ctrl.rewriteRegistry(index, .{
-        .host_idx = host,
-        .snapshot_path = snap_prev,
-        .wal_path = wal_prev,
-        .state = 2,
-    });
-    try f.ctrl.rewriteRegistry(index, .{
-        .host_idx = host,
-        .snapshot_path = snapshot_path,
-        .wal_path = wal_path,
-        .state = y,
-    });
-
-    const registry_path = try f.ctrl.registryPath(index);
-    defer allocator.free(registry_path);
-    const before_registry = try readWholeFile(allocator, registry_path);
-    defer allocator.free(before_registry);
-
-    // The crash-and-restart.
-    try f.reopen();
-
-    const ring_idx: u16 = f.cfg.fronts;
-    try f.ctrl.initRing(ring_idx, 1);
-    defer f.ctrl.rings[ring_idx].deinit();
-    const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
-
-    var st: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&st);
-    defer f.ctrl.deinitIndexState(&st);
-
-    try recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], logger, index, host, &st);
-
-    // The walked head is the pair's state, and both post-snapshot records
-    // were replayed over the snapshot.
-    try std.testing.expectEqual(@as(u128, y + 2), st.state);
-    try std.testing.expectEqual(@as(usize, 4), st.sessions.count());
-    try std.testing.expect(st.sessions.get(0x10) != null);
-    try std.testing.expect(st.sessions.get(0x11) != null);
-    try std.testing.expect(st.sessions.get(y + 1) != null);
-    try std.testing.expect(st.sessions.get(y + 2) != null);
-
-    // The adoption on restart finished the migration: the pair area is the
-    // temp ring's chain and the mark is gone.
-    const pair = wal.areaIndex(host, index, f.cfg.wal.hosts());
-    try std.testing.expectEqual(@as(u128, y + 2), f.ctrl.wal_writers[pair].?.head);
-    const stride = f.ctrl.wal_area_stride;
-    const pair_bytes = f.ctrl.wal_battery.?[pair * stride ..][0..stride];
-    const temp_bytes = f.ctrl.wal_battery.?[wal.tempAreaIdx(0, f.ctrl.wal_pairs) * stride ..][0..stride];
-    try std.testing.expectEqualSlices(u8, temp_bytes, pair_bytes);
-    try std.testing.expectEqual(
-        @as(u8, 0),
-        wal.controlLineOf(pair_bytes, f.cfg.wal.buffers(), f.cfg.wal.lba()).snapshot_in_progress,
-    );
-
-    // The registry's compaction holds and recovery leaves it whole.
-    const entries = (try f.ctrl.loadRegistry(index)).?;
-    defer f.ctrl.freeRegistry(entries);
-    try std.testing.expectEqual(@as(usize, 3), entries.len);
-    try std.testing.expectEqual(y, lifetime.Controller.lastLineFor(entries, host).?.state);
-
-    const after_registry = try readWholeFile(allocator, registry_path);
-    defer allocator.free(after_registry);
-    try std.testing.expectEqualSlices(u8, before_registry, after_registry);
-}
-
-test "plain mode corrects an empty new WAL's tag with the registry's state" {
-    const allocator = std.testing.allocator;
-
-    var f: StartupPlain = undefined;
-    try f.init();
-    defer f.deinit();
-
-    const host: u8 = 0;
-    const index: u16 = 0;
-    const x: u128 = 0x10;
-    const y: u128 = 0x20;
-
-    try f.ctrl.ensureIndexDir(index);
-    const dir = try f.ctrl.indexDirPath(index);
-    defer allocator.free(dir);
-
-    // An empty snapshot, and the empty new WAL named `X`: the walk returns
-    // `X`, and the line's state `Y` corrects it.
-    var empty: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&empty);
-    defer f.ctrl.deinitIndexState(&empty);
-    var dump: std.ArrayList(u8) = .empty;
-    defer dump.deinit(allocator);
-    try f.ctrl.dumpIndexState(&empty, &dump);
-
-    const snapshot_path = try wal.snapshotPath(allocator, dir, host, index, x);
-    defer allocator.free(snapshot_path);
-    try writeFileBytes(snapshot_path, dump.items);
-
-    const wal_path = try wal.walPath(allocator, dir, host, index, x);
-    defer allocator.free(wal_path);
-    const created = try createWalFile(wal_path);
-    _ = std.os.linux.close(created);
-
-    try f.ctrl.rewriteRegistry(index, .{
-        .host_idx = host,
-        .snapshot_path = snapshot_path,
-        .wal_path = wal_path,
-        .state = y,
-    });
-
-    const ring_idx: u16 = f.cfg.fronts;
-    try f.ctrl.initRing(ring_idx, 1);
-    defer f.ctrl.rings[ring_idx].deinit();
-    const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
-
-    var st: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&st);
-    defer f.ctrl.deinitIndexState(&st);
-
-    try recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], logger, index, host, &st);
-
-    try std.testing.expectEqual(y, st.state);
-    try std.testing.expectEqual(@as(usize, 0), st.sessions.count());
-    const pair = wal.areaIndex(host, index, f.cfg.wal.hosts());
-    try std.testing.expectEqual(y, f.ctrl.wal_writers[pair].?.head);
-}
-
-test "startup recovery re-captures the stream window after the landing handshake" {
-    var f: StartupPlain = undefined;
-    try f.init();
-    defer f.deinit();
-
-    const ring_idx: u16 = f.cfg.fronts;
-    try f.ctrl.initRing(ring_idx, 1);
-    defer f.ctrl.rings[ring_idx].deinit();
-    const ring = &f.ctrl.rings[ring_idx];
-
-    try std.testing.expectEqual(ring.ring.sq_tail.*, ring.sqstream.tail);
-
-    // The INITIALIZED report: a direct submission that moves the ring's tail
-    // past the window captured at ring creation.
-    try ring.ring.pushMsgRingFd(ring.ring.fd, messages.StartWorkIdx, 0, .{});
-    try std.testing.expect(ring.sqstream.tail != ring.ring.sq_tail.*);
-
-    var st: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&st);
-    defer f.ctrl.deinitIndexState(&st);
-
-    const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
-
-    // No registry: the pair starts empty, and the recovery's first act is the
-    // re-capture the later replay and the loop's flushes rely on.
-    try recoverPair(&f.ctrl, ring, logger, 0, 0, &st);
-
-    try std.testing.expectEqual(ring.ring.sq_tail.*, ring.sqstream.tail);
-}
-
-test "startup with an absent registry starts the pair empty" {
-    var f: StartupPlain = undefined;
-    try f.init();
-    defer f.deinit();
-
-    var st: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&st);
-    defer f.ctrl.deinitIndexState(&st);
-    st.state = 0x55;
-
-    const ring_idx: u16 = f.cfg.fronts;
-    try f.ctrl.initRing(ring_idx, 1);
-    defer f.ctrl.rings[ring_idx].deinit();
-    const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
-
-    try recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], logger, 0, 0, &st);
-
-    // State 0, no writer: startup does not scan (§7.3).
-    try std.testing.expectEqual(@as(u128, 0), st.state);
-    try std.testing.expectEqual(@as(usize, 0), st.sessions.count());
-    try std.testing.expect(f.ctrl.wal_writers[0] == null);
-}
-
-test "startup's corrupt registry line is a returned fatality" {
-    var f: StartupPlain = undefined;
-    try f.init();
-    defer f.deinit();
-
-    try f.ctrl.ensureIndexDir(0);
-    const registry_path = try f.ctrl.registryPath(0);
-    defer std.testing.allocator.free(registry_path);
-    try writeFileBytes(registry_path, "not json at all\n");
-
-    var st: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&st);
-    defer f.ctrl.deinitIndexState(&st);
-
-    const ring_idx: u16 = f.cfg.fronts;
-    try f.ctrl.initRing(ring_idx, 1);
-    defer f.ctrl.rings[ring_idx].deinit();
-    const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
-
-    try std.testing.expectError(
-        error.RegistryCorrupt,
-        recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], logger, 0, 0, &st),
-    );
-}
-
-test "startup surfaces a missing WAL file raw" {
-    var f: StartupPlain = undefined;
-    try f.init();
-    defer f.deinit();
-
-    const host: u8 = 0;
-    const index: u16 = 0;
-    try f.ctrl.ensureIndexDir(index);
-    const dir = try f.ctrl.indexDirPath(index);
-    defer std.testing.allocator.free(dir);
-
-    var empty: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&empty);
-    defer f.ctrl.deinitIndexState(&empty);
-    var dump: std.ArrayList(u8) = .empty;
-    defer dump.deinit(std.testing.allocator);
-    try f.ctrl.dumpIndexState(&empty, &dump);
-
-    const snapshot_path = try wal.snapshotPath(std.testing.allocator, dir, host, index, 0x10);
-    defer std.testing.allocator.free(snapshot_path);
-    try writeFileBytes(snapshot_path, dump.items);
-
-    // The line names a WAL that was never created: the raw open error is the
-    // startup fatality, never a repair.
-    const wal_path = try wal.walPath(std.testing.allocator, dir, host, index, 0x10);
-    defer std.testing.allocator.free(wal_path);
-    try f.ctrl.rewriteRegistry(index, .{
-        .host_idx = host,
-        .snapshot_path = snapshot_path,
-        .wal_path = wal_path,
-        .state = 0x20,
-    });
-
-    var st: state.IndexState = undefined;
-    try f.ctrl.initIndexState(&st);
-    defer f.ctrl.deinitIndexState(&st);
-
-    const ring_idx: u16 = f.cfg.fronts;
-    try f.ctrl.initRing(ring_idx, 1);
-    defer f.ctrl.rings[ring_idx].deinit();
-    const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
-
-    try std.testing.expectError(
-        error.FileNotFound,
-        recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], logger, index, host, &st),
-    );
-}
-
 // ============================================================================
 // Stage J: the end-to-end gate and the PMEM-shape crash matrix
 // ============================================================================
@@ -3040,7 +1315,7 @@ test "startup surfaces a missing WAL file raw" {
 /// none parked: the standalone pair writer's version of the window drain.
 fn drainWriterQuiet(frame: *Frame, writer: *wal.WalWriteFile) void {
     while (writer.flush_in_flight or writer.flush_pending) {
-        retryParkedFlush(writer);
+        if (writer.flush_pending and !writer.flush_in_flight) writer.driveFlush();
         if (frame.ring.ring.popCQE()) |cqe| {
             stepCQE(frame, cqe);
             continue;
@@ -3084,12 +1359,20 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
     const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
     defer allocator.free(dir);
 
-    // The barrier is tiny, so the first records fire the tick; the interval is
-    // irrelevant because the test calls `tickPass` directly.
-    var cfg = testConfig(dir, 1, 1, .{ .size_barrier = 1, .interval_s = 3600, .slots = 2, .registry_keep = 8 });
+    // The barrier is 1 MiB, so the two large records below fire the tick; the
+    // interval is irrelevant because the test calls `tickPass` directly.
+    var cfg = testConfig(dir, 1, 1, .{ .size_barrier = config.mib(1), .interval = config.seconds(3600), .slots = 2, .registry_keep = 8 });
+    cfg.wal = .{ .plain = .{ .dir = dir, .buffers = 2048, .hosts = 1, .lba = config.kib(1) } };
     const states = [_]u128{ 0x101, 0x102, 0x103, 0x104, 0x105 };
     const old_tag: u128 = 0x100;
     const elephant_ring: u16 = cfg.fronts + cfg.indexes;
+
+    // 19 framing bytes plus a 600 KiB payload fills exactly 600 one-KiB
+    // buffers, so the record ends on a buffer boundary and is durable at once.
+    const big_op_len: usize = 600 * 1024 - 19;
+    const op = try allocator.alloc(u8, big_op_len);
+    defer allocator.free(op);
+    for (op, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% 1);
 
     var saved_wal: ?[:0]u8 = null;
     var saved_snapshot: ?[:0]u8 = null;
@@ -3113,6 +1396,8 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         const logger = try ctrl.getLogger(1);
         defer dropTestLogger(&ctrl, logger);
 
+        var el = snapshot.Elephant{ .ctrl = &ctrl, .log = &logger.logger, .ring_idx = elephant_ring };
+
         var sets = [_]state.IndexState{undefined};
         try ctrl.initIndexState(&sets[0]);
         defer ctrl.deinitIndexState(&sets[0]);
@@ -3125,33 +1410,28 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         var frame = testFrame(&ctrl, 1, logger, &sets);
         const slots_full = ctrl.snapshot_slots.freeCount();
 
-        var ops: [states.len][e2e_op_len]u8 = undefined;
-        for (&ops, 0..) |*op, i| {
-            for (op, 0..) |*byte, j| byte.* = @truncate(j *% 17 +% i *% 11 +% 1);
-        }
-
-        // Two records before the tick.
+        // Two records before the tick; drain each so the next one has buffers.
         var i: usize = 0;
         while (i < 2) : (i += 1) {
-            try pair.write(states[i], pair.head, &ops[i]);
+            try pair.write(states[i], pair.head, op);
             sets[0].state = states[i];
-            try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = &ops[i] } });
+            try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = op } });
+            drainWriterQuiet(&frame, pair);
         }
-        drainWriterQuiet(&frame, pair);
         try testing.expectEqual(@as(u128, states[1]), sets[0].state);
 
         // The tick: the pair is over the barrier and its state is the tag X.
-        tickPass(&frame);
-        const job = frame.procedure orelse return error.SnapshotNotStarted;
+        frame.snap.onTick(frame.host());
+        const job = frame.snap.procedure orelse return error.SnapshotNotStarted;
         var job_live = true;
         defer if (job_live) dropTestJob(&ctrl, job);
         try testing.expectEqual(@as(u128, states[1]), job.tag);
 
         // The pair keeps serving between the tick and the create reply: the
         // clone state Y is ahead of the name tag X.
-        try pair.write(states[2], pair.head, &ops[2]);
+        try pair.write(states[2], pair.head, op);
         sets[0].state = states[2];
-        try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = &ops[2] } });
+        try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = op } });
         drainWriterQuiet(&frame, pair);
 
         // F1, the real handler: the create request's slot is released on read.
@@ -3161,7 +1441,7 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         const create_slot: u32 = @intCast(create_cqe.res);
         try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(create_slot).SnapshotCreate.job);
         ctrl.cross_slots.release(create_slot);
-        elephant.createSnapshot(&ctrl, job, &logger.logger);
+        el.createSnapshot(job);
         saved_wal = try allocator.dupeSentinel(u8, job.wal_path, 0);
         saved_snapshot = try allocator.dupeSentinel(u8, job.snapshot_path, 0);
         saved_k = job.k;
@@ -3171,12 +1451,12 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         const fd_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotReplyTimeout;
         stepCQE(&frame, fd_cqe);
-        const window = &(frame.window orelse return error.SnapshotWindowMissing);
+        const window = &(frame.snap.window orelse return error.SnapshotWindowMissing);
         try testing.expectEqual(@as(u128, states[2]), job.clone.state);
 
         // One window event: new first, then old, both through the ring.
-        try window.write(states[3], &ops[3]);
-        drainUntilQuiet(&frame);
+        try window.write(states[3], op);
+        pumpWindow(&frame);
         try testing.expect(window.quiet());
         try testing.expectEqual(@as(u128, states[3]), window.new.head);
         try testing.expectEqual(@as(u128, states[3]), window.old.head);
@@ -3187,14 +1467,15 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         const dump_slot: u32 = @intCast(dump_cqe.res);
         try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(dump_slot).SnapshotDump.job);
         ctrl.cross_slots.release(dump_slot);
-        elephant.dumpSnapshot(&ctrl, job, &logger.logger, elephant_ring);
+        el.dumpSnapshot(job);
 
         // The completion: the drain, the copy, the clear, the revival and the
         // close dispatch.
         const dumped_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotReplyTimeout;
         stepCQE(&frame, dumped_cqe);
-        try testing.expect(frame.window == null);
+        pumpWindow(&frame);
+        try testing.expect(frame.snap.window == null);
         try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
 
         // F3, the real handler: the old fd's close and the terminal reply.
@@ -3203,13 +1484,13 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         const close_slot: u32 = @intCast(close_cqe.res);
         try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(close_slot).SnapshotClose.job);
         ctrl.cross_slots.release(close_slot);
-        elephant.closeSnapshot(&ctrl, job, &logger.logger);
+        el.closeSnapshot(job);
         job_live = false;
 
         const done_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotReplyTimeout;
         stepCQE(&frame, done_cqe);
-        try testing.expect(frame.procedure == null);
+        try testing.expect(frame.snap.procedure == null);
 
         // The registry holds exactly one line: the new WAL and snapshot, with
         // the clone state Y.
@@ -3229,7 +1510,7 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
 
         // The snapshot loads and equals the pair at clone time: the three
         // sessions written before the window's event.
-        const snapshot_bytes = try readWholeFile(allocator, saved_snapshot.?);
+        const snapshot_bytes = try readFileBytes(allocator, saved_snapshot.?);
         defer allocator.free(snapshot_bytes);
         var loaded = try ctrl.loadIndexState(snapshot_bytes);
         defer ctrl.deinitIndexState(&loaded);
@@ -3248,7 +1529,7 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
 
         // The new writer serves further writes: the floor chains from the
         // window's head.
-        try registered.write(states[4], registered.head, &ops[4]);
+        try registered.write(states[4], registered.head, op);
         drainWriterQuiet(&frame, registered);
         try testing.expectEqual(@as(u128, states[4]), registered.head);
 
@@ -3274,7 +1555,7 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         try ctrl.initIndexState(&st);
         defer ctrl.deinitIndexState(&st);
 
-        try recoverPair(&ctrl, &ctrl.rings[1], logger, 0, 0, &st);
+        try snapshot.recoverPair(&ctrl, &ctrl.rings[1], &logger.logger, 0, 0, &st);
 
         try testing.expectEqual(@as(u128, states[4]), st.state);
         try testing.expectEqual(@as(usize, 5), st.sessions.count());
@@ -3516,7 +1797,7 @@ fn runJ2Row(row: J2Row) !void {
     try f.ctrl.initIndexState(&st);
     defer f.ctrl.deinitIndexState(&st);
 
-    try recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], logger, index, host, &st);
+    try snapshot.recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], &logger.logger, index, host, &st);
 
     // Every row converges on the same recovered state: the same sessions and
     // the same walked head, by whichever branch.
@@ -3607,7 +1888,7 @@ test "startup's bring-tail recovers the inter-write cut's surplus record" {
     try f.ctrl.initIndexState(&st);
     defer f.ctrl.deinitIndexState(&st);
 
-    try recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], logger, index, host, &st);
+    try snapshot.recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], &logger.logger, index, host, &st);
 
     // The surplus is home: the old chain replays it, once, after the abort.
     try std.testing.expectEqual(@as(u128, 0x17), st.state);
@@ -3657,44 +1938,47 @@ test "the freeze ladder drains the window, revives at the swap and stops on rela
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.procedure = job;
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
+    frame.snap.procedure = job;
+    frame.snap.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
     try ctrl.publishAdoptionMark(0, 0, k, 0x100);
 
-    var op = j2Op(0x101);
-    try frame.window.?.write(0x101, &op);
+    var op: [1006]u8 = undefined;
+    for (&op, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% 1);
+    try frame.snap.window.?.write(0x101, &op);
     try testing.expect(old.flush_in_flight and new.flush_in_flight);
 
     // The old side faults mid-window: the front freezes, the window serves on.
     old.faulted = true;
-    onWriterFault(old, &frame);
-    try testing.expectEqual(WalServe.frozen, frame.wal_serve);
+    frame.snap.onWriterFault(frame.host(), old);
+    try testing.expectEqual(snapshot.Serve.frozen, frame.snap.serve);
 
     // The completion pass's bounded drain steps the real flushes before the
     // copy; the swap retires the faulted writer and revives the front.
-    snapshotDumpedPass(&frame);
-    try testing.expect(frame.window == null);
-    try testing.expectEqual(WalServe.serving, frame.wal_serve);
+    frame.snap.onReply(frame.host(), .{ .SnapshotDumped = .{} });
+    pumpWindow(&frame);
+    try testing.expect(frame.snap.window == null);
+    try testing.expectEqual(snapshot.Serve.serving, frame.snap.serve);
     try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
 
+    var el = snapshot.Elephant{ .ctrl = &ctrl, .log = &logger.logger, .ring_idx = 2 };
     const close_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotDispatchTimeout;
     const close_slot: u32 = @intCast(close_cqe.res);
     try testing.expectEqual(@intFromPtr(job), ctrl.cross_slots.at(close_slot).SnapshotClose.job);
     ctrl.cross_slots.release(close_slot);
-    elephant.closeSnapshot(&ctrl, job, &logger.logger);
+    el.closeSnapshot(job);
     job_live = false;
 
     const done_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotReplyTimeout;
     stepCQE(&frame, done_cqe);
-    try testing.expect(frame.procedure == null);
+    try testing.expect(frame.snap.procedure == null);
 
     // A relapse after the swap finds no window and stops terminally.
     const live = ctrl.wal_writers[0].?;
     live.faulted = true;
-    onWriterFault(live, &frame);
-    try testing.expectEqual(WalServe.stopped, frame.wal_serve);
+    frame.snap.onWriterFault(frame.host(), live);
+    try testing.expectEqual(snapshot.Serve.stopped, frame.snap.serve);
 }
 
 test "a stop mid-window completes the procedure on the control plane" {
@@ -3734,36 +2018,38 @@ test "a stop mid-window completes the procedure on the control plane" {
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
-    frame.procedure = job;
-    frame.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
+    frame.snap.procedure = job;
+    frame.snap.window = .{ .new = new, .old = old, .allocator = ctrl.allocator };
     try ctrl.publishAdoptionMark(0, 0, k, 0x100);
 
     var op = j2Op(0x101);
-    try frame.window.?.write(0x101, &op);
+    try frame.snap.window.?.write(0x101, &op);
 
     // A new-side flush fault is the ordinary terminal stop; ticks skip the
     // thread, but the procedure still completes on the control plane (rung 10).
     new.faulted = true;
-    onWriterFault(new, &frame);
-    try testing.expectEqual(WalServe.stopped, frame.wal_serve);
+    frame.snap.onWriterFault(frame.host(), new);
+    try testing.expectEqual(snapshot.Serve.stopped, frame.snap.serve);
 
-    snapshotDumpedPass(&frame);
-    try testing.expect(frame.window == null);
+    frame.snap.onReply(frame.host(), .{ .SnapshotDumped = .{} });
+    pumpWindow(&frame);
+    try testing.expect(frame.snap.window == null);
     try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
 
     // The final close lands and the terminal reply clears the flag. The stop
     // stands: no swap revives a stopped thread.
+    var el = snapshot.Elephant{ .ctrl = &ctrl, .log = &logger.logger, .ring_idx = 2 };
     const close_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotDispatchTimeout;
     ctrl.cross_slots.release(@intCast(close_cqe.res));
-    elephant.closeSnapshot(&ctrl, job, &logger.logger);
+    el.closeSnapshot(job);
     job_live = false;
 
     const done_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotReplyTimeout;
     stepCQE(&frame, done_cqe);
-    try testing.expect(frame.procedure == null);
-    try testing.expectEqual(WalServe.stopped, frame.wal_serve);
+    try testing.expect(frame.snap.procedure == null);
+    try testing.expectEqual(snapshot.Serve.stopped, frame.snap.serve);
 }
 
 test "a failed registry rename leaves the old line winning and recovery-correct" {
@@ -3775,10 +2061,18 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
     const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
     defer allocator.free(dir);
 
-    var cfg = testConfig(dir, 1, 1, .{ .size_barrier = 1, .interval_s = 3600, .slots = 2, .registry_keep = 8 });
+    var cfg = testConfig(dir, 1, 1, .{ .size_barrier = config.mib(1), .interval = config.seconds(3600), .slots = 2, .registry_keep = 8 });
+    cfg.wal = .{ .plain = .{ .dir = dir, .buffers = 2048, .hosts = 1, .lba = config.kib(1) } };
     const old_tag: u128 = 0x100;
     const states = [_]u128{ 0x101, 0x102, 0x103, 0x104 };
     const elephant_ring: u16 = cfg.fronts + cfg.indexes;
+
+    // 19 framing bytes plus a 600 KiB payload fills exactly 600 one-KiB
+    // buffers, so the record ends on a buffer boundary and is durable at once.
+    const big_op_len: usize = 600 * 1024 - 19;
+    const op = try allocator.alloc(u8, big_op_len);
+    defer allocator.free(op);
+    for (op, 0..) |*byte, i| byte.* = @truncate(i *% 13 +% 3);
 
     var old_wal_path: ?[:0]u8 = null;
     var fixed_registry: ?[]u8 = null;
@@ -3798,6 +2092,8 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
 
         const logger = try ctrl.getLogger(1);
         defer dropTestLogger(&ctrl, logger);
+
+        var el = snapshot.Elephant{ .ctrl = &ctrl, .log = &logger.logger, .ring_idx = elephant_ring };
 
         var sets = [_]state.IndexState{undefined};
         try ctrl.initIndexState(&sets[0]);
@@ -3821,70 +2117,69 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
         });
         const registry_path = try ctrl.registryPath(0);
         defer allocator.free(registry_path);
-        fixed_registry = try readWholeFile(allocator, registry_path);
+        fixed_registry = try readFileBytes(allocator, registry_path);
 
         var frame = testFrame(&ctrl, 1, logger, &sets);
-        var ops: [states.len][j2_op_len]u8 = undefined;
-        for (&ops, 0..) |*op, i| op.* = j2Op(states[i]);
 
         var i: usize = 0;
         while (i < 2) : (i += 1) {
-            try pair.write(states[i], pair.head, &ops[i]);
+            try pair.write(states[i], pair.head, op);
             sets[0].state = states[i];
-            try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = &ops[i] } });
+            try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = op } });
+            drainWriterQuiet(&frame, pair);
         }
-        drainWriterQuiet(&frame, pair);
 
-        tickPass(&frame);
-        const job = frame.procedure orelse return error.SnapshotNotStarted;
+        frame.snap.onTick(frame.host());
+        const job = frame.snap.procedure orelse return error.SnapshotNotStarted;
         var job_live = true;
         defer if (job_live) dropTestJob(&ctrl, job);
 
-        try pair.write(states[2], pair.head, &ops[2]);
+        try pair.write(states[2], pair.head, op);
         sets[0].state = states[2];
-        try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = &ops[2] } });
+        try ctrl.applyIndexOp(&sets[0], .{ .create = .{ .compensator = "marker", .payload = op } });
         drainWriterQuiet(&frame, pair);
 
         const create_cqe = cqeBefore(&ctrl.rings[elephant_ring].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotDispatchTimeout;
         ctrl.cross_slots.release(@intCast(create_cqe.res));
-        elephant.createSnapshot(&ctrl, job, &logger.logger);
+        el.createSnapshot(job);
 
         const fd_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotReplyTimeout;
         stepCQE(&frame, fd_cqe);
 
-        try frame.window.?.write(states[3], &ops[3]);
-        drainUntilQuiet(&frame);
+        try frame.snap.window.?.write(states[3], op);
+        pumpWindow(&frame);
 
         // The rewrite's pending write succeeds; the rename is where it fails.
         ctrl.test_fail_registry_rename = true;
         const dump_cqe = cqeBefore(&ctrl.rings[elephant_ring].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotDispatchTimeout;
         ctrl.cross_slots.release(@intCast(dump_cqe.res));
-        elephant.dumpSnapshot(&ctrl, job, &logger.logger, elephant_ring);
+        el.dumpSnapshot(job);
         ctrl.test_fail_registry_rename = false;
 
         const abandon_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotReplyTimeout;
         stepCQE(&frame, abandon_cqe);
+        pumpWindow(&frame);
 
         // Unwind B: the window reverts, the new writer closes and cleanup is
         // dispatched. The committed line never changed.
-        try testing.expect(frame.window == null);
+        try testing.expect(frame.snap.window == null);
         try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
         try testing.expect(pairControlLine(&ctrl).snapshot_in_progress == 0);
 
         const cleanup_cqe = cqeBefore(&ctrl.rings[elephant_ring].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotDispatchTimeout;
         ctrl.cross_slots.release(@intCast(cleanup_cqe.res));
-        elephant.cleanupSnapshot(&ctrl, job, &logger.logger);
+        el.cleanupSnapshot(job);
         job_live = false;
 
         const done_cqe = cqeBefore(&ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
             return error.SnapshotReplyTimeout;
         stepCQE(&frame, done_cqe);
-        try testing.expect(frame.procedure == null);
+        try testing.expect(frame.snap.procedure == null);
 
         // The pending staging file is junk; the fixed registry still carries
         // the old line, byte for byte.
@@ -3893,7 +2188,7 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
         try testing.expect(fileExists(pending));
         const after_registry_path = try ctrl.registryPath(0);
         defer allocator.free(after_registry_path);
-        const after = try readWholeFile(allocator, after_registry_path);
+        const after = try readFileBytes(allocator, after_registry_path);
         defer allocator.free(after);
         try testing.expectEqualSlices(u8, fixed_registry.?, after);
         try testing.expect(fileExists(old_wal_path.?));
@@ -3916,12 +2211,17 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
         try ctrl.initIndexState(&st);
         defer ctrl.deinitIndexState(&st);
 
-        try recoverPair(&ctrl, &ctrl.rings[1], logger, 0, 0, &st);
+        try snapshot.recoverPair(&ctrl, &ctrl.rings[1], &logger.logger, 0, 0, &st);
 
         try testing.expectEqual(@as(u128, states[3]), st.state);
         try testing.expectEqual(states.len, st.sessions.count());
-        var reference = try j2State(&ctrl, &states);
+        var reference: state.IndexState = undefined;
+        try ctrl.initIndexState(&reference);
         defer ctrl.deinitIndexState(&reference);
+        for (states) |s| {
+            reference.state = s;
+            try ctrl.applyIndexOp(&reference, .{ .create = .{ .compensator = "marker", .payload = op } });
+        }
         try expectSameSessions(&reference, &st);
     }
 }

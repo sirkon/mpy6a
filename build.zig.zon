@@ -55,6 +55,10 @@
             .url = "git+https://github.com/sirkon/siggy.git?ref=master#9933fec6d2088d57e01e3c067e95eef53b96e705",
             .hash = "siggy-0.0.1-l6MsrVPmAQBaNqWUpgEuaYcIrGcNGOX14dqVlEYoHeK0",
         },
+        .zunit = .{
+            .url = "git+https://github.com/sirkon/zunit.git?ref=master#6b6c5c7839fa9735c64e2622a06717bd64c04fc4",
+            .hash = "zunit-0.0.1-aF7PyI70AAAP7dw3HCIiJW8zZtL_2SBxtFMbd8dG50Ef",
+        },
     },
     .paths = .{
         "build.zig",

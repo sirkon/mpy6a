@@ -261,7 +261,7 @@ fn waitForInitialized(ctrl: *lifetime.Controller, total: u16, reported: *[max_th
     // A one-shot multishot timer is the portable deadline: `pushTimeout` with
     // a zero `len` is rejected by the kernel in this zigring version.
     ctrl.init_deadline_spec = .{
-        .sec = ctrl.cfg.init_timeout_sec,
+        .sec = @intCast(@divExact(ctrl.cfg.init_timeout.value(), std.time.ns_per_s)),
         .nsec = 0,
     };
     try ctrl.init_ring.ring.pushTicker(messages.InitTimeoutIdx, &ctrl.init_deadline_spec, 1, .{});
@@ -339,7 +339,7 @@ fn shutdown(ctrl: *lifetime.Controller, total: u16) !void {
     var stopped: [max_threads]bool = @splat(false);
     var done: u16 = 0;
     var ticks: u32 = 0;
-    const max_ticks = ctrl.cfg.shutdown_timeout_sec * 2;
+    const max_ticks: u32 = @intCast(@divExact(ctrl.cfg.shutdown_timeout.value(), 500 * std.time.ns_per_ms));
 
     while (done < expected) {
         const cqe = waitOne(&ctrl.init_ring.ring);
@@ -399,7 +399,7 @@ const StopFixture = struct {
             .logging = .{
                 .method = .{ .json = {} },
                 .pool_capacity = 64,
-                .pool_frame_size = 1024,
+                .pool_frame_size = config.bytes(1024),
             },
         };
         try self.ctrl.init(std.testing.allocator, &self.cfg);

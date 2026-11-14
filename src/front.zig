@@ -110,7 +110,7 @@ fn handleCqe(ctx: *Ctx, cqe: zigring.CQE) bool {
         if (!ctx.draining) return false;
         ctx.ticks += 1;
         const elapsed = zigring.monotonicNs() - ctx.shutdown_start_ns;
-        const deadline = @as(u64, ctx.ctrl.cfg.shutdown_timeout_sec) * std.time.ns_per_s;
+        const deadline: u64 = @intCast(ctx.ctrl.cfg.shutdown_timeout.value());
         if (elapsed >= deadline and !ctx.escalated) {
             ctx.escalated = true;
             escalateShutdown(ctx);

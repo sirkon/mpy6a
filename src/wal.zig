@@ -2129,18 +2129,18 @@ test "the area stride hosts a control line after the header array" {
 
 test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 512 } };
-    const stride = areaStride(4, 512, page);
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(1) } };
+    const stride = areaStride(4, 1024, page);
 
     const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
     defer closeBattery(testing.allocator, wal_cfg, bytes, page);
 
-    const area = Area.init(bytes, 4, 512);
+    const area = Area.init(bytes, 4, 1024);
 
     // A used ring from a previous procedure: stale lines and a live mark.
     @memset(std.mem.sliceAsBytes(area.headers), 0xFF);
     @memset(area.data, 0x5A);
-    controlLineOf(bytes, 4, 512).* = .{
+    controlLineOf(bytes, 4, 1024).* = .{
         .data_len = 0,
         .flags = 0,
         .buffer_seq = 9,
@@ -2152,10 +2152,10 @@ test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
         ._pad_tail = @splat(0),
     };
 
-    mintArea(bytes, 4, 512, 0x777, false);
+    mintArea(bytes, 4, 1024, 0x777, false);
 
     for (0..4) |ordinal| {
-        switch (walkVerdict(&area.headers[ordinal], ordinal, 512)) {
+        switch (walkVerdict(&area.headers[ordinal], ordinal, 1024)) {
             .terminator => try testing.expectEqual(@as(usize, 0), ordinal),
             .stale => {},
             else => return error.TestUnexpectedResult,
@@ -2168,7 +2168,7 @@ test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
     try testing.expectEqual(@as(u32, 0), header.crc_running);
     try testing.expectEqual(@as(u128, 0x777), header.last_state);
     try testing.expectEqual(@as(u128, 0), header.target_state);
-    try testing.expectEqual(@as(u8, 0), controlLineOf(bytes, 4, 512).snapshot_in_progress);
+    try testing.expectEqual(@as(u8, 0), controlLineOf(bytes, 4, 1024).snapshot_in_progress);
     // The data array is not zeroed: stale bytes hide behind stale headers.
     try testing.expectEqual(@as(u8, 0x5A), area.data[0]);
 
@@ -2178,10 +2178,10 @@ test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
     try writer.write(0x778, 0x777, &data);
     try testing.expectEqual(@as(u64, 0), area.headers[0].buffer_seq);
 
-    mintArea(bytes, 4, 512, 0x800, false);
+    mintArea(bytes, 4, 1024, 0x800, false);
     try testing.expectEqual(@as(u128, 0x800), area.headers[0].last_state);
     for (0..4) |ordinal| {
-        switch (walkVerdict(&area.headers[ordinal], ordinal, 512)) {
+        switch (walkVerdict(&area.headers[ordinal], ordinal, 1024)) {
             .terminator => try testing.expectEqual(@as(usize, 0), ordinal),
             .stale => {},
             else => return error.TestUnexpectedResult,
@@ -2191,19 +2191,19 @@ test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
 
 test "the walk never reaches the temp section" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 512 } };
-    const stride = areaStride(4, 512, page);
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(1) } };
+    const stride = areaStride(4, 1024, page);
 
     // Two areas: a minted pair area, then a temp ring carrying a chain that
     // would look continuable if the walk crossed the area boundary.
     const bytes = try openBattery(testing.allocator, wal_cfg, 2, stride, page);
     defer closeBattery(testing.allocator, wal_cfg, bytes, page);
 
-    mintArea(bytes[0..stride], 4, 512, 0x10, false);
-    const temp = Area.init(bytes[stride..][0..stride], 4, 512);
+    mintArea(bytes[0..stride], 4, 1024, 0x10, false);
+    const temp = Area.init(bytes[stride..][0..stride], 4, 1024);
     for (temp.headers, 0..) |*header, ordinal| {
         header.* = .{
-            .data_len = 512,
+            .data_len = 1024,
             .flags = FLAG_FILLED,
             .buffer_seq = ordinal,
             .crc_running = 0,
@@ -2215,7 +2215,7 @@ test "the walk never reaches the temp section" {
         };
     }
 
-    const pair_area = Area.init(bytes[0..stride], 4, 512);
+    const pair_area = Area.init(bytes[0..stride], 4, 1024);
     const reader = WalReadFile.init(-1, wal_cfg, pair_area, 0, 0, 0x10);
     // The pair's stream ends at its own terminator; the temp ring behind it is
     // reached only through a writer wired to it or the adoption mark.
@@ -2224,7 +2224,7 @@ test "the walk never reaches the temp section" {
 
 test "a plain battery is allocated zeroed and carved by stride" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 4096 } };
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(4) } };
     const pairs: usize = 3;
     const stride = areaStride(4, 4096, page);
 
@@ -2250,7 +2250,7 @@ test "a plain battery is allocated zeroed and carved by stride" {
 
 test "a header publish overwrites the whole control line" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 4096 } };
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(4) } };
     const stride = areaStride(4, 4096, page);
 
     const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
@@ -2305,16 +2305,16 @@ test "the control line keeps its pinned layout with the adoption fields" {
 
 test "a fresh writer chains from its tag" {
     const page = std.heap.pageSize();
-    const plain: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 512 } };
-    const pmem: config.Wal = .{ .pmem = .{ .dir = "wal", .device = "/dev/dax0.0", .buffers = 4, .lba = 512 } };
-    const stride = areaStride(4, 512, page);
+    const plain: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(1) } };
+    const pmem: config.Wal = .{ .pmem = .{ .dir = "wal", .device = "/dev/dax0.0", .buffers = 4, .lba = config.kib(1) } };
+    const stride = areaStride(4, 1024, page);
 
     // The area's shape does not depend on the mode, so one plain allocation
     // serves the field wiring of both.
     const bytes = try openBattery(testing.allocator, plain, 1, stride, page);
     defer closeBattery(testing.allocator, plain, bytes, page);
 
-    const area = Area.init(bytes, 4, 512);
+    const area = Area.init(bytes, 4, 1024);
     const writer = WalWriteFile.init(-1, area, plain, 1, 2, 0xAA);
     try testing.expectEqual(@as(u128, 0xAA), writer.tag);
     try testing.expectEqual(@as(u128, 0xAA), writer.head);
@@ -2328,13 +2328,13 @@ test "a fresh writer chains from its tag" {
 
 test "the admission guards refuse without moving anything" {
     const page = std.heap.pageSize();
-    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = 512 } };
-    const stride = areaStride(4, 512, page);
+    const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(1) } };
+    const stride = areaStride(4, 1024, page);
 
     const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
     defer closeBattery(testing.allocator, wal_cfg, bytes, page);
 
-    var writer = WalWriteFile.init(-1, Area.init(bytes, 4, 512), wal_cfg, 0, 0, 0x10);
+    var writer = WalWriteFile.init(-1, Area.init(bytes, 4, 1024), wal_cfg, 0, 0, 0x10);
     writer.publishTerminator(0, 0x10, 0);
     const before = writer.headers[0];
 
@@ -2374,9 +2374,12 @@ const Pair = struct {
     /// plan's §E1 seam read from the other side — with no writeback left, a
     /// PMEM battery of ordinary memory is just memory, so the same suite proves
     /// the mode adds nothing but the persistence.
+    ///
+    /// `lba` is raw bytes here: these tests cover internal geometry down to a
+    /// 512-byte LBA, which a config document can no longer express.
     fn acquire(buffers: u32, lba: u32, tag: u128) !Pair {
         if (barrier.enabled) {
-            const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = buffers, .lba = lba } };
+            const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = buffers, .lba = .{ .raw = lba } } };
             return acquireIn(wal_cfg, buffers, lba, tag);
         }
         return acquirePmem(buffers, lba, tag);
@@ -2386,13 +2389,13 @@ const Pair = struct {
     /// flushes with `RWF.DSYNC`, over a battery carved out of ordinary memory.
     fn acquirePmem(buffers: u32, lba: u32, tag: u128) !Pair {
         const wal_cfg: config.Wal = .{
-            .pmem = .{ .dir = "wal", .device = "wal", .buffers = buffers, .lba = lba },
+            .pmem = .{ .dir = "wal", .device = "wal", .buffers = buffers, .lba = .{ .raw = lba } },
         };
         return acquireIn(wal_cfg, buffers, lba, tag);
     }
 
     fn acquireIn(wal_cfg: config.Wal, buffers: u32, lba: u32, tag: u128) !Pair {
-        const battery_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = buffers, .lba = lba } };
+        const battery_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = buffers, .lba = .{ .raw = lba } } };
         const page = std.heap.pageSize();
         const stride = areaStride(buffers, lba, page);
         const bytes = try openBattery(testing.allocator, battery_cfg, 1, stride, page);
@@ -3977,7 +3980,7 @@ test "a plain reopen recovers its head from the file itself" {
 
     // A plain configuration even where the barrier module is live: that
     // battery is DRAM and gone, so the file is the only source.
-    const plain_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 8, .lba = 65536 } };
+    const plain_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 8, .lba = config.kib(64) } };
 
     var states: [46]u128 = undefined;
     try fillRecords(&synth, &states, 0x7000);
@@ -4022,7 +4025,7 @@ test "a plain reopen stops at the padding a crash left half written" {
     try synth.init(40, 65536, 0xA000, false);
     defer synth.deinit();
 
-    const plain_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 40, .lba = 65536 } };
+    const plain_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 40, .lba = config.kib(64) } };
 
     var op: [50000]u8 = undefined;
     recordOp(&op, 0xA001, 0);
@@ -4064,7 +4067,7 @@ test "a plain reopen drops the record straddling the flush frontier" {
     try synth.init(8, 65536, 0x8000, false);
     defer synth.deinit();
 
-    const plain_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 8, .lba = 65536 } };
+    const plain_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 8, .lba = config.kib(64) } };
 
     // Two records of 60000 op bytes: the first ends inside the first buffer,
     // the second straddles the frontier. Only whole buffers reach the file, so

@@ -77,92 +77,6 @@ pub const SnapshotJob = struct {
     snapshot_path: [:0]u8,
 };
 
-/// The window's write interface (designs/SNAPSHOTS.md §3.2 step 4, §5).
-///
-/// Every event is written **new first, then old**, and is complete — durable,
-/// replyable — only when both sides' flushes have covered it. `new` is the temp
-/// ring `k` writer the procedure adopted; `old` is the pair area's writer,
-/// which stays registered for the window's duration.
-pub const CompositeWriter = struct {
-    new: *wal.WalWriteFile,
-    old: *wal.WalWriteFile,
-    /// The completion queue: one entry per event both sides accepted, in write
-    /// order. Completed events leave from the head, so the list is a FIFO.
-    pending: std.ArrayList(PendingEvent) = .empty,
-    onComplete: ?*const fn (ctx: ?*anyopaque, end: u64) void = null,
-    on_complete_ctx: ?*anyopaque = null,
-    /// The side the last refused write refused on; `null` when it was
-    /// accepted. The index's refusal classifier reads it (§5): the old side's
-    /// refusal freezes the front, the new side's is the ordinary stop or a
-    /// protocol answer.
-    failed_side: ?Side = null,
-    /// Owns `pending` — the controller's allocator.
-    allocator: std.mem.Allocator,
-
-    const PendingEvent = struct { end_new: u64, end_old: u64 };
-
-    pub const Side = enum { new, old };
-
-    /// Appends one event: new first, then old (§3.2 step 4).
-    ///
-    /// The order is load-bearing: the new WAL is the committed future and the
-    /// old one the pre-commit fallback, so when the old side refuses the event
-    /// is already in the new file. Each side chains from its own head — both
-    /// sit at the clone state `Y` — and only an event both sides accepted is
-    /// queued, because only that event can ever be complete.
-    pub fn write(self: *CompositeWriter, new_state_idx: u128, data: []u8) wal.WalError!void {
-        self.failed_side = null;
-
-        self.new.write(new_state_idx, self.new.head, data) catch |err| {
-            self.failed_side = .new;
-            return err;
-        };
-        const end_new = self.new.trackedExtent();
-
-        self.old.write(new_state_idx, self.old.head, data) catch |err| {
-            self.failed_side = .old;
-            return err;
-        };
-        const end_old = self.old.trackedExtent();
-
-        try self.pending.append(self.allocator, .{ .end_new = end_new, .end_old = end_old });
-    }
-
-    /// Delivers every FIFO-head event both sides' flushes have covered (§5).
-    ///
-    /// `writer` names the side whose flush just completed; both frontiers are
-    /// consulted on every call, because an event is complete — durable,
-    /// replyable — only once **both** have reached it. Either single-side rule
-    /// would lose durable events in one of the two crash outcomes. `end` in
-    /// the callback is the completed event's pair-side end offset: the byte
-    /// after its last byte in the old file's extent.
-    pub fn noteFlush(self: *CompositeWriter, writer: *wal.WalWriteFile) void {
-        std.debug.assert(writer == self.new or writer == self.old);
-        const new_limit = self.new.flushed_upto * self.new.lba;
-        const old_limit = self.old.flushed_upto * self.old.lba;
-
-        var complete: usize = 0;
-        while (complete < self.pending.items.len) : (complete += 1) {
-            const event = self.pending.items[complete];
-            if (event.end_new > new_limit or event.end_old > old_limit) break;
-            if (self.onComplete) |callback| callback(self.on_complete_ctx, event.end_old);
-        }
-        if (complete == 0) return;
-
-        const rest = self.pending.items.len - complete;
-        std.mem.copyForwards(PendingEvent, self.pending.items[0..rest], self.pending.items[complete..]);
-        self.pending.shrinkRetainingCapacity(rest);
-    }
-
-    /// Both writers quiet: no flush in flight and none parked (§3.4). At most
-    /// one flush is ever in flight per writer, so the drain that waits for this
-    /// is bounded.
-    pub fn quiet(self: *const CompositeWriter) bool {
-        return !self.new.flush_in_flight and !self.new.flush_pending and
-            !self.old.flush_in_flight and !self.old.flush_pending;
-    }
-};
-
 /// The controller that owns all shared process resources.
 pub const Controller = struct {
     const Self = @This();
@@ -456,7 +370,7 @@ pub const Controller = struct {
         var logger = try self.allocator.create(LoggerStuff);
         errdefer self.allocator.destroy(logger);
 
-        try logger.pool.init(self.allocator, self.cfg.logging.pool_capacity, self.cfg.logging.pool_frame_size);
+        try logger.pool.init(self.allocator, self.cfg.logging.pool_capacity, self.cfg.logging.frameSize());
         errdefer logger.pool.deinit();
         try logger.sink.init(self, self.cfg.logging, ring);
         logger.logger.init(&logger.pool, &logger.sink);
@@ -2005,7 +1919,7 @@ test "role distribution" {
     cfg.logging = .{
         .method = .{ .pretty = .dark },
         .pool_capacity = 64,
-        .pool_frame_size = 1024,
+        .pool_frame_size = config.bytes(1024),
     };
 
     var ctrl: Controller = undefined;
@@ -2094,7 +2008,7 @@ test "roles map to the shared arrays" {
     cfg.logging = .{
         .method = .{ .json = {} },
         .pool_capacity = 64,
-        .pool_frame_size = 1024,
+        .pool_frame_size = config.bytes(1024),
     };
 
     var ctrl: Controller = undefined;
@@ -2138,7 +2052,7 @@ test "the derived role addresses the thread's own slot" {
     cfg.logging = .{
         .method = .{ .json = {} },
         .pool_capacity = 64,
-        .pool_frame_size = 1024,
+        .pool_frame_size = config.bytes(1024),
     };
 
     var ctrl: Controller = undefined;
@@ -2178,7 +2092,7 @@ const TestController = struct {
             .logging = .{
                 .method = .{ .json = {} },
                 .pool_capacity = 64,
-                .pool_frame_size = 1024,
+                .pool_frame_size = config.bytes(1024),
             },
         };
         try self.ctrl.init(std.testing.allocator, &self.cfg);
@@ -2696,11 +2610,11 @@ const WalFixture = struct {
             .sqpoll_threads = 1,
             .ring_slots_capacity = 4096,
             .index_inbox_capacity = 8,
-            .wal = .{ .plain = .{ .dir = self.dir, .buffers = 4, .lba = 512 } },
+            .wal = .{ .plain = .{ .dir = self.dir, .buffers = 4, .lba = config.kib(1) } },
             .logging = .{
                 .method = .{ .json = {} },
                 .pool_capacity = 64,
-                .pool_frame_size = 1024,
+                .pool_frame_size = config.bytes(1024),
             },
         };
         try self.ctrl.init(std.testing.allocator, &self.cfg);
@@ -2874,9 +2788,9 @@ test "the battery is one zeroed plain area per pair and per temp ring" {
     try std.testing.expectEqual(wal.Mode.plain, fixture.ctrl.wal_mode);
     try std.testing.expectEqual(@as(usize, 2), fixture.ctrl.wal_pairs);
 
-    // A quarter-mebibyte-free geometry: 2 × 512 bytes of data plus headers,
-    // rounded up to a page so the next pair's data array stays aligned.
-    try std.testing.expectEqual(@as(usize, 4096), fixture.ctrl.wal_area_stride);
+    // Four 1 KiB buffers plus their headers, rounded up to the LBA/page
+    // granule so the next pair's data array stays aligned.
+    try std.testing.expectEqual(@as(usize, 8192), fixture.ctrl.wal_area_stride);
     try std.testing.expectEqual(@as(usize, 0), fixture.ctrl.wal_area_stride % std.heap.pageSize());
 
     try fixture.ctrl.acquireWalBattery();
@@ -2918,11 +2832,11 @@ test "a pmem reopen maps the device and walks the chain the crash left" {
         .sqpoll_threads = 1,
         .ring_slots_capacity = 4096,
         .index_inbox_capacity = 8,
-        .wal = .{ .pmem = .{ .dir = dir, .device = device, .buffers = 4, .lba = 4096 } },
+        .wal = .{ .pmem = .{ .dir = dir, .device = device, .buffers = 4, .lba = config.kib(4) } },
         .logging = .{
             .method = .{ .json = {} },
             .pool_capacity = 64,
-            .pool_frame_size = 1024,
+            .pool_frame_size = config.bytes(1024),
         },
     };
 
@@ -3024,12 +2938,12 @@ const RegistryFixture = struct {
             .sqpoll_threads = 1,
             .ring_slots_capacity = 4096,
             .index_inbox_capacity = 8,
-            .wal = .{ .plain = .{ .dir = self.dir, .buffers = 4, .hosts = hosts, .lba = 512 } },
+            .wal = .{ .plain = .{ .dir = self.dir, .buffers = 4, .hosts = hosts, .lba = config.kib(1) } },
             .snapshots = .{ .registry_keep = keep },
             .logging = .{
                 .method = .{ .json = {} },
                 .pool_capacity = 64,
-                .pool_frame_size = 1024,
+                .pool_frame_size = config.bytes(1024),
             },
         };
         try self.ctrl.init(std.testing.allocator, &self.cfg);
@@ -3450,7 +3364,7 @@ test "nextElephantRing round-robins over the elephant rings" {
     cfg.logging = .{
         .method = .{ .json = {} },
         .pool_capacity = 64,
-        .pool_frame_size = 1024,
+        .pool_frame_size = config.bytes(1024),
     };
 
     var ctrl: Controller = undefined;
@@ -3496,122 +3410,6 @@ test "nextElephantRing round-robins over the elephant rings" {
 
     const expected: u32 = @intCast(2 * 12 / cfg.elephants);
     for (counts) |count| try std.testing.expectEqual(expected, count.load(.monotonic));
-}
-
-/// The composite's sink in the window tests: every submission is held, so the
-/// test decides when a flush completes and observes the both-sides rule one
-/// frontier at a time.
-const HeldSink = struct {
-    fn room(ctx: ?*anyopaque, writer: *wal.WalWriteFile) wal.WalError!void {
-        _ = ctx;
-        _ = writer;
-    }
-
-    fn submit(ctx: ?*anyopaque, writer: *wal.WalWriteFile, ordinal: u64) void {
-        _ = ctx;
-        _ = writer;
-        _ = ordinal;
-    }
-
-    fn install(writer: *wal.WalWriteFile) void {
-        writer.sink = .{ .room = room, .submit = submit };
-    }
-};
-
-/// The composite's completion log, in delivery order.
-const CompletionLog = struct {
-    ends: [8]u64 = undefined,
-    len: usize = 0,
-
-    fn push(ctx: ?*anyopaque, end: u64) void {
-        const self: *CompletionLog = @ptrCast(@alignCast(ctx.?));
-        self.ends[self.len] = end;
-        self.len += 1;
-    }
-};
-
-test "a composite event completes only when both sides' flushes cover it" {
-    var fixture: WalFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-
-    // The pair has history: the old writer chains from the file's tag.
-    const opened = try fixture.create(0, 0, 0x100);
-    _ = std.os.linux.close(opened);
-    const old = try fixture.ctrl.walOpenWrite(0, 0, 0x100);
-
-    // The window's writer runs on temp ring 0, chained from the clone state Y.
-    const new = try fixture.ctrl.walAdoptWrite(0, 0, 0, 0x100, try fixture.create(0, 0, 0x101));
-    defer {
-        _ = std.os.linux.close(new.fd);
-        fixture.ctrl.allocator.destroy(new);
-    }
-
-    HeldSink.install(old);
-    HeldSink.install(new);
-
-    var log = CompletionLog{};
-    var composite = CompositeWriter{
-        .new = new,
-        .old = old,
-        .allocator = std.testing.allocator,
-        .onComplete = CompletionLog.push,
-        .on_complete_ctx = &log,
-    };
-    defer composite.pending.deinit(std.testing.allocator);
-
-    // 494 op bytes frame to exactly one buffer on both sides.
-    var op: [494]u8 = undefined;
-    for (&op, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 1);
-
-    try composite.write(0x101, &op);
-    try std.testing.expectEqual(@as(usize, 1), composite.pending.items.len);
-    try std.testing.expect(old.flush_in_flight and new.flush_in_flight);
-    try std.testing.expect(!composite.quiet());
-
-    // Old-side coverage alone completes nothing: the event must be durable in
-    // both files or either crash outcome loses it.
-    old.flushResult(.{ .user_data = 0, .res = 512, .flags = 0 });
-    composite.noteFlush(old);
-    try std.testing.expectEqual(@as(usize, 0), log.len);
-    try std.testing.expectEqual(@as(usize, 1), composite.pending.items.len);
-
-    // The new side's flush lands on the same buffer: now it is complete.
-    new.flushResult(.{ .user_data = 0, .res = 512, .flags = 0 });
-    composite.noteFlush(new);
-    try std.testing.expectEqual(@as(usize, 1), log.len);
-    try std.testing.expectEqual(@as(u64, 512), log.ends[0]);
-    try std.testing.expectEqual(@as(usize, 0), composite.pending.items.len);
-    try std.testing.expect(composite.quiet());
-
-    // A mid-buffer tail event has no flush of its own; it completes when the
-    // buffer it ends in fills and both sides flush it.
-    var tail: [100]u8 = undefined;
-    @memset(&tail, 0x5a);
-    try composite.write(0x102, &tail);
-    try std.testing.expectEqual(@as(usize, 1), composite.pending.items.len);
-    try std.testing.expect(composite.quiet());
-
-    // 377 op bytes frame to 395: 117 + 395 fills the open buffer exactly.
-    var filler: [377]u8 = undefined;
-    @memset(&filler, 0xa5);
-    try composite.write(0x103, &filler);
-    try std.testing.expectEqual(@as(usize, 2), composite.pending.items.len);
-    try std.testing.expect(old.flush_in_flight and new.flush_in_flight);
-
-    // New-side coverage alone still completes nothing.
-    new.flushResult(.{ .user_data = 0, .res = 512, .flags = 0 });
-    composite.noteFlush(new);
-    try std.testing.expectEqual(@as(usize, 1), log.len);
-
-    // The old side's covering flush completes both, in write order.
-    old.flushResult(.{ .user_data = 0, .res = 512, .flags = 0 });
-    composite.noteFlush(old);
-    try std.testing.expectEqual(@as(usize, 3), log.len);
-    try std.testing.expectEqual(@as(u64, 629), log.ends[1]);
-    try std.testing.expectEqual(@as(u64, 1024), log.ends[2]);
-    try std.testing.expectEqual(@as(usize, 0), composite.pending.items.len);
-    try std.testing.expect(composite.quiet());
 }
 
 test "the adoption mark publishes on the pair's control line and clears" {
@@ -3724,14 +3522,14 @@ const PmemFixture = struct {
                 .dir = self.dir,
                 .device = self.device,
                 .buffers = 4,
-                .lba = 512,
+                .lba = config.kib(1),
                 .hosts = hosts,
             } },
             .snapshots = .{ .registry_keep = 8 },
             .logging = .{
                 .method = .{ .json = {} },
                 .pool_capacity = 64,
-                .pool_frame_size = 1024,
+                .pool_frame_size = config.bytes(1024),
             },
         };
 

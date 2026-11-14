@@ -26,6 +26,39 @@
 
 const std = @import("std");
 const siggy = @import("siggy");
+const zunit = @import("zunit");
+
+/// A byte count written with an optional binary suffix, e.g. `4096` or `4KiB`.
+pub const Bytes = zunit.Volume(.b).Siggy;
+
+/// A kibibyte count, e.g. `4KiB`; a bare number is whole kibibytes.
+pub const Kib = zunit.Volume(.kib).Siggy;
+
+/// A mebibyte count, e.g. `256MiB`; a bare number is whole mebibytes.
+pub const Mib = zunit.Volume(.mib).Siggy;
+
+/// A duration written with a unit suffix, e.g. `8s` or `1h30m`.
+pub const Seconds = zunit.Duration(.secs).Siggy;
+
+/// Builds a `Bytes` value from a raw byte count for literals and defaults.
+pub inline fn bytes(n: u128) Bytes {
+    return Bytes.fromBase(n) catch unreachable;
+}
+
+/// Builds a `Kib` value from a count of kibibytes for literals and defaults.
+pub inline fn kib(n: u128) Kib {
+    return Kib.fromBase(n) catch unreachable;
+}
+
+/// Builds a `Mib` value from a count of mebibytes for literals and defaults.
+pub inline fn mib(n: u128) Mib {
+    return Mib.fromBase(n) catch unreachable;
+}
+
+/// Builds a `Seconds` value from a count of seconds for literals and defaults.
+pub inline fn seconds(n: i64) Seconds {
+    return Seconds.fromBase(n) catch unreachable;
+}
 
 /// Server config structure.
 ///
@@ -55,11 +88,11 @@ pub const Config = struct {
     logging: Logging = .{
         .method = .{ .pretty = .dark },
         .pool_capacity = 1024,
-        .pool_frame_size = 2048,
+        .pool_frame_size = bytes(512),
     },
     queue_depth: u32 = 4096,
-    init_timeout_sec: u32 = 8,
-    shutdown_timeout_sec: u32 = 8,
+    init_timeout: Seconds = seconds(8),
+    shutdown_timeout: Seconds = seconds(8),
     cross_task_slots: u32 = 4096,
     accept_backlog: u32 = 1024,
     sqpoll_threads: u32 = 1,
@@ -77,17 +110,17 @@ pub const Config = struct {
 
 /// Snapshot procedure parameters.
 ///
-/// `interval_s` is the ticker period; `size_barrier` is the pair-size bar a
+/// `interval` is the ticker period; `size_barrier` is the pair-size bar a
 /// procedure needs to start; `slots` is the process-wide bound on parallel
 /// procedures; `registry_keep` is how many registry lines per hosted pair the
 /// rewrite keeps.
 ///
 /// ```text
-/// snapshots = { interval_s = 60 size_barrier = 268435456 slots = 8 registry_keep = 8 }
+/// snapshots = { interval = 60s size_barrier = 256MiB slots = 8 registry_keep = 8 }
 /// ```
 pub const Snapshots = struct {
-    interval_s: u32 = 60,
-    size_barrier: u64 = 268435456,
+    interval: Seconds = seconds(60),
+    size_barrier: Mib = mib(256),
     slots: u32 = 8,
     registry_keep: u32 = 8,
 };
@@ -98,7 +131,7 @@ pub const Snapshots = struct {
 /// `hosts` and `lba` are omittable and take the documented defaults.
 ///
 /// ```text
-/// wal = plain { dir = "wal" buffers = 32 hosts = 1 lba = 4096 }
+/// wal = plain { dir = "wal" buffers = 32 hosts = 1 lba = 4KiB }
 /// wal = pmem  { dir = "wal" device = "/dev/dax0.0" }
 /// ```
 ///
@@ -111,7 +144,7 @@ pub const Wal = union(enum) {
         dir: []const u8,
         buffers: u32 = 32,
         hosts: u32 = 1,
-        lba: u32 = 4096,
+        lba: Kib = kib(4),
     },
     /// NVDIMM battery: the un-flushed tail survives a crash.
     pmem: struct {
@@ -119,7 +152,7 @@ pub const Wal = union(enum) {
         device: []const u8,
         buffers: u32 = 32,
         hosts: u32 = 1,
-        lba: u32 = 4096,
+        lba: Kib = kib(4),
     },
 
     /// The directory WAL files live in, shared by both modes.
@@ -146,12 +179,15 @@ pub const Wal = union(enum) {
         };
     }
 
-    /// Buffer size in bytes, also the flush granularity.
+    /// Buffer size in bytes, also the flush granularity. Values that do not
+    /// fit in `u32` collapse to zero, so validation rejects them.
     pub fn lba(self: Wal) u32 {
-        return switch (self) {
+        const value = switch (self) {
             .plain => |p| p.lba,
             .pmem => |p| p.lba,
         };
+        const widened = value.value64() catch return 0;
+        return std.math.cast(u32, widened) orelse 0;
     }
 
     /// Whether the battery is a mapped NVDIMM instead of ordinary memory.
@@ -172,7 +208,13 @@ pub const Logging = struct {
         file: []const u8,
     },
     pool_capacity: u32,
-    pool_frame_size: u32,
+    pool_frame_size: Bytes = bytes(512),
+
+    /// Bytes in one frame, the value `blog.BufferPool.init` wants.
+    pub fn frameSize(self: Logging) u32 {
+        const widened = self.pool_frame_size.value64() catch return 0;
+        return std.math.cast(u32, widened) orelse 0;
+    }
 };
 
 /// A CPU pinning mask: a sorted, duplicate-free list of core indices produced
@@ -376,7 +418,7 @@ pub const check_cpu_cores: u16 = 8;
 /// or stringify: this literal spells the defaults plus the WAL block the dev
 /// document carries. A broken value here still fails the build.
 pub const canonical = Config{
-    .wal = .{ .plain = .{ .dir = "wal", .buffers = 32, .hosts = 1, .lba = 4096 } },
+    .wal = .{ .plain = .{ .dir = "wal", .buffers = 32, .hosts = 1, .lba = kib(4) } },
 };
 
 /// CPU count the tests validate against.
@@ -402,14 +444,14 @@ pub const test_cpu_count: u16 = check_cpu_cores;
 /// - `elephants > 0` and less than `cpu_cores`
 /// - `fronts + indexes + elephants < cpu_cores` (strictly, no equality)
 /// - `queue_depth` is a power of two
-/// - `init_timeout_sec > 0`
-/// - `shutdown_timeout_sec > 0`
+/// - `init_timeout > 0`
+/// - `shutdown_timeout > 0`
 /// - `cross_task_slots` is a power of two
 /// - `accept_backlog` is a power of two
 ///
 /// Rules for `wal`:
 ///
-/// - `lba` is a power of two in `[512, 1 MiB]` and divides 1 MiB exactly
+/// - `lba` is a power of two in `[1 KiB, 1 MiB]` and divides 1 MiB exactly
 /// - `buffers >= 4` (a current buffer, a free buffer, and room for the
 ///   bring-tail's flush-then-append)
 /// - `1 <= hosts <= 256` (`host_idx: u8` bounds it)
@@ -419,8 +461,8 @@ pub const test_cpu_count: u16 = check_cpu_cores;
 ///
 /// Rules for `snapshots`:
 ///
-/// - `interval_s >= 1`
-/// - `size_barrier >= 1`
+/// - `interval > 0`
+/// - `size_barrier >= 1 MiB`
 /// - `1 <= slots <= 65535` (the mark's `new_wal_buffer_idx: u16` bounds it)
 /// - `registry_keep >= 1`
 ///
@@ -547,8 +589,8 @@ fn validate(config: Config, cpu_cores: u16) ParseError!void {
     if (config.queue_depth == 0 or !std.math.isPowerOfTwo(config.queue_depth)) {
         return error.InvalidQueueDepth;
     }
-    if (config.init_timeout_sec == 0) return error.InvalidInitTimeout;
-    if (config.shutdown_timeout_sec == 0) return error.InvalidShutdownTimeout;
+    if (config.init_timeout.value() <= 0) return error.InvalidInitTimeout;
+    if (config.shutdown_timeout.value() <= 0) return error.InvalidShutdownTimeout;
     if (config.cross_task_slots == 0 or !std.math.isPowerOfTwo(config.cross_task_slots)) {
         return error.InvalidCrossTaskSlots;
     }
@@ -585,7 +627,7 @@ const wal_block: u32 = 1 << 20;
 /// comptime check and the runtime `fromText`.
 fn validateWal(wal: Wal, host_index: u16) ParseError!void {
     const lba = wal.lba();
-    if (lba < 512 or lba > wal_block or !std.math.isPowerOfTwo(lba) or wal_block % lba != 0) {
+    if (lba < 1024 or lba > wal_block or !std.math.isPowerOfTwo(lba) or wal_block % lba != 0) {
         return error.InvalidLba;
     }
     if (wal.buffers() < 4) return error.InvalidBuffers;
@@ -609,8 +651,8 @@ fn validateWal(wal: Wal, host_index: u16) ParseError!void {
 /// slot bound and the registry compaction knob. No allocation, so it serves
 /// both the comptime check and the runtime `fromText`.
 fn validateSnapshots(snapshots: Snapshots) ParseError!void {
-    if (snapshots.interval_s < 1) return error.InvalidSnapshotInterval;
-    if (snapshots.size_barrier < 1) return error.InvalidSizeBarrier;
+    if (snapshots.interval.value() <= 0) return error.InvalidSnapshotInterval;
+    if (snapshots.size_barrier.value() < 1024 * 1024) return error.InvalidSizeBarrier;
     if (snapshots.slots < 1 or snapshots.slots > 65535) return error.InvalidSnapshotSlots;
     if (snapshots.registry_keep < 1) return error.InvalidRegistryKeep;
 }
@@ -780,17 +822,17 @@ test "the dev document parses" {
         \\index_cores = { 4..7 }
         \\elephants = 1
         \\host_index = 0
-        \\logging = { method = pretty { dark } pool_capacity = 1024 pool_frame_size = 2048 }
+        \\logging = { method = pretty { dark } pool_capacity = 1024 pool_frame_size = 512 }
         \\queue_depth = 4096
-        \\init_timeout_sec = 8
-        \\shutdown_timeout_sec = 8
+        \\init_timeout = 8s
+        \\shutdown_timeout = 8s
         \\cross_task_slots = 4096
         \\accept_backlog = 1024
         \\sqpoll_threads = 1
         \\index_inbox_capacity = 1024
         \\ring_slots_capacity = 4096
-        \\wal = plain { dir = "wal" buffers = 32 hosts = 1 lba = 4096 }
-        \\snapshots = { interval_s = 60 size_barrier = 268435456 slots = 8 registry_keep = 8 }
+        \\wal = plain { dir = "wal" buffers = 32 hosts = 1 lba = 4KiB }
+        \\snapshots = { interval = 60s size_barrier = 256MiB slots = 8 registry_keep = 8 }
     ;
     const config = try manager.fromText(dev);
 
@@ -799,8 +841,9 @@ test "the dev document parses" {
     try testing.expectEqual(@as(u32, 32), config.wal.buffers());
     try testing.expectEqual(@as(u32, 1), config.wal.hosts());
     try testing.expectEqual(@as(u32, 4096), config.wal.lba());
-    try testing.expectEqual(@as(u32, 60), config.snapshots.interval_s);
-    try testing.expectEqual(@as(u64, 268435456), config.snapshots.size_barrier);
+    try testing.expectEqual(@as(u32, 512), config.logging.frameSize());
+    try testing.expectEqual(60 * std.time.ns_per_s, config.snapshots.interval.value());
+    try testing.expectEqual(@as(u128, 268435456), config.snapshots.size_barrier.value());
     try testing.expectEqual(@as(u32, 8), config.snapshots.slots);
     try testing.expectEqual(@as(u32, 8), config.snapshots.registry_keep);
 }
@@ -815,29 +858,34 @@ test "wal geometry defaults to the documented values" {
     try testing.expectEqual(@as(u32, 1), plain.wal.hosts());
     try testing.expectEqual(@as(u32, 4096), plain.wal.lba());
 
-    const pmem = try manager.fromText("wal = pmem { dir = \"wal\" device = \"/dev/dax0.0\" lba = 512 }");
+    const pmem = try manager.fromText("wal = pmem { dir = \"wal\" device = \"/dev/dax0.0\" lba = 1KiB }");
     try testing.expect(pmem.wal.isPmem());
     try testing.expectEqualStrings("/dev/dax0.0", pmem.wal.pmem.device);
     try testing.expectEqual(@as(u32, 32), pmem.wal.buffers());
-    try testing.expectEqual(@as(u32, 512), pmem.wal.lba());
+    try testing.expectEqual(@as(u32, 1024), pmem.wal.lba());
 }
 
 test "wal rules are enforced" {
     var manager = testManager();
     defer manager.deinit();
 
-    // lba: power of two, inside [512, 1 MiB], dividing a block exactly.
+    // lba: power of two, inside [1 KiB, 1 MiB], dividing a block exactly.
     try testing.expectError(
         error.InvalidLba,
-        manager.fromText("wal = plain { dir = \"wal\" lba = 256 }"),
+        manager.fromText("wal = plain { dir = \"wal\" lba = 0KiB }"),
     );
     try testing.expectError(
         error.InvalidLba,
-        manager.fromText("wal = plain { dir = \"wal\" lba = 3072 }"),
+        manager.fromText("wal = plain { dir = \"wal\" lba = 3KiB }"),
     );
     try testing.expectError(
         error.InvalidLba,
-        manager.fromText("wal = plain { dir = \"wal\" lba = 2097152 }"),
+        manager.fromText("wal = plain { dir = \"wal\" lba = 2048KiB }"),
+    );
+    // A bare count below one KiB is not a whole kibibyte: the parser refuses it.
+    try testing.expectError(
+        error.ParseSiggy,
+        manager.fromText("wal = plain { dir = \"wal\" lba = 512 }"),
     );
 
     // A file's ring keeps at least four buffers: a current one, a free one,
@@ -892,16 +940,16 @@ test "snapshots default to the documented values and accept every key" {
     defer manager.deinit();
 
     const defaults = try manager.fromText(wal_doc);
-    try testing.expectEqual(@as(u32, 60), defaults.snapshots.interval_s);
-    try testing.expectEqual(@as(u64, 268435456), defaults.snapshots.size_barrier);
+    try testing.expectEqual(60 * std.time.ns_per_s, defaults.snapshots.interval.value());
+    try testing.expectEqual(@as(u128, 268435456), defaults.snapshots.size_barrier.value());
     try testing.expectEqual(@as(u32, 8), defaults.snapshots.slots);
     try testing.expectEqual(@as(u32, 8), defaults.snapshots.registry_keep);
 
     const tuned = try manager.fromText(wal_doc ++
-        \\snapshots = { interval_s = 5 size_barrier = 4096 slots = 16 registry_keep = 2 }
+        \\snapshots = { interval = 5s size_barrier = 4MiB slots = 16 registry_keep = 2 }
     );
-    try testing.expectEqual(@as(u32, 5), tuned.snapshots.interval_s);
-    try testing.expectEqual(@as(u64, 4096), tuned.snapshots.size_barrier);
+    try testing.expectEqual(5 * std.time.ns_per_s, tuned.snapshots.interval.value());
+    try testing.expectEqual(@as(u128, 4194304), tuned.snapshots.size_barrier.value());
     try testing.expectEqual(@as(u32, 16), tuned.snapshots.slots);
     try testing.expectEqual(@as(u32, 2), tuned.snapshots.registry_keep);
 
@@ -909,7 +957,7 @@ test "snapshots default to the documented values and accept every key" {
         \\snapshots = { slots = 2 }
     );
     try testing.expectEqual(@as(u32, 2), partial.snapshots.slots);
-    try testing.expectEqual(@as(u32, 60), partial.snapshots.interval_s);
+    try testing.expectEqual(60 * std.time.ns_per_s, partial.snapshots.interval.value());
 }
 
 test "snapshot rules are enforced" {
@@ -918,7 +966,7 @@ test "snapshot rules are enforced" {
 
     try testing.expectError(
         error.InvalidSnapshotInterval,
-        manager.fromText(wal_doc ++ "snapshots = { interval_s = 0 }"),
+        manager.fromText(wal_doc ++ "snapshots = { interval = 0s }"),
     );
     try testing.expectError(
         error.InvalidSizeBarrier,
@@ -950,8 +998,10 @@ test "the rendered default document re-parses" {
     defer testing.allocator.free(text);
 
     try testing.expect(std.mem.indexOf(u8, text, "snapshots") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "interval_s = 60") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "size_barrier = 268435456") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "interval = 60s") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "lba = 4KiB") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "pool_frame_size = 512") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "size_barrier = 256MiB") != null);
 
     const config = try manager.fromText(text);
     try testing.expect(config.wal == .plain);
@@ -959,8 +1009,9 @@ test "the rendered default document re-parses" {
     try testing.expectEqual(@as(u32, 32), config.wal.buffers());
     try testing.expectEqual(@as(u32, 1), config.wal.hosts());
     try testing.expectEqual(@as(u32, 4096), config.wal.lba());
-    try testing.expectEqual(@as(u32, 60), config.snapshots.interval_s);
-    try testing.expectEqual(@as(u64, 268435456), config.snapshots.size_barrier);
+    try testing.expectEqual(@as(u32, 512), config.logging.frameSize());
+    try testing.expectEqual(60 * std.time.ns_per_s, config.snapshots.interval.value());
+    try testing.expectEqual(@as(u128, 268435456), config.snapshots.size_barrier.value());
     try testing.expectEqual(@as(u32, 8), config.snapshots.slots);
     try testing.expectEqual(@as(u32, 8), config.snapshots.registry_keep);
     try testing.expectEqual(@as(u16, 60006), config.port);
