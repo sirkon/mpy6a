@@ -134,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
                 },
             };
 
-            try CLI.usage(cli);
+            try CLI.usage(c);
             std.debug.print("\x1b[1;91mno config subcommand specified\x1b[0m\n", .{});
             std.process.exit(1);
         },
