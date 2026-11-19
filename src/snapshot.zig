@@ -738,7 +738,7 @@ pub const Elephant = struct {
             .SnapshotFd, .SnapshotCreateFailed, .SnapshotDumped, .SnapshotDumpFailed, .SnapshotAbandon, .SnapshotDone => {
                 self.log.warn("elephant read a snapshot reply it does not handle", .{ .ring_idx = self.ring_idx });
             },
-            .ShutdownDemand, .SoftShutdown, .ServerSocket, .IndexDrained => return false,
+            .ShutdownDemand, .SoftShutdown, .ServerSocket, .IndexDrained, .PeerLink, .PeerServerSocket => return false,
         }
         return true;
     }

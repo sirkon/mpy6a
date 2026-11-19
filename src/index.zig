@@ -16,6 +16,7 @@ const state = @import("state.zig");
 const wal = @import("wal.zig");
 const cross_task = @import("cross_task.zig");
 const snapshot = @import("snapshot.zig");
+const cluster_transport = @import("cluster_transport.zig");
 
 /// A message that a front pushes into an index inbox.
 pub const FrontMessage = union(enum) {
@@ -52,6 +53,9 @@ const Frame = struct {
     data_sets: []state.IndexState,
     stream_io: wal.FileReadProcess.Io,
     soft_draining: bool = false,
+    /// Set once the drain closed every link (§3.7). A hand-over that races the
+    /// shutdown is then closed instead of greeted.
+    links_closed: bool = false,
     /// The snapshot procedure's policy state.
     snap: snapshot.State = .{},
 
@@ -141,11 +145,14 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
         .stream_io = stream_io,
     };
     snapshot.armTicker(frame.host());
+    dialPeers(&frame);
+    frame.ring.ring.streamedSQ(&frame.ring.sqstream);
 
     while (true) {
         // One pending push per pass: a procedure's pushes are sequential, so a
         // single op suffices (§4).
         frame.snap.retryPending(frame.host());
+        pumpRetries(&frame);
 
         const batch = inbox.batch(cfg.batch_k, cfg.batch_k) orelse {
             // A pending push must not park: the loop keeps passing until the
@@ -165,6 +172,10 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
             std.process.exit(1);
         };
 
+        // A frame the transport could not dispatch (a full send ring) is
+        // retried here, once per pass, never inside the receive completion.
+        drainLinks(&frame);
+
         // A reply armed a continuation: finish it now that the batch cursor is
         // published, and before any front task. The pump's raw `popCQE` must
         // never run inside the batch window (§5, D1).
@@ -173,6 +184,7 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
             continue;
         }
 
+        var stopping = false;
         while (batch.front.next()) |task| switch (task) {
             .create => |create| {
                 // A stopped thread takes no front work at all: the session is
@@ -204,16 +216,23 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
                     log.info("index soft shutdown", .{ .ring_idx = role.index.ring_idx });
                 }
                 if (own_state.sessions.count() == 0) {
-                    reportDrained(ring, front_ring, role.index.ring_idx);
-                    return;
+                    stopping = true;
+                    break;
                 }
             },
             .shutdown_hard => {
                 log.info("index hard shutdown", .{ .ring_idx = role.index.ring_idx });
-                reportDrained(ring, front_ring, role.index.ring_idx);
-                return;
+                stopping = true;
+                break;
             },
         };
+
+        // Every drain path closes the links before it reports (§3.7).
+        if (stopping) {
+            teardownLinks(&frame);
+            reportDrained(ring, front_ring, role.index.ring_idx);
+            return;
+        }
 
         // The queue entry itself carries the future due time; checking it
         // against the clock is the loop's outer logic, not the drain's.
@@ -224,6 +243,7 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
         // not gate shutdown: its contents are dump-persistent state that
         // survives the restart.
         if (frame.soft_draining and own_state.sessions.count() == 0) {
+            teardownLinks(&frame);
             reportDrained(ring, front_ring, role.index.ring_idx);
             return;
         }
@@ -252,7 +272,10 @@ fn stepCQE(frame: *Frame, cqe: zigring.CQE) void {
             // window's cursors. Re-capture them before the pass (and any WAL
             // flush it triggers) submits through the same window (§4).
             frame.snap.resync(frame.host());
-            frame.snap.onReply(frame.host(), task);
+            switch (task) {
+                .PeerLink => |link| onPeerLink(frame, link),
+                else => frame.snap.onReply(frame.host(), task),
+            }
         },
         // The repeating snapshot ticker's own timeout completion (§1.1).
         messages.SnapshotTickIdx => frame.snap.onTick(frame.host()),
@@ -288,10 +311,1336 @@ fn stepCQE(frame: *Frame, cqe: zigring.CQE) void {
                         if (err == error.IO) frame.snap.onReadFault();
                     };
                 },
+                .greeting_send => |greet| {
+                    const entry = linkEntry(frame, greet.host_idx) orelse return;
+                    onGreetingSend(frame, entry, greet.epoch, cqe);
+                },
+                .frame_send => |send| {
+                    const entry = linkEntry(frame, send.host_idx) orelse return;
+                    onFrameSend(frame, entry, send.epoch, cqe);
+                },
+                .frame_recv => |recv| {
+                    const entry = linkEntry(frame, recv.host_idx) orelse return;
+                    onFrameRecv(frame, entry, recv.epoch, cqe);
+                },
+                .peer_close => |close| onPeerClose(frame, close.host_idx, close.epoch, cqe),
+                .pulse => |pulse| {
+                    const entry = linkEntry(frame, pulse.host_idx) orelse return;
+                    onPulse(frame, entry, cqe);
+                },
+                .predicate_timeout => |deadline| {
+                    const entry = linkEntry(frame, deadline.host_idx) orelse return;
+                    onPredicateTimeout(frame, entry, deadline.epoch, cqe);
+                },
+                .keepalive_tick => |tick| {
+                    const entry = linkEntry(frame, tick.host_idx) orelse return;
+                    onKeepaliveTick(frame, entry, tick.epoch, cqe);
+                },
+                .connect => |dial| {
+                    const entry = linkEntry(frame, dial.host_idx) orelse return;
+                    onConnect(frame, entry, dial.epoch, cqe);
+                },
+                .connect_deadline => |deadline| {
+                    const entry = linkEntry(frame, deadline.host_idx) orelse return;
+                    onConnectDeadline(frame, entry, deadline.epoch, cqe);
+                },
+                .greet_send => |send| {
+                    const entry = linkEntry(frame, send.host_idx) orelse return;
+                    onGreetSend(frame, entry, send.epoch, cqe);
+                },
+                .verdict_read => |read| {
+                    const entry = linkEntry(frame, read.host_idx) orelse return;
+                    onVerdictRead(frame, entry, read.epoch, cqe);
+                },
+                .reply_deadline => |deadline| {
+                    const entry = linkEntry(frame, deadline.host_idx) orelse return;
+                    onReplyDeadline(frame, entry, deadline.epoch, cqe);
+                },
+                .retry_timer => |retry| {
+                    const entry = linkEntry(frame, retry.host_idx) orelse return;
+                    onRetryTimer(frame, entry, retry.epoch, cqe);
+                },
+                .timeout => frame.ring.slots.del(cqe.taskIdx()),
                 else => {},
             }
         },
     }
+}
+
+/// The link table of this index thread, or null when the transport is dark.
+fn linkTable(frame: *Frame) ?*lifetime.LinkTable {
+    if (frame.ctrl.cfg.cluster == null) return null;
+    if (frame.index_idx >= frame.ctrl.link_tables.len) return null;
+    return &frame.ctrl.link_tables[frame.index_idx];
+}
+
+/// The installed entry for `host_idx`, or null when the link was never
+/// promoted.
+fn linkEntry(frame: *Frame, host_idx: u8) ?*cluster_transport.LinkEntry {
+    const table = linkTable(frame) orelse return null;
+    return table.get(host_idx);
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    if (fd >= 0) _ = std.os.linux.close(fd);
+}
+
+fn setDeadlineSpec(spec: *std.os.linux.kernel_timespec, ns: i64) void {
+    const total = @max(ns, 0);
+    spec.* = .{
+        .sec = @intCast(@divTrunc(total, std.time.ns_per_s)),
+        .nsec = @intCast(@mod(total, std.time.ns_per_s)),
+    };
+}
+
+fn nextBackoff(current: u64) u64 {
+    if (current >= cluster_transport.RETRY_MAX) return cluster_transport.RETRY_MAX;
+    return @min(current * 2, cluster_transport.RETRY_MAX);
+}
+
+fn peerAddressText(frame: *Frame, host_idx: u8) []const u8 {
+    const text = frame.ctrl.cfg.cluster.?.peers[host_idx];
+    if (std.mem.eql(u8, text, "localhost")) return "127.0.0.1";
+    return text;
+}
+
+/// The lower host dials every higher host once recovery is done and before the
+/// service loop (§3.1, §3.6).
+fn dialPeers(frame: *Frame) void {
+    const cfg = frame.ctrl.cfg;
+    if (cfg.cluster == null) return;
+    const own: u32 = cfg.host_index;
+    const hosts = cfg.wal.hosts();
+    var host: u32 = own + 1;
+    while (host < hosts) : (host += 1) startDial(frame, @intCast(host));
+}
+
+fn startDial(frame: *Frame, host_idx: u8) void {
+    const cluster = frame.ctrl.cfg.cluster orelse return;
+    const table = linkTable(frame) orelse return;
+    const entry = table.acquire(host_idx, frame.index_idx) catch |err| {
+        frame.logger.logger.err("peer dial entry allocation failed", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = host_idx,
+            .err = @errorName(err),
+        });
+        return;
+    };
+    if (entry.state != .none or entry.fd >= 0) return;
+
+    entry.epoch +%= 1;
+    entry.retry_pending = false;
+    entry.verdict_filled = 0;
+    entry.state = .greeting;
+
+    const fd = zigring.createTCPClientSocket(null) catch |err| {
+        entry.state = .none;
+        frame.logger.logger.warn("peer dial socket failed", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = host_idx,
+            .err = @errorName(err),
+        });
+        armRetry(frame, entry);
+        return;
+    };
+    entry.fd = fd;
+
+    setDeadlineSpec(&entry.connect_deadline_spec, cluster.handshake_timeout.value());
+    const deadline_idx = frame.ring.slots.add(.{ .connect_deadline = .{
+        .host_idx = host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        failDial(frame, entry, @errorName(err));
+        return;
+    };
+    entry.connect_deadline_task = deadline_idx;
+    frame.ring.ring.pushTicker(deadline_idx, &entry.connect_deadline_spec, 1, .{}) catch |err| {
+        frame.ring.slots.del(deadline_idx);
+        entry.connect_deadline_task = null;
+        failDial(frame, entry, @errorName(err));
+        return;
+    };
+
+    const connect_idx = frame.ring.slots.add(.{ .connect = .{
+        .host_idx = host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        failDial(frame, entry, @errorName(err));
+        return;
+    };
+    entry.connect_task = connect_idx;
+    frame.ring.ring.pushConnectIp4(
+        fd,
+        connect_idx,
+        peerAddressText(frame, host_idx),
+        cluster.peer_port,
+        .{},
+    ) catch |err| {
+        frame.ring.slots.del(connect_idx);
+        entry.connect_task = null;
+        failDial(frame, entry, @errorName(err));
+    };
+}
+
+fn cancelTask(frame: *Frame, task: ?u64) void {
+    const target = task orelse return;
+    const cancel_idx = frame.ring.slots.add(.{ .timeout = .{} }) catch return;
+    frame.ring.ring.pushCancel(cancel_idx, target, .{}) catch {
+        frame.ring.slots.del(cancel_idx);
+    };
+}
+
+fn cancelDial(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    cancelTask(frame, entry.connect_task);
+    cancelTask(frame, entry.connect_deadline_task);
+    cancelTask(frame, entry.greet_task);
+    cancelTask(frame, entry.verdict_task);
+    cancelTask(frame, entry.verdict_deadline_task);
+    entry.connect_task = null;
+    entry.connect_deadline_task = null;
+    entry.greet_task = null;
+    entry.verdict_task = null;
+    entry.verdict_deadline_task = null;
+}
+
+fn armRetry(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    if (entry.retry_task != null) return;
+    const delay = entry.retry_backoff;
+    setDeadlineSpec(&entry.retry_spec, @intCast(delay));
+
+    const task_idx = frame.ring.slots.add(.{ .retry_timer = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch {
+        entry.retry_pending = true;
+        return;
+    };
+    entry.retry_task = task_idx;
+    frame.ring.ring.pushTicker(task_idx, &entry.retry_spec, 1, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        entry.retry_task = null;
+        entry.retry_pending = true;
+        frame.logger.logger.warn("peer dial retry arm failed", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .err = @errorName(err),
+        });
+        return;
+    };
+
+    entry.retry_pending = false;
+    entry.retry_backoff = nextBackoff(delay);
+    frame.logger.logger.warn("peer dial retry armed", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .delay_ms = delay / std.time.ns_per_ms,
+    });
+}
+
+/// Re-arms every retry whose ticker the ring refused on a previous pass.
+fn pumpRetries(frame: *Frame) void {
+    const table = linkTable(frame) orelse return;
+    for (table.entries) |maybe| {
+        const entry = maybe orelse continue;
+        if (!entry.retry_pending or entry.retry_task != null) continue;
+        armRetry(frame, entry);
+    }
+}
+
+/// A failed dial: the descriptor is retired, the reorder state returns to zero
+/// and the retry timer carries the exponential backoff (§3.6).
+fn failDial(frame: *Frame, entry: *cluster_transport.LinkEntry, reason: []const u8) void {
+    frame.logger.logger.warn("peer dial failed", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .reason = reason,
+    });
+    cancelDial(frame, entry);
+    closeEntryFd(frame, entry);
+    entry.state = .none;
+    entry.resetConnection();
+    armRetry(frame, entry);
+}
+
+fn onConnect(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.connect_task != cqe.taskIdx()) return;
+    entry.connect_task = null;
+    if (entry.epoch != epoch) return;
+    if (entry.state != .greeting or entry.fd < 0) return;
+
+    cancelTask(frame, entry.connect_deadline_task);
+    entry.connect_deadline_task = null;
+
+    if (cqe.res < 0) {
+        failDial(frame, entry, "connect failed");
+        return;
+    }
+
+    cluster_transport.encodeGreet(.{
+        .version = cluster_transport.VERSION,
+        .host_idx = @intCast(frame.ctrl.cfg.host_index),
+        .index_idx = frame.index_idx,
+    }, &entry.greet);
+
+    const task_idx = frame.ring.slots.add(.{ .greet_send = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        failDial(frame, entry, @errorName(err));
+        return;
+    };
+    entry.greet_task = task_idx;
+    frame.ring.ring.pushSend(entry.fd, task_idx, &entry.greet, cluster_transport.GREET_LEN, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        entry.greet_task = null;
+        failDial(frame, entry, @errorName(err));
+    };
+}
+
+fn onConnectDeadline(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.connect_deadline_task != cqe.taskIdx()) return;
+    entry.connect_deadline_task = null;
+    if (entry.epoch != epoch) return;
+    if (entry.state != .greeting) return;
+
+    cancelTask(frame, entry.connect_task);
+    entry.connect_task = null;
+    failDial(frame, entry, "connect deadline");
+}
+
+fn onGreetSend(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.greet_task != cqe.taskIdx()) return;
+    entry.greet_task = null;
+    if (entry.epoch != epoch) return;
+    if (entry.state != .greeting or entry.fd < 0) return;
+
+    if (cqe.res != cluster_transport.GREET_LEN) {
+        failDial(frame, entry, "greet send failed");
+        return;
+    }
+
+    const cluster = frame.ctrl.cfg.cluster.?;
+    entry.verdict_filled = 0;
+
+    const read_idx = frame.ring.slots.add(.{ .verdict_read = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        failDial(frame, entry, @errorName(err));
+        return;
+    };
+    entry.verdict_task = read_idx;
+    frame.ring.ring.pushRecv(entry.fd, read_idx, entry.reply[0..cluster_transport.REPLY_LEN], .{}) catch |err| {
+        frame.ring.slots.del(read_idx);
+        entry.verdict_task = null;
+        failDial(frame, entry, @errorName(err));
+        return;
+    };
+
+    setDeadlineSpec(&entry.verdict_deadline_spec, cluster.handshake_timeout.value());
+    const deadline_idx = frame.ring.slots.add(.{ .reply_deadline = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        failDial(frame, entry, @errorName(err));
+        return;
+    };
+    entry.verdict_deadline_task = deadline_idx;
+    frame.ring.ring.pushTicker(deadline_idx, &entry.verdict_deadline_spec, 1, .{}) catch |err| {
+        frame.ring.slots.del(deadline_idx);
+        entry.verdict_deadline_task = null;
+        failDial(frame, entry, @errorName(err));
+    };
+}
+
+fn onVerdictRead(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.verdict_task != cqe.taskIdx()) return;
+    entry.verdict_task = null;
+    if (entry.epoch != epoch) return;
+    if (entry.state != .greeting or entry.fd < 0) return;
+
+    if (cqe.res < 0) {
+        failDial(frame, entry, "verdict read failed");
+        return;
+    }
+    if (cqe.res == 0) {
+        failDial(frame, entry, "peer closed before the verdict");
+        return;
+    }
+
+    entry.verdict_filled += @intCast(cqe.res);
+    if (entry.verdict_filled < cluster_transport.REPLY_LEN) {
+        const read_idx = frame.ring.slots.add(.{ .verdict_read = .{
+            .host_idx = entry.host_idx,
+            .epoch = entry.epoch,
+        } }) catch |err| {
+            failDial(frame, entry, @errorName(err));
+            return;
+        };
+        entry.verdict_task = read_idx;
+        frame.ring.ring.pushRecv(entry.fd, read_idx, entry.reply[entry.verdict_filled..], .{}) catch |err| {
+            frame.ring.slots.del(read_idx);
+            entry.verdict_task = null;
+            failDial(frame, entry, @errorName(err));
+        };
+        return;
+    }
+
+    cancelTask(frame, entry.verdict_deadline_task);
+    entry.verdict_deadline_task = null;
+    onVerdictComplete(frame, entry);
+}
+
+fn onVerdictComplete(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    const cluster = frame.ctrl.cfg.cluster.?;
+    const reply = cluster_transport.decodeReply(&entry.reply) catch {
+        failDial(frame, entry, "verdict decode failed");
+        return;
+    };
+
+    if (reply.verdict != .ok) {
+        frame.logger.logger.warn("peer rejected the link", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .verdict = @tagName(reply.verdict),
+            .address = peerAddressText(frame, entry.host_idx),
+            .peer_port = cluster.peer_port,
+        });
+        failDial(frame, entry, "peer rejected the link");
+        return;
+    }
+
+    if (reply.version != cluster_transport.VERSION or
+        reply.host_idx != entry.host_idx or
+        reply.index_idx != frame.index_idx)
+    {
+        frame.logger.logger.warn("peer verdict identity mismatch", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .version = reply.version,
+            .index_idx = reply.index_idx,
+        });
+        failDial(frame, entry, "verdict identity mismatch");
+        return;
+    }
+
+    entry.state = .up;
+    entry.retry_backoff = cluster_transport.RETRY_MIN;
+    entry.retry_pending = false;
+    entry.resetConnection();
+    armReceive(frame, entry);
+    armKeepalive(frame, entry);
+    frame.logger.logger.info("peer link established", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .index_idx = entry.index_idx,
+    });
+}
+
+fn onReplyDeadline(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.verdict_deadline_task != cqe.taskIdx()) return;
+    entry.verdict_deadline_task = null;
+    if (entry.epoch != epoch) return;
+    if (entry.state != .greeting) return;
+
+    cancelTask(frame, entry.verdict_task);
+    entry.verdict_task = null;
+    failDial(frame, entry, "verdict deadline");
+}
+
+fn onRetryTimer(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.retry_task != cqe.taskIdx()) return;
+    entry.retry_task = null;
+    if (entry.epoch != epoch) return;
+    if (entry.state != .none or entry.fd >= 0) return;
+    startDial(frame, entry.host_idx);
+}
+
+/// The front handed a promoted peer socket over (§3.2). The index re-validates
+/// what it was told and answers with the seven-byte greeting (§3.3).
+fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink")) void {
+    // §3.7: a hand-over that raced the drain is closed at once, never greeted,
+    // so the final drain cannot install a link after every link was closed.
+    if (frame.links_closed) {
+        frame.logger.logger.warn("peer link refused: index drained", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+        });
+        closeFd(link.fd);
+        return;
+    }
+    const cfg = frame.ctrl.cfg;
+    const table = linkTable(frame) orelse {
+        closeFd(link.fd);
+        return;
+    };
+    const own_host: u8 = @intCast(cfg.host_index);
+    const hosts = cfg.wal.hosts();
+    const host_valid = @as(u32, link.host_idx) < hosts and link.host_idx != own_host;
+
+    if (link.version != cluster_transport.VERSION) {
+        frame.logger.logger.warn("peer link version mismatch", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+            .version = link.version,
+        });
+        if (host_valid) {
+            rejectLink(frame, table, link, .version_mismatch);
+        } else {
+            closeFd(link.fd);
+        }
+        return;
+    }
+    if (!host_valid) {
+        frame.logger.logger.warn("peer link invalid host", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+        });
+        closeFd(link.fd);
+        return;
+    }
+    if (!link.source_ok) {
+        rejectLink(frame, table, link, .peer_address_mismatch);
+        return;
+    }
+    if (link.index_idx != frame.index_idx) {
+        frame.logger.logger.warn("peer link unknown index", .{
+            .ring_idx = frame.ring_idx,
+            .index_idx = link.index_idx,
+        });
+        rejectLink(frame, table, link, .unknown_index);
+        return;
+    }
+    if (frame.snap.serve != .serving or frame.soft_draining) {
+        frame.logger.logger.warn("peer link refused: index draining", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+        });
+        closeFd(link.fd);
+        return;
+    }
+
+    acceptLink(frame, table, link);
+}
+
+/// A candidate that failed a check is answered with the failing verdict and
+/// closed after that send's completion. A bad duplicate is closed the same
+/// way: only a candidate that passed every check earns the switch predicate.
+fn rejectLink(
+    frame: *Frame,
+    table: *lifetime.LinkTable,
+    link: @FieldType(cross_task.CrossTask, "PeerLink"),
+    verdict: cluster_transport.Verdict,
+) void {
+    const entry = table.acquire(link.host_idx, frame.index_idx) catch |err| {
+        frame.logger.logger.err("peer link entry allocation failed", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+            .err = @errorName(err),
+        });
+        closeFd(link.fd);
+        return;
+    };
+    if (entry.state != .none) {
+        frame.logger.logger.warn("duplicate peer link rejected", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+        });
+        closeFd(link.fd);
+        return;
+    }
+
+    entry.fd = link.fd;
+    entry.version = link.version;
+    entry.state = .greeting;
+    cluster_transport.encodeReply(.{
+        .version = cluster_transport.VERSION,
+        .host_idx = @intCast(frame.ctrl.cfg.host_index),
+        .index_idx = frame.index_idx,
+        .verdict = verdict,
+    }, &entry.reply);
+    armGreetingSend(frame, entry);
+}
+
+/// A candidate that passed every check is answered `ok`; the link goes `up` on
+/// that send's completion. A candidate for a pair that already holds a link is
+/// parked instead and handed to the switch predicate (§3.4).
+fn acceptLink(frame: *Frame, table: *lifetime.LinkTable, link: @FieldType(cross_task.CrossTask, "PeerLink")) void {
+    const entry = table.acquire(link.host_idx, frame.index_idx) catch |err| {
+        frame.logger.logger.err("peer link entry allocation failed", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+            .err = @errorName(err),
+        });
+        closeFd(link.fd);
+        return;
+    };
+    if (entry.state != .none) {
+        parkCandidate(frame, entry, link);
+        return;
+    }
+
+    entry.fd = link.fd;
+    entry.version = link.version;
+    entry.state = .greeting;
+    cluster_transport.encodeReply(.{
+        .version = cluster_transport.VERSION,
+        .host_idx = @intCast(frame.ctrl.cfg.host_index),
+        .index_idx = frame.index_idx,
+        .verdict = .ok,
+    }, &entry.reply);
+    armGreetingSend(frame, entry);
+}
+
+/// Parks a duplicate that passed every check and starts the switch predicate
+/// (§3.4). The candidate keeps its socket but gets no receive arm: the dialer
+/// sends nothing after its greet until it reads a verdict, so a parked
+/// candidate is discarded by a plain close.
+fn parkCandidate(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    link: @FieldType(cross_task.CrossTask, "PeerLink"),
+) void {
+    if (entry.state != .up or entry.candidate_state != .none) {
+        frame.logger.logger.warn("duplicate peer link rejected", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = link.host_idx,
+            .link_state = @tagName(entry.state),
+        });
+        closeFd(link.fd);
+        return;
+    }
+
+    entry.candidate_fd = link.fd;
+    entry.candidate_version = link.version;
+    entry.candidate_state = .parked;
+    entry.probe_pending = true;
+    // The probe tests liveness now: an acknowledgement that landed before it
+    // says nothing about the link the candidate would replace.
+    entry.acked = false;
+
+    frame.logger.logger.warn("duplicate peer link parked", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .index_idx = entry.index_idx,
+    });
+    probeCandidate(frame, entry);
+}
+
+/// Sends the pulse that decides the parked candidate and arms its one-shot
+/// deadline (§3.4, §4.8). A push the ring refuses leaves the candidate parked
+/// and retried on the next pass, never spinning the loop.
+fn probeCandidate(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    if (entry.state != .up or entry.candidate_state != .parked) return;
+    if (entry.predicate_task != null) return;
+
+    sendFrame(frame, entry, cluster_transport.OP_PULSE, &.{}, .{}) catch |err| switch (err) {
+        error.Backpressure, error.RingFull, error.NoFreeSlots, error.OutOfMemory => return,
+        else => {
+            killLink(frame, entry, "pulse could not be submitted");
+            return;
+        },
+    };
+    entry.probe_pending = false;
+
+    // The clock starts when the probe is on the wire: a refused push must not
+    // spend the candidate's deadline on a pulse that never went out.
+    const cluster = frame.ctrl.cfg.cluster.?;
+    setDeadlineSpec(&entry.predicate_spec, cluster.pulse_timeout.value());
+
+    const task_idx = frame.ring.slots.add(.{ .predicate_timeout = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        dropCandidate(frame, entry, @errorName(err));
+        return;
+    };
+    entry.predicate_task = task_idx;
+    frame.ring.ring.pushTicker(task_idx, &entry.predicate_spec, 1, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        entry.predicate_task = null;
+        dropCandidate(frame, entry, @errorName(err));
+    };
+}
+
+/// Discards the candidate without a verdict: the probe could not be timed, so
+/// nothing decides the switch and the established link keeps serving. The peer
+/// retries the dial with the backoff in force.
+fn dropCandidate(frame: *Frame, entry: *cluster_transport.LinkEntry, reason: []const u8) void {
+    const fd = entry.candidate_fd;
+    entry.candidate_fd = -1;
+    entry.candidate_state = .none;
+    entry.probe_pending = false;
+    cancelTask(frame, entry.predicate_task);
+    entry.predicate_task = null;
+
+    frame.logger.logger.warn("duplicate peer link dropped", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .reason = reason,
+    });
+    closeFd(fd);
+}
+
+/// The probe's acknowledgement landed: the established link is alive, so the
+/// candidate is the suspicious side. It gets `host_index_squatting` and is
+/// closed after that send's completion; the link is untouched (§3.4).
+fn resolveProbe(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    // The acknowledgement stays set: it also satisfies the link's keepalive
+    // clock, which shares the flag (§4.8).
+    entry.probe_pending = false;
+    cancelTask(frame, entry.predicate_task);
+    entry.predicate_task = null;
+    if (entry.candidate_state != .parked) return;
+
+    const fd = entry.candidate_fd;
+    entry.candidate_state = .greeting;
+    cluster_transport.encodeReply(.{
+        .version = cluster_transport.VERSION,
+        .host_idx = @intCast(frame.ctrl.cfg.host_index),
+        .index_idx = entry.index_idx,
+        .verdict = .host_index_squatting,
+    }, &entry.candidate_reply);
+
+    const task_idx = frame.ring.slots.add(.{ .pulse = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        entry.candidate_fd = -1;
+        entry.candidate_state = .none;
+        frame.logger.logger.warn("duplicate peer link rejected", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .err = @errorName(err),
+        });
+        closeFd(fd);
+        return;
+    };
+    frame.ring.ring.pushSend(fd, task_idx, &entry.candidate_reply, cluster_transport.REPLY_LEN, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        entry.candidate_fd = -1;
+        entry.candidate_state = .none;
+        frame.logger.logger.warn("duplicate peer link rejected", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .err = @errorName(err),
+        });
+        closeFd(fd);
+        return;
+    };
+    entry.candidate_reply_task = task_idx;
+
+    frame.logger.logger.warn("duplicate peer link rejected: host_index_squatting", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .index_idx = entry.index_idx,
+    });
+}
+
+/// The switch predicate's answer left: the candidate is closed after it, its
+/// descriptor no longer owned by the entry.
+fn onPulse(frame: *Frame, entry: *cluster_transport.LinkEntry, cqe: zigring.CQE) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.candidate_reply_task != cqe.taskIdx()) return;
+    entry.candidate_reply_task = null;
+
+    if (cqe.res != cluster_transport.REPLY_LEN) {
+        frame.logger.logger.warn("duplicate peer link verdict did not leave whole", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .sent = cqe.res,
+        });
+    }
+
+    const fd = entry.candidate_fd;
+    entry.candidate_fd = -1;
+    entry.candidate_state = .none;
+    closePeerFd(frame, entry.host_idx, entry.epoch, fd);
+}
+
+/// The predicate's clock ran out: no acknowledgement means the established
+/// link is dead, and the candidate takes its place (§3.4).
+fn onPredicateTimeout(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.predicate_task != cqe.taskIdx()) return;
+    entry.predicate_task = null;
+    if (entry.epoch != epoch) return;
+    if (entry.candidate_state != .parked) return;
+
+    // The acknowledgement may have landed in this same drain, before the tick.
+    if (entry.acked) {
+        resolveProbe(frame, entry);
+        return;
+    }
+    killLink(frame, entry, "pulse not acknowledged");
+}
+
+/// Arms the repeating keepalive on a link that just went `up` (§4.8). The
+/// handshake itself proved the peer alive, so the first tick has an
+/// acknowledgement to spend; from then on a tick sends one pulse and the next
+/// tick must find its answer. The ticker keeps its slot across ticks, so only
+/// its final (canceled) completion releases it.
+fn armKeepalive(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    if (entry.keepalive_task != null) return;
+    const cluster = frame.ctrl.cfg.cluster orelse return;
+
+    setDeadlineSpec(&entry.keepalive_spec, cluster.keepalive_interval.value());
+
+    const task_idx = frame.ring.slots.add(.{ .keepalive_tick = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        frame.logger.logger.err("peer keepalive arm failed", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .err = @errorName(err),
+        });
+        return;
+    };
+    frame.ring.ring.pushTicker(task_idx, &entry.keepalive_spec, 0, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        frame.logger.logger.err("peer keepalive arm failed", .{
+            .ring_idx = frame.ring_idx,
+            .host_idx = entry.host_idx,
+            .err = @errorName(err),
+        });
+        return;
+    };
+
+    entry.keepalive_task = task_idx;
+    entry.keepalive_pending = false;
+    entry.acked = true;
+}
+
+/// Stops the keepalive when its link ends. The ticker's own final completion is
+/// what releases the slot; clearing the field first makes a late tick
+/// attributable.
+fn cancelKeepalive(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    entry.keepalive_pending = false;
+    const task = entry.keepalive_task orelse return;
+    entry.keepalive_task = null;
+    cancelTask(frame, task);
+}
+
+/// One keepalive tick: a send error or a missing acknowledgement kills the link
+/// the same way any other link death does (§3.6, §4.8).
+fn onKeepaliveTick(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    const final = !cqe.hasMore();
+    if (final) frame.ring.slots.del(cqe.taskIdx());
+
+    const task = entry.keepalive_task orelse return;
+    if (task != cqe.taskIdx()) return;
+    if (final) {
+        entry.keepalive_task = null;
+        return;
+    }
+    if (entry.epoch != epoch) return;
+    if (entry.state != .up) return;
+
+    if (!entry.acked) {
+        killLink(frame, entry, "keepalive not acknowledged");
+        return;
+    }
+    sendKeepalivePulse(frame, entry);
+}
+
+/// Sends the keepalive's pulse. The flag clears only once the frame is on the
+/// ring: a refused push is retried on the next pass instead of spending the
+/// peer's answer on a pulse that never left.
+fn sendKeepalivePulse(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    if (entry.state != .up) return;
+    sendFrame(frame, entry, cluster_transport.OP_PULSE, &.{}, .{}) catch |err| switch (err) {
+        error.Backpressure, error.RingFull, error.NoFreeSlots, error.OutOfMemory => {
+            entry.keepalive_pending = true;
+            return;
+        },
+        else => {
+            killLink(frame, entry, "keepalive pulse could not be submitted");
+            return;
+        },
+    };
+    entry.keepalive_pending = false;
+    entry.acked = false;
+}
+
+/// The probe failed: the candidate replaces the established link. The old
+/// socket is retired with its own close, the stream state returns to absolute
+/// zero and nothing is replayed, because the old host cannot send anything
+/// more (§3.4).
+fn promoteCandidate(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    reason: []const u8,
+) void {
+    const fd = entry.candidate_fd;
+    const version = entry.candidate_version;
+    entry.candidate_fd = -1;
+    entry.candidate_state = .none;
+    entry.probe_pending = false;
+    cancelTask(frame, entry.predicate_task);
+    entry.predicate_task = null;
+
+    closeEntryFd(frame, entry);
+    entry.state = .none;
+    entry.resetConnection();
+
+    entry.fd = fd;
+    entry.version = version;
+    entry.state = .greeting;
+    cluster_transport.encodeReply(.{
+        .version = cluster_transport.VERSION,
+        .host_idx = @intCast(frame.ctrl.cfg.host_index),
+        .index_idx = entry.index_idx,
+        .verdict = .ok,
+    }, &entry.reply);
+
+    frame.logger.logger.warn("peer link replaced", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .index_idx = entry.index_idx,
+        .reason = reason,
+    });
+    armGreetingSend(frame, entry);
+}
+
+fn armGreetingSend(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    const task_idx = frame.ring.slots.add(.{ .greeting_send = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        killLink(frame, entry, @errorName(err));
+        return;
+    };
+    frame.ring.ring.pushSend(entry.fd, task_idx, &entry.reply, cluster_transport.REPLY_LEN, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        killLink(frame, entry, @errorName(err));
+        return;
+    };
+    entry.greeting_task = task_idx;
+}
+
+fn onGreetingSend(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.greeting_task != cqe.taskIdx()) return;
+    entry.greeting_task = null;
+    if (entry.epoch != epoch) return;
+
+    if (cqe.res != cluster_transport.REPLY_LEN) {
+        killLink(frame, entry, "greeting send failed");
+        return;
+    }
+    const reply = cluster_transport.decodeReply(&entry.reply) catch {
+        killLink(frame, entry, "greeting reply decode failed");
+        return;
+    };
+    if (reply.verdict != .ok) {
+        closeEntryFd(frame, entry);
+        entry.state = .none;
+        entry.resetConnection();
+        return;
+    }
+
+    entry.state = .up;
+    entry.resetConnection();
+    armReceive(frame, entry);
+    armKeepalive(frame, entry);
+    frame.logger.logger.info("peer link up", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .index_idx = entry.index_idx,
+    });
+}
+
+/// Arms the next receive: the header remainder, or the body remainder of the
+/// one open reservation. The arm is gated by the undelivered backlog (§4.3).
+fn armReceive(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    if (entry.state != .up) return;
+    if (entry.recv_task != null) return;
+
+    var dst: []u8 = undefined;
+    if (entry.open_reservation != null) {
+        const frame_len: usize = std.mem.readInt(u16, entry.frame_hdr[2..4], .little);
+        dst = entry.frame_slot.?[entry.frame_filled..frame_len];
+    } else {
+        const window = frame.ctrl.cfg.cluster.?.reorder_window;
+        if (entry.pushed_absolute - entry.delivered >= window) return;
+        dst = entry.frame_hdr[entry.filled_hdr..4];
+    }
+    if (dst.len == 0) return;
+
+    const task_idx = frame.ring.slots.add(.{ .frame_recv = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } }) catch |err| {
+        killLink(frame, entry, @errorName(err));
+        return;
+    };
+    frame.ring.ring.pushRecv(entry.fd, task_idx, dst, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        killLink(frame, entry, @errorName(err));
+        return;
+    };
+    entry.recv_task = task_idx;
+}
+
+fn onFrameRecv(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.recv_task != cqe.taskIdx()) return;
+    entry.recv_task = null;
+    if (entry.epoch != epoch) return;
+
+    if (cqe.res < 0) {
+        killLink(frame, entry, "receive error");
+        return;
+    }
+    if (cqe.res == 0) {
+        killLink(frame, entry, "peer closed");
+        return;
+    }
+    const got: usize = @intCast(cqe.res);
+
+    if (entry.open_reservation == null) {
+        entry.filled_hdr += got;
+        if (entry.filled_hdr < 4) {
+            armReceive(frame, entry);
+            return;
+        }
+        onFrameHeader(frame, entry);
+        return;
+    }
+
+    entry.frame_filled += got;
+    const frame_len: usize = std.mem.readInt(u16, entry.frame_hdr[2..4], .little);
+    if (entry.frame_filled < frame_len) {
+        armReceive(frame, entry);
+        return;
+    }
+
+    const abs = entry.open_reservation.?;
+    entry.reorder.commit(abs, frame_len);
+    entry.filled_hdr = 0;
+    entry.open_reservation = null;
+    entry.frame_slot = null;
+    entry.frame_filled = 0;
+    drainFrames(frame, entry);
+    armReceive(frame, entry);
+}
+
+/// A complete four-byte prefix: validate the length, lift the sequence number
+/// and reserve the slot the body lands in (§4.3).
+fn onFrameHeader(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    const seq_id = std.mem.readInt(u16, entry.frame_hdr[0..2], .little);
+    const frame_len: usize = std.mem.readInt(u16, entry.frame_hdr[2..4], .little);
+    if (!cluster_transport.frameLenValid(frame_len)) {
+        killLink(frame, entry, "frame length out of range");
+        return;
+    }
+
+    const window = frame.ctrl.cfg.cluster.?.reorder_window;
+    const abs = cluster_transport.lift(entry.reorder.wave, seq_id, window) orelse {
+        killLink(frame, entry, "unliftable sequence number");
+        return;
+    };
+    const slot = entry.reorder.reserve(abs) catch |err| {
+        killLink(frame, entry, @errorName(err));
+        return;
+    };
+    @memcpy(slot[0..4], entry.frame_hdr[0..]);
+    entry.open_reservation = abs;
+    entry.frame_slot = slot;
+    entry.frame_filled = 4;
+    entry.pushed_absolute = @max(entry.pushed_absolute, abs + 1);
+    armReceive(frame, entry);
+}
+
+const DispatchResult = enum { consumed, retry, death };
+
+/// Delivers every committed frame at the delivery cursor. A frame the control
+/// plane cannot hold stays at the head and is retried next pass (§4.3).
+fn drainFrames(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    while (true) {
+        const bytes = entry.reorder.peekHeadCond(entry.delivered) orelse return;
+        switch (dispatchFrame(frame, entry, bytes)) {
+            .consumed => {
+                entry.reorder.dropHead();
+                entry.delivered += 1;
+            },
+            .retry => return,
+            .death => {
+                killLink(frame, entry, "unknown op code");
+                return;
+            },
+        }
+    }
+}
+
+fn dispatchFrame(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    bytes: []const u8,
+) DispatchResult {
+    const op = bytes[21];
+    switch (op) {
+        cluster_transport.OP_PULSE => {
+            sendFrame(frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, .{}) catch |err| switch (err) {
+                error.Backpressure, error.RingFull => return .retry,
+                else => return .death,
+            };
+            return .consumed;
+        },
+        cluster_transport.OP_PULSE_ACK => {
+            entry.acked = true;
+            return .consumed;
+        },
+        else => {
+            if (op >= 0x10 and op <= 0x7F) return .retry;
+            return .death;
+        },
+    }
+}
+
+/// Encodes one frame into a free send buffer and submits it. `seq_abs` advances
+/// only after a successful submit, so a local `RingFull` leaves no hole (§4.2).
+fn sendFrame(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    op: u8,
+    payload: []const u8,
+    envelope: cluster_transport.CommitEnvelope,
+) !void {
+    const seq = entry.freeSendBuffer() orelse return error.Backpressure;
+    const buf = entry.sendBuffer(seq);
+
+    const vc_host = entry.vc_cursor;
+    const vc_state = frame.data_sets[vc_host].state;
+
+    const len = try cluster_transport.encodeFrame(buf, .{
+        .seq_id = @truncate(entry.seq_abs),
+        .vector_clock_frame = .{ .host_idx = vc_host, .state = vc_state },
+        .op_code = op,
+        .op_payload = payload,
+        .commit_envelope = envelope,
+    });
+
+    const task_idx = try frame.ring.slots.add(.{ .frame_send = .{
+        .host_idx = entry.host_idx,
+        .epoch = entry.epoch,
+    } });
+    frame.ring.ring.pushSend(entry.fd, task_idx, buf.ptr, len, .{}) catch |err| {
+        frame.ring.slots.del(task_idx);
+        return err;
+    };
+
+    entry.setSendBusy(seq, true);
+    entry.send_task[seq] = task_idx;
+    entry.seq_abs += 1;
+    entry.vc_cursor = @intCast((@as(usize, vc_host) + 1) % frame.data_sets.len);
+}
+
+fn onFrameSend(
+    frame: *Frame,
+    entry: *cluster_transport.LinkEntry,
+    epoch: u32,
+    cqe: zigring.CQE,
+) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    if (entry.epoch != epoch) return;
+
+    const seq = entry.findSendTask(cqe.taskIdx()) orelse return;
+    entry.send_task[seq] = null;
+    entry.setSendBusy(seq, false);
+
+    const buf = entry.sendBuffer(seq);
+    const len: i32 = std.mem.readInt(u16, buf[2..4], .little);
+    if (cqe.res != len) {
+        killLink(frame, entry, "frame send failed");
+    }
+}
+
+/// Retries every link's undelivered head once per loop pass.
+fn drainLinks(frame: *Frame) void {
+    const table = linkTable(frame) orelse return;
+    for (table.entries) |maybe| {
+        const entry = maybe orelse continue;
+        if (entry.state != .up) continue;
+        drainFrames(frame, entry);
+        if (entry.candidate_state == .parked) {
+            // The probe's own progress is stepped here, once per pass, never
+            // inside a completion: an acknowledgement that landed in this drain
+            // resolves the predicate, and a pulse the ring refused is retried.
+            if (entry.acked) {
+                resolveProbe(frame, entry);
+            } else if (entry.probe_pending) {
+                probeCandidate(frame, entry);
+            }
+        }
+        if (entry.keepalive_pending and entry.acked) sendKeepalivePulse(frame, entry);
+        armReceive(frame, entry);
+    }
+}
+
+/// Closes every link before the index reports its drain (§3.7).
+///
+/// `shutdown_soft` keeps the links alive until the last session is gone, so
+/// this runs only once the service loop is leaving; `shutdown_hard` reaches it
+/// at once. Each descriptor is retired with its own close, every timer that
+/// still guarded it is canceled, and the entry returns to a dead connection.
+/// The completion queue is then drained one last time, so a hand-over slot
+/// that raced the shutdown is released and its descriptor closed.
+fn teardownLinks(frame: *Frame) void {
+    closeLinks(frame);
+    drainFinalCQ(frame);
+}
+
+fn closeLinks(frame: *Frame) void {
+    frame.links_closed = true;
+    const table = linkTable(frame) orelse return;
+
+    for (table.entries) |maybe| {
+        const entry = maybe orelse continue;
+
+        cancelKeepalive(frame, entry);
+        cancelTask(frame, entry.predicate_task);
+        entry.predicate_task = null;
+        entry.probe_pending = false;
+        cancelTask(frame, entry.retry_task);
+        entry.retry_task = null;
+        entry.retry_pending = false;
+        cancelDial(frame, entry);
+        cancelTask(frame, entry.candidate_reply_task);
+        entry.candidate_reply_task = null;
+
+        if (entry.candidate_fd >= 0) {
+            const fd = entry.candidate_fd;
+            entry.candidate_fd = -1;
+            entry.candidate_state = .none;
+            closePeerFd(frame, entry.host_idx, entry.epoch, fd);
+        }
+
+        closeEntryFd(frame, entry);
+        entry.state = .none;
+        entry.resetConnection();
+    }
+}
+
+/// The final full drain (§3.7): a `PeerLink` whose completion arrived after the
+/// loop's last pass is released and its descriptor closed, never greeted. A
+/// stale completion is attributable by its epoch and ignored.
+fn drainFinalCQ(frame: *Frame) void {
+    while (frame.ring.ring.popCQE()) |cqe| stepCQE(frame, cqe);
+}
+
+/// Tears a link down: the descriptor is retired with a dedicated close, the
+/// reorder buffer returns to absolute zero and the epoch advances so a late
+/// completion is ignored (§3.6). A parked candidate outlives the link it was
+/// probing: a dead link installs it instead (§3.4).
+fn killLink(frame: *Frame, entry: *cluster_transport.LinkEntry, reason: []const u8) void {
+    frame.logger.logger.warn("peer link died", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = entry.host_idx,
+        .reason = reason,
+    });
+    cancelKeepalive(frame, entry);
+    if (entry.candidate_state == .parked) {
+        promoteCandidate(frame, entry, reason);
+        return;
+    }
+    closeEntryFd(frame, entry);
+    entry.state = .none;
+    entry.resetConnection();
+
+    // §3.6: a death arms the lower host's retry timer. The higher host never
+    // dials, so it closes and waits for the lower host to come back.
+    if (frame.ctrl.cfg.host_index < @as(u16, entry.host_idx)) armRetry(frame, entry);
+}
+
+fn closeEntryFd(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
+    const fd = entry.fd;
+    entry.fd = -1;
+    closePeerFd(frame, entry.host_idx, entry.epoch, fd);
+}
+
+/// Retires one descriptor with a dedicated close, so its completion is
+/// attributable and never confused with a reused number.
+fn closePeerFd(frame: *Frame, host_idx: u8, epoch: u32, fd: posix.fd_t) void {
+    if (fd < 0) return;
+
+    const task_idx = frame.ring.slots.add(.{ .peer_close = .{
+        .host_idx = host_idx,
+        .epoch = epoch,
+    } }) catch {
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    frame.ring.ring.pushClose(task_idx, fd, .{}) catch {
+        frame.ring.slots.del(task_idx);
+        _ = std.os.linux.close(fd);
+    };
+}
+
+fn onPeerClose(frame: *Frame, host_idx: u8, epoch: u32, cqe: zigring.CQE) void {
+    frame.ring.slots.del(cqe.taskIdx());
+    frame.logger.logger.debug("peer link closed", .{
+        .ring_idx = frame.ring_idx,
+        .host_idx = host_idx,
+        .epoch = epoch,
+    });
 }
 
 /// Steps the armed continuation outside the batch window (§5, D1). A reply
@@ -2224,4 +3573,888 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
         }
         try expectSameSessions(&reference, &st);
     }
+}
+
+/// A two-host cluster config: the transport is live and the own peer slot is
+/// empty.
+fn clusterTestConfig(dir: []const u8) config.Config {
+    var cfg = testConfig(dir, 2, 0, .{});
+    cfg.cluster = .{
+        .peer_port = 7001,
+        .peers = &[_][]const u8{ "", "127.0.0.1" },
+    };
+    return cfg;
+}
+
+/// The Stage F fixture: a live transport, one index ring and one link entry.
+const LinkFixture = struct {
+    cfg: config.Config = undefined,
+    ctrl: lifetime.Controller = undefined,
+    logger: *lifetime.LoggerStuff = undefined,
+    sets: [2]state.IndexState = undefined,
+    frame: Frame = undefined,
+
+    fn init(self: *LinkFixture, dir: []const u8) !void {
+        try self.initOnPort(dir, 7001);
+    }
+
+    fn initOnPort(self: *LinkFixture, dir: []const u8, peer_port: u16) !void {
+        self.cfg = clusterTestConfig(dir);
+        self.cfg.cluster.?.peer_port = peer_port;
+        try self.ctrl.init(std.testing.allocator, &self.cfg);
+        try self.ctrl.initRing(1, 1);
+        self.logger = try self.ctrl.getLogger(1);
+        for (&self.sets) |*st| try self.ctrl.initIndexState(st);
+        self.frame = testFrame(&self.ctrl, 1, self.logger, &self.sets);
+    }
+
+    fn deinit(self: *LinkFixture) void {
+        for (&self.sets) |*st| self.ctrl.deinitIndexState(st);
+        dropTestLogger(&self.ctrl, self.logger);
+        self.ctrl.rings[1].deinit();
+        self.ctrl.deinit();
+    }
+
+    fn entry(self: *LinkFixture) !*cluster_transport.LinkEntry {
+        return self.ctrl.link_tables[0].acquire(1, 0);
+    }
+};
+
+fn socketPair() ![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    const res = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (std.os.linux.errno(res) != .SUCCESS) return error.SocketPairFailed;
+    return fds;
+}
+
+fn listenLoopback() !struct { fd: posix.fd_t, port: u16 } {
+    const fd = try zigring.createTCPServerSocket();
+    errdefer _ = std.os.linux.close(fd);
+
+    const ip = std.Io.net.Ip4Address.loopback(0);
+    var addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = @bitCast(ip.bytes),
+    };
+
+    const bind_res = std.os.linux.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    if (std.os.linux.errno(bind_res) != .SUCCESS) return error.BindFailed;
+    const listen_res = std.os.linux.listen(fd, 8);
+    if (std.os.linux.errno(listen_res) != .SUCCESS) return error.ListenFailed;
+
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    const name_res = std.os.linux.getsockname(fd, @ptrCast(&addr), &len);
+    if (std.os.linux.errno(name_res) != .SUCCESS) return error.GetSockNameFailed;
+
+    return .{ .fd = fd, .port = std.mem.nativeToBig(u16, addr.port) };
+}
+
+fn readExact(fd: posix.fd_t, dst: []u8) !void {
+    var got: usize = 0;
+    while (got < dst.len) {
+        const n = try posix.read(fd, dst[got..]);
+        if (n == 0) return error.EndOfStream;
+        got += n;
+    }
+}
+
+fn writeExact(fd: posix.fd_t, src: []const u8) !void {
+    var written: usize = 0;
+    while (written < src.len) {
+        const rc = std.os.linux.write(fd, src[written..].ptr, src.len - written);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.WriteFailed;
+        written += rc;
+    }
+}
+
+const DialWait = struct {
+    entry: *cluster_transport.LinkEntry,
+    step: enum { greeted, up, retry },
+
+    fn ready(self: DialWait) bool {
+        return switch (self.step) {
+            .greeted => self.entry.greet_task != null,
+            .up => self.entry.state == .up,
+            .retry => self.entry.retry_task != null,
+        };
+    }
+};
+
+fn pumpDial(frame: *Frame, wait: DialWait, deadline_ns: u64) void {
+    while (zigring.monotonicNs() < deadline_ns) {
+        if (wait.ready()) return;
+        if (frame.ring.ring.popCQE()) |cqe| {
+            stepCQE(frame, cqe);
+            continue;
+        }
+        std.atomic.spinLoopHint();
+    }
+}
+
+test "the dialer greets and installs the link on an ok verdict" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    const listener = try listenLoopback();
+    defer _ = std.os.linux.close(listener.fd);
+
+    var f: LinkFixture = undefined;
+    try f.initOnPort(dir, listener.port);
+    defer f.deinit();
+
+    dialPeers(&f.frame);
+
+    const accepted_raw = std.os.linux.accept(listener.fd, null, null);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(accepted_raw));
+    const peer: posix.fd_t = @intCast(accepted_raw);
+    defer _ = std.os.linux.close(peer);
+
+    const entry = f.ctrl.link_tables[0].get(1).?;
+    const deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
+
+    pumpDial(&f.frame, .{ .entry = entry, .step = .greeted }, deadline);
+    try testing.expect(entry.greet_task != null);
+
+    var greet_bytes: [cluster_transport.GREET_LEN]u8 = undefined;
+    try readExact(peer, &greet_bytes);
+    const greet = cluster_transport.decodeGreet(&greet_bytes);
+    try testing.expectEqual(cluster_transport.VERSION, greet.version);
+    try testing.expectEqual(@as(u8, 0), greet.host_idx);
+    try testing.expectEqual(@as(u16, 0), greet.index_idx);
+
+    var reply_bytes: [cluster_transport.REPLY_LEN]u8 = undefined;
+    cluster_transport.encodeReply(.{
+        .version = cluster_transport.VERSION,
+        .host_idx = 1,
+        .index_idx = 0,
+        .verdict = .ok,
+    }, &reply_bytes);
+    try writeExact(peer, &reply_bytes);
+
+    pumpDial(&f.frame, .{ .entry = entry, .step = .up }, deadline);
+    try testing.expectEqual(cluster_transport.LinkState.up, entry.state);
+    try testing.expectEqual(cluster_transport.RETRY_MIN, entry.retry_backoff);
+    // The handshake proved the peer alive: the dialer's side arms the
+    // keepalive on `up` (§4.8).
+    try testing.expect(entry.keepalive_task != null);
+    cancelKeepalive(&f.frame, entry);
+}
+
+test "a non-ok verdict closes the dial and arms the retry" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    const listener = try listenLoopback();
+    defer _ = std.os.linux.close(listener.fd);
+
+    var f: LinkFixture = undefined;
+    try f.initOnPort(dir, listener.port);
+    defer f.deinit();
+
+    dialPeers(&f.frame);
+
+    const accepted_raw = std.os.linux.accept(listener.fd, null, null);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(accepted_raw));
+    const peer: posix.fd_t = @intCast(accepted_raw);
+    defer _ = std.os.linux.close(peer);
+
+    const entry = f.ctrl.link_tables[0].get(1).?;
+    const deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
+
+    pumpDial(&f.frame, .{ .entry = entry, .step = .greeted }, deadline);
+    try testing.expect(entry.greet_task != null);
+
+    var greet_bytes: [cluster_transport.GREET_LEN]u8 = undefined;
+    try readExact(peer, &greet_bytes);
+
+    var reply_bytes: [cluster_transport.REPLY_LEN]u8 = undefined;
+    cluster_transport.encodeReply(.{
+        .version = cluster_transport.VERSION,
+        .host_idx = 1,
+        .index_idx = 0,
+        .verdict = .host_index_squatting,
+    }, &reply_bytes);
+    try writeExact(peer, &reply_bytes);
+
+    pumpDial(&f.frame, .{ .entry = entry, .step = .retry }, deadline);
+    try testing.expectEqual(cluster_transport.LinkState.none, entry.state);
+    try testing.expect(entry.retry_task != null);
+    try testing.expectEqual(cluster_transport.RETRY_MIN * 2, entry.retry_backoff);
+}
+
+test "the dial backoff doubles to the cap" {
+    try std.testing.expectEqual(cluster_transport.RETRY_MIN * 2, nextBackoff(cluster_transport.RETRY_MIN));
+    try std.testing.expectEqual(cluster_transport.RETRY_MAX, nextBackoff(cluster_transport.RETRY_MAX));
+    try std.testing.expectEqual(cluster_transport.RETRY_MAX, nextBackoff(cluster_transport.RETRY_MAX / 2));
+}
+
+test "the send path encodes a frame and advances the sequence" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const entry = try f.entry();
+    const fds = try socketPair();
+    defer _ = std.os.linux.close(fds[1]);
+    entry.fd = fds[0];
+    entry.state = .up;
+
+    try sendFrame(&f.frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, .{});
+    try testing.expectEqual(@as(u64, 1), entry.seq_abs);
+    try testing.expect(entry.sendBusy(0));
+
+    var buf: [cluster_transport.FRAME_CAP]u8 = undefined;
+    const got = try std.posix.read(fds[1], &buf);
+    try testing.expectEqual(@as(usize, cluster_transport.FRAME_MIN), got);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, buf[0..2], .little));
+    try testing.expectEqual(@as(u16, cluster_transport.FRAME_MIN), std.mem.readInt(u16, buf[2..4], .little));
+    try testing.expectEqual(cluster_transport.OP_PULSE_ACK, buf[21]);
+
+    const cqe = cqeBefore(&f.ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
+        return error.SendCqeTimeout;
+    onFrameSend(&f.frame, entry, entry.epoch, cqe);
+    try testing.expect(!entry.sendBusy(0));
+    try testing.expectEqual(@as(?u64, null), entry.send_task[0]);
+}
+
+test "the send path reports backpressure when every buffer is busy" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const entry = try f.entry();
+    const fds = try socketPair();
+    defer _ = std.os.linux.close(fds[1]);
+    entry.fd = fds[0];
+    entry.state = .up;
+
+    var seq: u16 = 0;
+    while (seq < entry.inflight) : (seq += 1) entry.setSendBusy(seq, true);
+    try testing.expectError(
+        error.Backpressure,
+        sendFrame(&f.frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, .{}),
+    );
+}
+
+test "the drain delivers a committed frame and advances the cursor" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const entry = try f.entry();
+    entry.state = .up;
+
+    var wire: [cluster_transport.FRAME_CAP]u8 = undefined;
+    const len = try cluster_transport.encodeFrame(&wire, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = cluster_transport.OP_PULSE_ACK,
+        .op_payload = &.{},
+    });
+    try entry.reorder.push(0, wire[0..len]);
+
+    drainFrames(&f.frame, entry);
+    try testing.expect(entry.acked);
+    try testing.expectEqual(@as(u64, 1), entry.delivered);
+}
+
+test "an unknown op code is a link death and a consensus op is retried" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const entry = try f.entry();
+    entry.state = .up;
+
+    var wire: [cluster_transport.FRAME_CAP]u8 = undefined;
+    var len = try cluster_transport.encodeFrame(&wire, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = 0x80,
+        .op_payload = &.{},
+    });
+    try testing.expectEqual(DispatchResult.death, dispatchFrame(&f.frame, entry, wire[0..len]));
+
+    len = try cluster_transport.encodeFrame(&wire, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = 0x20,
+        .op_payload = &.{},
+    });
+    try testing.expectEqual(DispatchResult.retry, dispatchFrame(&f.frame, entry, wire[0..len]));
+}
+
+test "a valid peer link is greeted ok and goes up on the send completion" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const fds = try socketPair();
+    defer _ = std.os.linux.close(fds[1]);
+
+    onPeerLink(&f.frame, .{
+        .fd = fds[0],
+        .host_idx = 1,
+        .index_idx = 0,
+        .version = cluster_transport.VERSION,
+        .source_ok = true,
+    });
+
+    const entry = f.ctrl.link_tables[0].get(1) orelse return error.MissingLinkEntry;
+    try testing.expectEqual(cluster_transport.LinkState.greeting, entry.state);
+    const reply = try cluster_transport.decodeReply(&entry.reply);
+    try testing.expectEqual(cluster_transport.Verdict.ok, reply.verdict);
+
+    var buf: [cluster_transport.REPLY_LEN]u8 = undefined;
+    const got = try std.posix.read(fds[1], &buf);
+    try testing.expectEqual(@as(usize, cluster_transport.REPLY_LEN), got);
+
+    const cqe = cqeBefore(&f.ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
+        return error.GreetingCqeTimeout;
+    onGreetingSend(&f.frame, entry, entry.epoch, cqe);
+    try testing.expectEqual(cluster_transport.LinkState.up, entry.state);
+    try testing.expect(entry.recv_task != null);
+    // The acceptor arms its own keepalive on the same transition.
+    try testing.expect(entry.keepalive_task != null);
+    cancelKeepalive(&f.frame, entry);
+}
+
+test "a peer link with a bad source is rejected with peer_address_mismatch" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const fds = try socketPair();
+    defer _ = std.os.linux.close(fds[1]);
+
+    onPeerLink(&f.frame, .{
+        .fd = fds[0],
+        .host_idx = 1,
+        .index_idx = 0,
+        .version = cluster_transport.VERSION,
+        .source_ok = false,
+    });
+
+    const entry = f.ctrl.link_tables[0].get(1) orelse return error.MissingLinkEntry;
+    try testing.expectEqual(cluster_transport.LinkState.greeting, entry.state);
+    const reply = try cluster_transport.decodeReply(&entry.reply);
+    try testing.expectEqual(cluster_transport.Verdict.peer_address_mismatch, reply.verdict);
+
+    var buf: [cluster_transport.REPLY_LEN]u8 = undefined;
+    const got = try std.posix.read(fds[1], &buf);
+    try testing.expectEqual(@as(usize, cluster_transport.REPLY_LEN), got);
+
+    const cqe = cqeBefore(&f.ctrl.rings[1].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
+        return error.GreetingCqeTimeout;
+    onGreetingSend(&f.frame, entry, entry.epoch, cqe);
+    try testing.expectEqual(cluster_transport.LinkState.none, entry.state);
+    try testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
+}
+
+/// Sets up an established link between the entry and a live socket pair: the
+/// entry holds one end, the test drives the peer on the other.
+fn establishedLink(f: *LinkFixture) !struct { entry: *cluster_transport.LinkEntry, fds: [2]posix.fd_t } {
+    const entry = try f.entry();
+    const fds = try socketPair();
+    entry.fd = fds[0];
+    entry.state = .up;
+    return .{ .entry = entry, .fds = fds };
+}
+
+test "a duplicate candidate parks without a receive arm and probes the link" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+
+    const cand = try socketPair();
+    defer _ = std.os.linux.close(cand[1]);
+
+    onPeerLink(&f.frame, .{
+        .fd = cand[0],
+        .host_idx = 1,
+        .index_idx = 0,
+        .version = cluster_transport.VERSION,
+        .source_ok = true,
+    });
+
+    // The established link is untouched and still `up`; the candidate is
+    // parked with its socket and without a receive arm of its own.
+    try testing.expectEqual(cluster_transport.LinkState.up, entry.state);
+    try testing.expectEqual(cluster_transport.LinkState.parked, entry.candidate_state);
+    try testing.expectEqual(cand[0], entry.candidate_fd);
+    try testing.expectEqual(@as(?u64, null), entry.recv_task);
+    try testing.expect(entry.predicate_task != null);
+
+    // The probe is a pulse on the established link, consuming a `seq_id`.
+    try testing.expectEqual(@as(u64, 1), entry.seq_abs);
+    var wire: [cluster_transport.FRAME_CAP]u8 = undefined;
+    const got = try std.posix.read(live.fds[1], &wire);
+    try testing.expectEqual(@as(usize, cluster_transport.FRAME_MIN), got);
+    try testing.expectEqual(cluster_transport.OP_PULSE, wire[21]);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, wire[0..2], .little));
+}
+
+test "an acknowledged probe rejects the candidate and keeps the link" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+
+    const cand = try socketPair();
+    defer _ = std.os.linux.close(cand[1]);
+
+    onPeerLink(&f.frame, .{
+        .fd = cand[0],
+        .host_idx = 1,
+        .index_idx = 0,
+        .version = cluster_transport.VERSION,
+        .source_ok = true,
+    });
+    try testing.expectEqual(cluster_transport.LinkState.parked, entry.candidate_state);
+
+    // The peer answers the pulse: the acknowledgement is any inbound frame,
+    // here delivered through the link's own reorder stream.
+    var wire: [cluster_transport.FRAME_CAP]u8 = undefined;
+    const len = try cluster_transport.encodeFrame(&wire, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = cluster_transport.OP_PULSE_ACK,
+        .op_payload = &.{},
+    });
+    try entry.reorder.push(0, wire[0..len]);
+    entry.pushed_absolute = 1;
+
+    drainLinks(&f.frame);
+
+    // The link survives, its clock is cancelled, and the candidate is answered.
+    try testing.expectEqual(cluster_transport.LinkState.up, entry.state);
+    try testing.expectEqual(cluster_transport.LinkState.greeting, entry.candidate_state);
+    try testing.expectEqual(@as(?u64, null), entry.predicate_task);
+    // The acknowledgement is shared with the keepalive clock (§4.8): rejecting
+    // the candidate must not spend it.
+    try testing.expect(entry.acked);
+
+    var reply_bytes: [cluster_transport.REPLY_LEN]u8 = undefined;
+    const got = try std.posix.read(cand[1], &reply_bytes);
+    try testing.expectEqual(@as(usize, cluster_transport.REPLY_LEN), got);
+    const reply = try cluster_transport.decodeReply(&reply_bytes);
+    try testing.expectEqual(cluster_transport.Verdict.host_index_squatting, reply.verdict);
+
+    // The candidate is closed only after its verdict left whole.
+    const reply_task = entry.candidate_reply_task orelse return error.MissingCandidateReply;
+    const deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
+    while (entry.candidate_reply_task != null) {
+        const cqe = cqeBefore(&f.ctrl.rings[1].ring, deadline) orelse return error.CqeTimeout;
+        if (cqe.taskIdx() == reply_task) {
+            onPulse(&f.frame, entry, cqe);
+        } else {
+            stepCQE(&f.frame, cqe);
+        }
+    }
+    try testing.expectEqual(@as(posix.fd_t, -1), entry.candidate_fd);
+    try testing.expectEqual(cluster_transport.LinkState.none, entry.candidate_state);
+    try testing.expectEqual(cluster_transport.LinkState.up, entry.state);
+    try testing.expect(entry.fd >= 0);
+}
+
+test "a timed-out probe installs the candidate at absolute zero" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+    const old_fd = live.fds[0];
+    const old_epoch = entry.epoch;
+
+    // Frames from the old connection moved both counters off zero.
+    entry.seq_abs = 7;
+    entry.delivered = 3;
+    entry.pushed_absolute = 5;
+    const old_wire = try cluster_transport.encodeFrame(entry.sendBuffer(0), .{
+        .seq_id = 6,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = cluster_transport.OP_PULSE_ACK,
+        .op_payload = &.{},
+    });
+    try entry.reorder.push(2, entry.sendBuffer(0)[0..old_wire]);
+    entry.pushed_absolute = 3;
+
+    const cand = try socketPair();
+    defer _ = std.os.linux.close(cand[1]);
+
+    onPeerLink(&f.frame, .{
+        .fd = cand[0],
+        .host_idx = 1,
+        .index_idx = 0,
+        .version = cluster_transport.VERSION,
+        .source_ok = true,
+    });
+    const predicate_task = entry.predicate_task orelse return error.MissingPredicateTimer;
+
+    // The deadline fires before any acknowledgement arrives.
+    onPredicateTimeout(&f.frame, entry, old_epoch, .{
+        .user_data = predicate_task,
+        .res = 0,
+        .flags = 0,
+    });
+
+    // The candidate owns the link now and the old connection is retired.
+    try testing.expectEqual(cand[0], entry.fd);
+    try testing.expect(entry.fd != old_fd);
+    try testing.expectEqual(@as(posix.fd_t, -1), entry.candidate_fd);
+    try testing.expectEqual(cluster_transport.LinkState.none, entry.candidate_state);
+    try testing.expectEqual(old_epoch +% 1, entry.epoch);
+    try testing.expectEqual(cluster_transport.LinkState.greeting, entry.state);
+    try testing.expectEqual(@as(u64, 0), entry.seq_abs);
+    try testing.expectEqual(@as(u64, 0), entry.delivered);
+    try testing.expectEqual(@as(u64, 0), entry.pushed_absolute);
+    try testing.expectEqual(@as(u64, 0), entry.reorder.wave);
+
+    const reply = try cluster_transport.decodeReply(&entry.reply);
+    try testing.expectEqual(cluster_transport.Verdict.ok, reply.verdict);
+
+    // The greeting goes `up` on its own completion, with a fresh receive.
+    const deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
+    while (entry.state != .up) {
+        const cqe = cqeBefore(&f.ctrl.rings[1].ring, deadline) orelse return error.CqeTimeout;
+        stepCQE(&f.frame, cqe);
+    }
+    try testing.expect(entry.recv_task != null);
+}
+
+test "a keepalive tick sends a pulse and clears the acknowledgement" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+
+    armKeepalive(&f.frame, entry);
+    const task = entry.keepalive_task orelse return error.MissingKeepalive;
+    // The handshake is the first acknowledgement the clock spends.
+    try testing.expect(entry.acked);
+    try testing.expectEqual(
+        @as(i64, @intCast(@divTrunc(f.cfg.cluster.?.keepalive_interval.value(), std.time.ns_per_s))),
+        @as(i64, entry.keepalive_spec.sec),
+    );
+
+    // A normal tick: the multishot is still armed, so `hasMore` stays set.
+    onKeepaliveTick(&f.frame, entry, entry.epoch, .{
+        .user_data = task,
+        .res = -@as(i32, @intCast(@backingInt(std.os.linux.E.TIME))),
+        .flags = 2,
+    });
+
+    try testing.expectEqual(@as(u64, 1), entry.seq_abs);
+    try testing.expect(!entry.acked);
+    try testing.expect(!entry.keepalive_pending);
+    try testing.expectEqual(task, entry.keepalive_task.?);
+
+    var wire: [cluster_transport.FRAME_CAP]u8 = undefined;
+    const got = try std.posix.read(live.fds[1], &wire);
+    try testing.expectEqual(@as(usize, cluster_transport.FRAME_MIN), got);
+    try testing.expectEqual(cluster_transport.OP_PULSE, wire[21]);
+
+    // The peer's acknowledgement re-arms the flag for the next tick.
+    const len = try cluster_transport.encodeFrame(&wire, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 1, .state = 0 },
+        .op_code = cluster_transport.OP_PULSE_ACK,
+        .op_payload = &.{},
+    });
+    try entry.reorder.push(0, wire[0..len]);
+    entry.pushed_absolute = 1;
+    drainLinks(&f.frame);
+    try testing.expect(entry.acked);
+
+    cancelKeepalive(&f.frame, entry);
+    try testing.expectEqual(@as(?u64, null), entry.keepalive_task);
+}
+
+test "a keepalive tick without an acknowledgement kills the link" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+
+    armKeepalive(&f.frame, entry);
+    const task = entry.keepalive_task orelse return error.MissingKeepalive;
+    entry.acked = false;
+
+    onKeepaliveTick(&f.frame, entry, entry.epoch, .{
+        .user_data = task,
+        .res = -@as(i32, @intCast(@backingInt(std.os.linux.E.TIME))),
+        .flags = 2,
+    });
+
+    // §3.6's teardown ran: the descriptor is retired, the stream returns to
+    // absolute zero and the ticker is canceled.
+    try testing.expectEqual(cluster_transport.LinkState.none, entry.state);
+    try testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
+    try testing.expectEqual(@as(?u64, null), entry.keepalive_task);
+    try testing.expect(!entry.keepalive_pending);
+    try testing.expectEqual(@as(u64, 0), entry.seq_abs);
+}
+
+test "the canceled keepalive's final completion releases its slot" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+
+    armKeepalive(&f.frame, entry);
+    const task = entry.keepalive_task orelse return error.MissingKeepalive;
+    cancelKeepalive(&f.frame, entry);
+    try testing.expectEqual(@as(?u64, null), entry.keepalive_task);
+    try testing.expect(f.frame.ring.slots.get(task) != null);
+
+    // The kernel's final completion of a canceled unlimited ticker.
+    onKeepaliveTick(&f.frame, entry, entry.epoch, .{
+        .user_data = task,
+        .res = -@as(i32, @intCast(@backingInt(std.os.linux.E.CANCELED))),
+        .flags = 0,
+    });
+    try testing.expect(f.frame.ring.slots.get(task) == null);
+    try testing.expectEqual(@as(?u64, null), entry.keepalive_task);
+}
+
+test "a backpressured keepalive pulse is retried on the next pass" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+
+    armKeepalive(&f.frame, entry);
+    var seq: u16 = 0;
+    while (seq < entry.inflight) : (seq += 1) entry.setSendBusy(seq, true);
+
+    sendKeepalivePulse(&f.frame, entry);
+    // Nothing left the ring, so the acknowledgement is not spent yet.
+    try testing.expect(entry.keepalive_pending);
+    try testing.expect(entry.acked);
+    try testing.expectEqual(@as(u64, 0), entry.seq_abs);
+
+    seq = 0;
+    while (seq < entry.inflight) : (seq += 1) entry.setSendBusy(seq, false);
+    drainLinks(&f.frame);
+    try testing.expect(!entry.keepalive_pending);
+    try testing.expect(!entry.acked);
+    try testing.expectEqual(@as(u64, 1), entry.seq_abs);
+
+    cancelKeepalive(&f.frame, entry);
+}
+/// Whether the descriptor has already been closed: the kernel answer the
+/// teardown tests use to prove a close landed.
+fn fdClosed(fd: posix.fd_t) bool {
+    return std.os.linux.errno(std.os.linux.fcntl(fd, std.os.linux.F.GETFD, 0)) == .BADF;
+}
+
+test "the drain closes every link and reaps the close completions" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const live = try establishedLink(&f);
+    defer _ = std.os.linux.close(live.fds[1]);
+    const entry = live.entry;
+    armKeepalive(&f.frame, entry);
+
+    // A duplicate candidate parked by the switch predicate is a descriptor the
+    // entry still owns, so the drain must retire it too.
+    const cand = try socketPair();
+    defer _ = std.os.linux.close(cand[1]);
+    onPeerLink(&f.frame, .{
+        .fd = cand[0],
+        .host_idx = 1,
+        .index_idx = 0,
+        .version = cluster_transport.VERSION,
+        .source_ok = true,
+    });
+    try testing.expectEqual(cluster_transport.LinkState.parked, entry.candidate_state);
+
+    // One packet the link had queued, so the drain meets a live send too.
+    try sendFrame(&f.frame, entry, cluster_transport.OP_PULSE, &.{}, .{});
+
+    teardownLinks(&f.frame);
+
+    // §3.7: both descriptors are retired, the link is dead and the stream
+    // state returns to absolute zero; the ticker is gone.
+    try testing.expect(f.frame.links_closed);
+    try testing.expectEqual(cluster_transport.LinkState.none, entry.state);
+    try testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
+    try testing.expectEqual(@as(posix.fd_t, -1), entry.candidate_fd);
+    try testing.expectEqual(cluster_transport.LinkState.none, entry.candidate_state);
+    try testing.expectEqual(@as(?u64, null), entry.keepalive_task);
+    try testing.expectEqual(@as(u64, 0), entry.seq_abs);
+    try testing.expectEqual(@as(u64, 0), entry.reorder.wave);
+
+    // The closes are SQEs of their own: step them until the kernel reports both
+    // descriptors gone, which proves the completions were reaped, not leaked.
+    const deadline = zigring.monotonicNs() + 5 * std.time.ns_per_s;
+    while (zigring.monotonicNs() < deadline) {
+        if (f.frame.ring.ring.popCQE()) |cqe| {
+            stepCQE(&f.frame, cqe);
+            continue;
+        }
+        if (fdClosed(live.fds[0]) and fdClosed(cand[0])) break;
+        std.atomic.spinLoopHint();
+    }
+    try testing.expect(fdClosed(live.fds[0]));
+    try testing.expect(fdClosed(cand[0]));
+}
+
+test "a hand-over that raced the drain is closed, never greeted" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer testing.allocator.free(dir);
+
+    var f: LinkFixture = undefined;
+    try f.init(dir);
+    defer f.deinit();
+
+    const cand = try socketPair();
+    defer _ = std.os.linux.close(cand[1]);
+
+    closeLinks(&f.frame);
+    onPeerLink(&f.frame, .{
+        .fd = cand[0],
+        .host_idx = 1,
+        .index_idx = 0,
+        .version = cluster_transport.VERSION,
+        .source_ok = true,
+    });
+
+    // The final drain's hand-over is a plain close: no entry, no greeting.
+    try testing.expect(fdClosed(cand[0]));
+    try testing.expect(f.ctrl.link_tables[0].get(1) == null);
 }

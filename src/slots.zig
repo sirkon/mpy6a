@@ -45,6 +45,99 @@ pub const TaskCtx = union(enum) {
         /// Where the front thread is in its own lifecycle bookkeeping.
         generation: u32 = 0,
     },
+    /// A multishot accept armed on the shared peer listener. The client arm
+    /// above stays single-purpose, so the two are never confused.
+    peer_accept: struct {
+        /// Where the front thread is in its own lifecycle bookkeeping.
+        generation: u32 = 0,
+    },
+    /// The front's exact-length read of a peer greet, into its handshake
+    /// entry's buffer.
+    greet_read: struct {
+        entry: u32,
+    },
+    /// The front's greet deadline: the one absolute clock over the re-armed
+    /// partial reads.
+    greet_deadline: struct {
+        entry: u32,
+    },
+    /// A front-side reject reply. The connection is closed after this send's
+    /// completion.
+    reply_send: struct {
+        entry: u32,
+    },
+    /// The acceptor's seven-byte greeting reply. The link goes `up` on this
+    /// send's completion, or closes after it when the verdict rejects.
+    greeting_send: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// One frame's send completion: the buffer it used is freed here.
+    frame_send: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// One frame's receive completion: a header fragment or a body fragment.
+    frame_recv: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// A dedicated close of a link's descriptor, attributable by epoch.
+    peer_close: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The switch predicate's own work: the verdict the parked candidate is
+    /// answered with (§3.4). It is sent on the candidate's socket, never the
+    /// link's, so its completion must not run the frame-send path.
+    pulse: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The switch predicate's one-shot deadline: a link whose pulse the peer
+    /// has not acknowledged by now is dead (§3.4).
+    predicate_timeout: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// A liveness tick: a repeating timer armed on every established link by
+    /// both sides (§4.8). The completion carries no verdict; the link's ack
+    /// flag decides whether the peer is still there.
+    keepalive_tick: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The dialer's non-blocking connect to a peer host (§3.1).
+    connect: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The dialer's connect bound: the one absolute clock around the connect.
+    connect_deadline: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The dialer's five-byte greet, sent only after the connect completed.
+    greet_send: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The dialer's exact-length read of the acceptor's seven-byte verdict.
+    verdict_read: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The dialer's verdict-read deadline: one absolute clock over the
+    /// re-armed partial reads (§3.5).
+    reply_deadline: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
+    /// The dialer's retry backoff timer (§3.6).
+    retry_timer: struct {
+        host_idx: u8,
+        epoch: u32,
+    },
     /// A multishot receive armed on one accepted client socket.
     recv: struct {
         fd: std.posix.fd_t,
@@ -206,6 +299,28 @@ test "wal contexts round-trip through the slot table" {
     slots.del(read);
     try expect(slots.get(flush) == null);
     try expect(slots.get(read) == null);
+}
+
+test "the switch predicate's contexts round-trip through the slot table" {
+    var slots: RingSlots = undefined;
+    try slots.init(std.testing.allocator, 4096);
+    defer slots.deinit();
+
+    // All three are plain data: the link they name plus its epoch, nothing else.
+    const pulse = try slots.add(.{ .pulse = .{ .host_idx = 1, .epoch = 7 } });
+    const timeout = try slots.add(.{ .predicate_timeout = .{ .host_idx = 1, .epoch = 7 } });
+    const keepalive = try slots.add(.{ .keepalive_tick = .{ .host_idx = 1, .epoch = 7 } });
+
+    try expectEqual(@as(u8, 1), slots.get(pulse).?.pulse.host_idx);
+    try expectEqual(@as(u32, 7), slots.get(timeout).?.predicate_timeout.epoch);
+    try expectEqual(@as(u32, 7), slots.get(keepalive).?.keepalive_tick.epoch);
+
+    slots.del(pulse);
+    slots.del(timeout);
+    slots.del(keepalive);
+    try expect(slots.get(pulse) == null);
+    try expect(slots.get(timeout) == null);
+    try expect(slots.get(keepalive) == null);
 }
 
 test "del on a reserved or already-freed index is a no-op" {

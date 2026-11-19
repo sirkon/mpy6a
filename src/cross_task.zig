@@ -91,6 +91,24 @@ pub const CrossTask = union(enum) {
 
     /// Elephant -> index: terminal reply; the in-flight flag clears on it.
     SnapshotDone: struct {},
+
+    /// Front -> index: a promoted peer socket. The front hands the descriptor
+    /// over once and never touches it again; `source_ok` is the reduced
+    /// `getpeername` verdict, since the four address bytes do not fit the slot.
+    PeerLink: struct {
+        fd: posix.fd_t,
+        host_idx: u8,
+        index_idx: u16,
+        version: u16,
+        source_ok: bool,
+    },
+
+    /// Process -> front: the shared peer listener. The client listener travels
+    /// in the `START_WORK` broadcast `res` word; the peer listener is posted
+    /// through a slot before the broadcast, only when `hosts > 1`.
+    PeerServerSocket: struct {
+        fd: posix.fd_t,
+    },
 };
 
 /// State of one snapshot slot: set by the index at the tick (`in_flight`) and
@@ -124,7 +142,7 @@ const expectEqual = std.testing.expectEqual;
 
 test "variants round-trip through a slot" {
     var slots: @import("cross_task_slots.zig").CrossTaskSlots = undefined;
-    try slots.init(std.testing.allocator, 6);
+    try slots.init(std.testing.allocator, 8);
     defer slots.deinit();
 
     const a = try slots.acquire();
@@ -151,6 +169,26 @@ test "variants round-trip through a slot" {
     const f = try slots.acquire();
     slots.at(f).* = .{ .SnapshotFd = .{ .fd = 9 } };
     try expectEqual(@as(posix.fd_t, 9), slots.at(f).SnapshotFd.fd);
+
+    // The peer vocabulary: a promoted link and the shared peer listener.
+    const g = try slots.acquire();
+    slots.at(g).* = .{ .PeerLink = .{
+        .fd = 11,
+        .host_idx = 2,
+        .index_idx = 3,
+        .version = @import("cluster_transport.zig").VERSION,
+        .source_ok = true,
+    } };
+    const link = slots.at(g).PeerLink;
+    try expectEqual(@as(posix.fd_t, 11), link.fd);
+    try expectEqual(@as(u8, 2), link.host_idx);
+    try expectEqual(@as(u16, 3), link.index_idx);
+    try expectEqual(@import("cluster_transport.zig").VERSION, link.version);
+    try expect(link.source_ok);
+
+    const h = try slots.acquire();
+    slots.at(h).* = .{ .PeerServerSocket = .{ .fd = 12 } };
+    try expectEqual(@as(posix.fd_t, 12), slots.at(h).PeerServerSocket.fd);
 
     try std.testing.expectError(error.CrossTaskFull, slots.acquire());
 }

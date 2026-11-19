@@ -35,6 +35,7 @@ const messages = @import("messages.zig");
 const state = @import("state.zig");
 const replay_queue = @import("replay_queue.zig");
 const wal = @import("wal.zig");
+const cluster_transport = @import("cluster_transport.zig");
 
 /// Where one snapshot procedure's job stands, as the index thread left it.
 ///
@@ -76,6 +77,109 @@ pub const SnapshotJob = struct {
     /// The snapshot path, heap on the controller's allocator.
     snapshot_path: [:0]u8,
 };
+
+/// One index thread's link storage: a slot per host of the replication group,
+/// the own slot never used (designs/CONSENSUS-TOPOLOGY-AND-TRANSPORT.md §2).
+///
+/// Nothing is allocated before a link exists: an entry is created on the first
+/// promotion of that link, through the controller's allocator, and lives until
+/// `deinit` runs after every thread has stopped. A connection replacement
+/// resets the existing entry instead of allocating a new one, so the table
+/// holds one entry per peer host for the life of the process.
+pub const LinkTable = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    /// The link geometry every entry is built from. Copied from the config,
+    /// whose strings and slices outlive the controller.
+    cluster: config.Cluster,
+    /// The own host's slot, which never gets an entry.
+    own: u8,
+    /// One slot per host of the group, all null until a promotion.
+    entries: []?*cluster_transport.LinkEntry,
+
+    pub fn init(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        cfg: *const config.Config,
+    ) !void {
+        const cluster = cfg.cluster orelse return error.NoCluster;
+        const entries = try allocator.alloc(?*cluster_transport.LinkEntry, cfg.wal.hosts());
+        @memset(entries, null);
+        self.* = .{
+            .allocator = allocator,
+            .cluster = cluster,
+            .own = @intCast(cfg.host_index),
+            .entries = entries,
+        };
+    }
+
+    /// Releases every entry and closes the descriptor of one that was still
+    /// held: only a failed shutdown leaves one open, exactly like a live WAL
+    /// writer. A candidate the switch predicate never resolved is a descriptor
+    /// the entry still owns, so it is closed here too.
+    pub fn deinit(self: *Self) void {
+        for (self.entries) |maybe| {
+            const entry = maybe orelse continue;
+            if (entry.fd >= 0) {
+                _ = std.os.linux.close(entry.fd);
+                entry.fd = -1;
+            }
+            if (entry.candidate_fd >= 0) {
+                _ = std.os.linux.close(entry.candidate_fd);
+                entry.candidate_fd = -1;
+            }
+            entry.deinit();
+            self.allocator.destroy(entry);
+        }
+        self.allocator.free(self.entries);
+    }
+
+    /// The installed entry for `host_idx`, or null when that link was never
+    /// promoted. The own slot never has one.
+    pub fn get(self: *Self, host_idx: u8) ?*cluster_transport.LinkEntry {
+        if (host_idx == self.own or host_idx >= self.entries.len) return null;
+        return self.entries[host_idx];
+    }
+
+    /// The entry for `host_idx`, allocated on the first promotion of that link.
+    /// Later calls return the same entry.
+    pub fn acquire(self: *Self, host_idx: u8, index_idx: u16) !*cluster_transport.LinkEntry {
+        if (host_idx == self.own or host_idx >= self.entries.len) {
+            return error.InvalidPeerHost;
+        }
+        if (self.entries[host_idx]) |entry| return entry;
+
+        const entry = try self.allocator.create(cluster_transport.LinkEntry);
+        errdefer self.allocator.destroy(entry);
+        try entry.init(
+            self.allocator,
+            host_idx,
+            index_idx,
+            self.cluster.reorder_window,
+            self.cluster.inflight_frames,
+        );
+        self.entries[host_idx] = entry;
+        return entry;
+    }
+};
+
+/// The parsed peer table: `cfg.wal.hosts()` four-byte IPv4 addresses indexed by
+/// `host_idx`, the own slot all zeroes. `localhost` folds to loopback exactly
+/// as the client listener does, and config validation has already proved every
+/// other entry parses.
+fn parsePeerAddresses(cluster: config.Cluster, own: u16, addrs: [][4]u8) !void {
+    for (addrs, 0..) |*addr, idx| {
+        addr.* = @splat(0);
+        if (idx == own) continue;
+        const text = cluster.peers[idx];
+        const ip = if (std.mem.eql(u8, text, "localhost"))
+            std.Io.net.Ip4Address.loopback(0)
+        else
+            try std.Io.net.Ip4Address.parse(text, 0);
+        addr.* = ip.bytes;
+    }
+}
 
 /// The controller that owns all shared process resources.
 pub const Controller = struct {
@@ -151,6 +255,17 @@ pub const Controller = struct {
     /// start allocates, the rest wait for it.
     wal_battery_lock: std.atomic.Mutex,
 
+    /// The replication group's peer addresses, one four-byte IPv4 address per
+    /// host indexed by `host_idx`; the own slot is all zeroes. Empty when the
+    /// group spans a single host, because the `cluster` block is absent then
+    /// and the transport is dark.
+    peer_addrs: [][4]u8,
+
+    /// One link table per index thread, indexed by the index's `inbox_idx`;
+    /// empty when the transport is dark (`hosts == 1`). The entries themselves
+    /// are allocated on a link's first promotion.
+    link_tables: []LinkTable,
+
     /// Test seam: `rewriteRegistry` stops after the staging file's commit and
     /// reports the rename as failed — the "pending write landed, line never
     /// committed" crash shape (designs/SNAPSHOTS-steps.md §J2). Production
@@ -184,6 +299,22 @@ pub const Controller = struct {
         errdefer allocator.free(wal_writers);
         @memset(wal_writers, null);
 
+        // The transport is dark with a single host: no peer table, no link
+        // storage, nothing allocated before a link exists.
+        const peer_addrs = try allocator.alloc([4]u8, if (cfg.cluster == null) 0 else cfg.wal.hosts());
+        errdefer allocator.free(peer_addrs);
+        if (cfg.cluster) |cluster| try parsePeerAddresses(cluster, cfg.host_index, peer_addrs);
+
+        const link_tables = try allocator.alloc(LinkTable, if (cfg.cluster == null) 0 else cfg.indexes);
+        var tables_ready: usize = 0;
+        errdefer {
+            for (link_tables[0..tables_ready]) |*table| table.deinit();
+            allocator.free(link_tables);
+        }
+        while (tables_ready < link_tables.len) : (tables_ready += 1) {
+            try link_tables[tables_ready].init(allocator, cfg);
+        }
+
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
@@ -205,6 +336,8 @@ pub const Controller = struct {
             .wal_writers = wal_writers,
             .wal_battery = null,
             .wal_battery_lock = .unlocked,
+            .peer_addrs = peer_addrs,
+            .link_tables = link_tables,
         };
         errdefer self.compensators.deinit();
 
@@ -243,10 +376,18 @@ pub const Controller = struct {
             self.wal_battery = null;
         }
 
+        // The links are torn down before the ring array goes, and only after
+        // every thread has stopped: an entry's buffers and any descriptor a
+        // failed shutdown left open are released here (the R1 ordering).
+        for (self.link_tables) |*table| table.deinit();
+        self.allocator.free(self.link_tables);
+        self.allocator.free(self.peer_addrs);
+
         self.allocator.free(self.thread_ctx);
         self.allocator.free(self.threads);
         self.allocator.free(self.inboxes);
         self.allocator.free(self.rings);
+
         self.compensators.deinit();
         self.cross_slots.deinit();
         self.snapshot_slots.deinit();
@@ -1189,14 +1330,28 @@ pub const Controller = struct {
     /// config. The descriptor is owned by the controller's process thread and
     /// is shared with all fronts through `START_WORK`.
     pub fn createServerSocket(self: *Self) !std.posix.fd_t {
+        return self.createListener(self.cfg.bind, self.cfg.port);
+    }
+
+    /// Creates, binds and listens on the peer endpoint of the `cluster` block,
+    /// which exists exactly when the replication group spans more than one
+    /// host. The descriptor is owned by the process thread too and is handed
+    /// to the fronts through a `PeerServerSocket` slot before `START_WORK`.
+    pub fn createPeerServerSocket(self: *Self) !std.posix.fd_t {
+        const cluster = self.cfg.cluster orelse return error.NoCluster;
+        return self.createListener(self.cfg.bind, cluster.peer_port);
+    }
+
+    /// Binds `bind:port` and listens with the configured backlog.
+    fn createListener(self: *Self, bind: []const u8, port: u16) !std.posix.fd_t {
         const cfg = self.cfg;
 
         // The config names an IPv4 endpoint; `localhost` is accepted as the
         // loopback spelling used by the default document.
-        const ip = if (std.mem.eql(u8, cfg.bind, "localhost"))
-            std.Io.net.Ip4Address.loopback(cfg.port)
+        const ip = if (std.mem.eql(u8, bind, "localhost"))
+            std.Io.net.Ip4Address.loopback(port)
         else
-            try std.Io.net.Ip4Address.parse(cfg.bind, cfg.port);
+            try std.Io.net.Ip4Address.parse(bind, port);
 
         const fd = try zigring.createTCPServerSocket();
         errdefer _ = std.os.linux.close(fd);
@@ -1914,6 +2069,7 @@ test "role distribution" {
     cfg.cross_task_slots = 16;
     cfg.sqpoll_threads = 1;
     cfg.wal = .{ .plain = .{ .dir = "wal" } };
+    cfg.cluster = null;
     cfg.snapshots = .{};
     cfg.ring_slots_capacity = 4096;
     cfg.logging = .{
@@ -2002,6 +2158,7 @@ test "roles map to the shared arrays" {
     cfg.cross_task_slots = 8;
     cfg.sqpoll_threads = 1;
     cfg.wal = .{ .plain = .{ .dir = "wal" } };
+    cfg.cluster = null;
     cfg.snapshots = .{};
     cfg.ring_slots_capacity = 4096;
     cfg.index_inbox_capacity = 8;
@@ -2046,6 +2203,7 @@ test "the derived role addresses the thread's own slot" {
     cfg.cross_task_slots = 8;
     cfg.sqpoll_threads = 1;
     cfg.wal = .{ .plain = .{ .dir = "wal" } };
+    cfg.cluster = null;
     cfg.snapshots = .{};
     cfg.ring_slots_capacity = 4096;
     cfg.index_inbox_capacity = 8;
@@ -2068,6 +2226,158 @@ test "the derived role addresses the thread's own slot" {
     try std.testing.expectEqual(ctx.spawn_idx, ring_idx);
     const slot = ctrl.roleOf(ring_idx).ringIdx();
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&ctrl.rings[slot]) -| @intFromPtr(ctrl.rings.ptr));
+}
+
+/// The two-host fixture the transport tests run on: `host_index` 0, one index
+/// thread, the own peer slot empty and the other host on loopback. The peer
+/// port is 0, so the kernel hands out an ephemeral one; the config rules that
+/// out in production and these tests only exercise the shapes.
+fn clusterFixture(hosts: u32, own: u16, peers: []const []const u8) config.Config {
+    return .{
+        .fronts = 1,
+        .indexes = 1,
+        .elephants = 1,
+        .queue_depth = 64,
+        .cross_task_slots = 64,
+        .sqpoll_threads = 1,
+        .ring_slots_capacity = 4096,
+        .index_inbox_capacity = 8,
+        .host_index = own,
+        .wal = .{ .plain = .{ .dir = "wal", .hosts = hosts } },
+        .snapshots = .{},
+        .cluster = .{ .peer_port = 0, .peers = peers },
+        .logging = .{
+            .method = .{ .json = {} },
+            .pool_capacity = 64,
+            .pool_frame_size = config.bytes(1024),
+        },
+    };
+}
+
+test "the peer table folds localhost and leaves the own slot empty" {
+    var cfg = clusterFixture(3, 1, &.{ "10.0.0.2", "", "localhost" });
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+    defer ctrl.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), ctrl.peer_addrs.len);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &ctrl.peer_addrs[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &ctrl.peer_addrs[1]);
+    try std.testing.expectEqualSlices(u8, &std.Io.net.Ip4Address.loopback(0).bytes, &ctrl.peer_addrs[2]);
+}
+
+test "a dark transport allocates no peer table and no link storage" {
+    var cfg = clusterFixture(1, 0, &.{});
+    cfg.cluster = null;
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+    defer ctrl.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), ctrl.peer_addrs.len);
+    try std.testing.expectEqual(@as(usize, 0), ctrl.link_tables.len);
+}
+
+test "a link entry is allocated on the first promotion only" {
+    var cfg = clusterFixture(3, 1, &.{ "10.0.0.2", "", "10.0.0.3" });
+    cfg.indexes = 2;
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+    defer ctrl.deinit();
+
+    // One table per index thread, one slot per host, all empty until a link
+    // exists.
+    try std.testing.expectEqual(@as(usize, 2), ctrl.link_tables.len);
+    for (ctrl.link_tables) |*table| {
+        try std.testing.expectEqual(@as(usize, 3), table.entries.len);
+        for (table.entries) |slot| try std.testing.expect(slot == null);
+    }
+
+    const first_table = &ctrl.link_tables[0];
+    const second_table = &ctrl.link_tables[1];
+
+    // The own slot is not a link and has no storage.
+    try std.testing.expect(first_table.get(1) == null);
+    try std.testing.expectError(error.InvalidPeerHost, first_table.acquire(1, 0));
+    try std.testing.expectError(error.InvalidPeerHost, first_table.acquire(3, 0));
+
+    const entry = try first_table.acquire(2, 0);
+    try std.testing.expectEqual(cluster_transport.LinkState.none, entry.state);
+    try std.testing.expectEqual(@as(u8, 2), entry.host_idx);
+    try std.testing.expectEqual(@as(u16, 0), entry.index_idx);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
+    try std.testing.expectEqual(@as(u16, cfg.cluster.?.inflight_frames), entry.inflight);
+    try std.testing.expect(first_table.get(2) == entry);
+
+    // A second promotion of the same pair returns the same entry, so a
+    // replacement resets rather than reallocates.
+    try std.testing.expectEqual(entry, try first_table.acquire(2, 0));
+
+    // Tables are per index thread: the same host has its own entry there.
+    const other = try second_table.acquire(2, 1);
+    try std.testing.expect(other != entry);
+    try std.testing.expectEqual(@as(u16, 1), other.index_idx);
+}
+
+test "deinit releases a link entry's buffers and closes a held descriptor" {
+    var cfg = clusterFixture(2, 0, &.{ "", "10.0.0.2" });
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+
+    const entry = try ctrl.link_tables[0].acquire(1, 0);
+    var fds: [2]std.os.linux.fd_t = undefined;
+    const pipe_res = std.os.linux.pipe(&fds);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pipe_res));
+    defer _ = std.os.linux.close(fds[1]);
+    entry.fd = fds[0];
+
+    // A failed shutdown leaves a link's descriptor open; the controller
+    // releases it after the threads have stopped.
+    ctrl.deinit();
+    try std.testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(std.os.linux.close(fds[0])));
+}
+
+test "the peer listener binds the cluster's peer port" {
+    var cfg = clusterFixture(2, 0, &.{ "", "10.0.0.2" });
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+    defer ctrl.deinit();
+
+    const fd = try ctrl.createPeerServerSocket();
+    defer _ = std.os.linux.close(fd);
+
+    // The bind and listen succeeded: the descriptor answers a local connect.
+    var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = 0 };
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    const getsock_res = std.os.linux.getsockname(
+        fd,
+        @ptrCast(&addr),
+        &len,
+    );
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(getsock_res));
+    try std.testing.expect(std.mem.nativeToBig(u16, addr.port) != 0);
+
+    // `listen` is part of the shape, not only `bind`: a local connect
+    // completes and the listener accepts it.
+    const client_raw = std.os.linux.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(client_raw));
+    const client: posix.fd_t = @intCast(client_raw);
+    defer _ = std.os.linux.close(client);
+    const connect_res = std.os.linux.connect(client, @ptrCast(&addr), len);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(connect_res));
+
+    const accepted_raw = std.os.linux.accept(fd, null, null);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(accepted_raw));
+    defer _ = std.os.linux.close(@intCast(accepted_raw));
+}
+
+test "a dark transport has no peer listener" {
+    var cfg = clusterFixture(1, 0, &.{});
+    cfg.cluster = null;
+    var ctrl: Controller = undefined;
+    try ctrl.init(std.testing.allocator, &cfg);
+    defer ctrl.deinit();
+
+    try std.testing.expectError(error.NoCluster, ctrl.createPeerServerSocket());
 }
 
 // ============================================================================
@@ -3358,6 +3668,7 @@ test "nextElephantRing round-robins over the elephant rings" {
     cfg.cross_task_slots = 8;
     cfg.sqpoll_threads = 1;
     cfg.wal = .{ .plain = .{ .dir = "wal" } };
+    cfg.cluster = null;
     cfg.snapshots = .{};
     cfg.ring_slots_capacity = 4096;
     cfg.index_inbox_capacity = 8;

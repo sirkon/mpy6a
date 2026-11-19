@@ -106,6 +106,10 @@ pub const Config = struct {
 
     /// Snapshot procedure parameters. Every key is omittable.
     snapshots: Snapshots = .{},
+
+    /// Cluster transport parameters. Absent exactly when the WAL group spans
+    /// a single host.
+    cluster: ?Cluster = null,
 };
 
 /// Snapshot procedure parameters.
@@ -123,6 +127,26 @@ pub const Snapshots = struct {
     size_barrier: Mib = mib(256),
     slots: u32 = 8,
     registry_keep: u32 = 8,
+};
+
+/// Cluster transport parameters: the peer endpoint and the link geometry.
+///
+/// The block is absent when the WAL group spans one host. `peer_port` is the
+/// peer listener's port, distinct from the client `port`; `peers` is indexed
+/// by `host_index` and the own slot is empty.
+///
+/// ```text
+/// cluster = { peer_port = 7001 peers = { "" "10.0.0.2" "10.0.0.3" } }
+/// ```
+pub const Cluster = struct {
+    peer_port: u16,
+    peers: []const []const u8,
+    reorder_window: u16 = 16,
+    inflight_frames: u16 = 8,
+    handshake_slots: u16 = 64,
+    handshake_timeout: Seconds = seconds(5),
+    pulse_timeout: Seconds = seconds(1),
+    keepalive_interval: Seconds = seconds(5),
 };
 
 /// Write-ahead log parameters: the mode and the battery geometry.
@@ -403,6 +427,15 @@ pub const ParseError = error{
     InvalidSizeBarrier,
     InvalidSnapshotSlots,
     InvalidRegistryKeep,
+    InvalidPeerPort,
+    InvalidPeerCount,
+    InvalidOwnPeer,
+    InvalidPeerAddress,
+    InvalidPeerDuplicate,
+    InvalidReorderWindow,
+    InvalidInflightFrames,
+    InvalidHandshakeSlots,
+    InvalidClusterMode,
     OutOfMemory,
     MissingField,
     ParseSiggy,
@@ -465,6 +498,19 @@ pub const test_cpu_count: u16 = check_cpu_cores;
 /// - `size_barrier >= 1 MiB`
 /// - `1 <= slots <= 65535` (the mark's `new_wal_buffer_idx: u16` bounds it)
 /// - `registry_keep >= 1`
+///
+/// Rules for `cluster`, present exactly when `wal.hosts() > 1`:
+///
+/// - `peer_port > 0` and `peer_port != port`
+/// - `peers.len == wal.hosts()`
+/// - `peers[host_index]` is empty
+/// - every other entry is non-empty and a parseable IPv4 address or
+///   `localhost`
+/// - no two peer entries name the same address
+/// - `reorder_window` is a power of two in `[2, 65535]`
+/// - `1 <= inflight_frames <= reorder_window`
+/// - `handshake_slots >= 1`
+/// - `cross_task_slots >= fronts * handshake_slots`
 ///
 /// Rules for `front_cores` and `index_cores`:
 ///
@@ -600,6 +646,7 @@ fn validate(config: Config, cpu_cores: u16) ParseError!void {
 
     try validateWal(config.wal, config.host_index);
     try validateSnapshots(config.snapshots);
+    try validateCluster(config);
 
     try validateCores(
         config.front_cores.cores,
@@ -657,6 +704,63 @@ fn validateSnapshots(snapshots: Snapshots) ParseError!void {
     if (snapshots.registry_keep < 1) return error.InvalidRegistryKeep;
 }
 
+/// Cluster transport rules: the peer endpoint, the replication-group sized
+/// peer table, the link geometry and the handshake pool the fronts draw from.
+/// The block is present exactly when the group spans more than one host. No
+/// allocation, so it serves both the comptime check and the runtime `fromText`.
+fn validateCluster(config: Config) ParseError!void {
+    const hosts = config.wal.hosts();
+    const cluster = config.cluster orelse {
+        if (hosts > 1) return error.InvalidClusterMode;
+        return;
+    };
+    if (hosts == 1) return error.InvalidClusterMode;
+
+    if (cluster.peer_port == 0 or cluster.peer_port == config.port) {
+        return error.InvalidPeerPort;
+    }
+    if (cluster.peers.len != @as(usize, hosts)) return error.InvalidPeerCount;
+
+    const own = config.host_index;
+    if (cluster.peers[own].len != 0) return error.InvalidOwnPeer;
+
+    var parsed: [256]std.Io.net.Ip4Address = undefined;
+    for (cluster.peers, 0..) |peer, idx| {
+        if (idx == own) continue;
+        parsed[idx] = parsePeerAddress(peer) orelse return error.InvalidPeerAddress;
+        for (0..idx) |earlier| {
+            if (earlier == own) continue;
+            if (std.mem.eql(u8, &parsed[earlier].bytes, &parsed[idx].bytes)) {
+                return error.InvalidPeerDuplicate;
+            }
+        }
+    }
+
+    if (cluster.reorder_window < 2 or
+        !std.math.isPowerOfTwo(cluster.reorder_window))
+    {
+        return error.InvalidReorderWindow;
+    }
+    if (cluster.inflight_frames < 1 or
+        cluster.inflight_frames > cluster.reorder_window)
+    {
+        return error.InvalidInflightFrames;
+    }
+    if (cluster.handshake_slots < 1) return error.InvalidHandshakeSlots;
+
+    const handshakes: u32 = @as(u32, config.fronts) * cluster.handshake_slots;
+    if (config.cross_task_slots < handshakes) return error.InvalidCrossTaskSlots;
+}
+
+/// Parses one peer table entry: an IPv4 literal, or `localhost` folded to the
+/// loopback address the listener itself accepts.
+fn parsePeerAddress(text: []const u8) ?std.Io.net.Ip4Address {
+    if (std.mem.eql(u8, text, "localhost")) {
+        return std.Io.net.Ip4Address.loopback(0);
+    }
+    return std.Io.net.Ip4Address.parse(text, 0) catch null;
+}
+
 /// Checks a single core set: bounds, uniqueness and expanded length.
 fn validateCores(
     cores: []const u16,
@@ -702,6 +806,9 @@ fn testManager() ManagerType {
 /// `wal` is a required key, so every test document carries it; prepending the
 /// block keeps the text of each test focused on the rule it exercises.
 const wal_doc = "wal = plain { dir = \"wal\" }\n";
+
+/// The three-host group of the §6 example, dialing from host 0.
+const cluster_doc = "wal = plain { dir = \"wal\" hosts = 3 }\nhost_index = 0\n";
 
 test "core masks accept blocks of cores and ranges" {
     var manager = testManager();
@@ -990,6 +1097,148 @@ test "snapshot rules are enforced" {
     try testing.expectEqual(@as(u32, 65535), edge.snapshots.slots);
 }
 
+test "cluster accepts the three-host example" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    const config = try manager.fromText(cluster_doc ++
+        \\cluster = { peer_port = 7001 peers = { "" "10.0.0.2" "10.0.0.3" } }
+    );
+
+    const cluster = config.cluster orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 7001), cluster.peer_port);
+    try testing.expectEqual(@as(usize, 3), cluster.peers.len);
+    try testing.expectEqualStrings("", cluster.peers[0]);
+    try testing.expectEqualStrings("10.0.0.2", cluster.peers[1]);
+    try testing.expectEqualStrings("10.0.0.3", cluster.peers[2]);
+    try testing.expectEqual(@as(u16, 16), cluster.reorder_window);
+    try testing.expectEqual(@as(u16, 8), cluster.inflight_frames);
+    try testing.expectEqual(@as(u16, 64), cluster.handshake_slots);
+    try testing.expectEqual(5 * std.time.ns_per_s, cluster.handshake_timeout.value());
+    try testing.expectEqual(std.time.ns_per_s, cluster.pulse_timeout.value());
+    try testing.expectEqual(5 * std.time.ns_per_s, cluster.keepalive_interval.value());
+
+    // Any slot may be the own one.
+    const peer = try manager.fromText(
+        "wal = plain { dir = \"wal\" hosts = 3 }\nhost_index = 1\n" ++
+            "cluster = { peer_port = 7001 peers = { \"10.0.0.1\" \"\" \"10.0.0.3\" } }",
+    );
+    try testing.expectEqualStrings("", peer.cluster.?.peers[1]);
+
+    // Every key is tunable.
+    const tuned = try manager.fromText(cluster_doc ++
+        \\cluster = { peer_port = 7001 peers = { "" "10.0.0.2" "10.0.0.3" }
+        \\    reorder_window = 32 inflight_frames = 16 handshake_slots = 4
+        \\    handshake_timeout = 2s pulse_timeout = 2s keepalive_interval = 10s }
+    );
+    const geometry = tuned.cluster.?;
+    try testing.expectEqual(@as(u16, 32), geometry.reorder_window);
+    try testing.expectEqual(@as(u16, 16), geometry.inflight_frames);
+    try testing.expectEqual(@as(u16, 4), geometry.handshake_slots);
+    try testing.expectEqual(2 * std.time.ns_per_s, geometry.handshake_timeout.value());
+    try testing.expectEqual(2 * std.time.ns_per_s, geometry.pulse_timeout.value());
+    try testing.expectEqual(10 * std.time.ns_per_s, geometry.keepalive_interval.value());
+
+    // A single-host group carries no block.
+    const solo = try manager.fromText(wal_doc);
+    try testing.expect(solo.cluster == null);
+}
+
+test "cluster rules are enforced" {
+    var manager = testManager();
+    defer manager.deinit();
+
+    try testing.expectError(
+        error.InvalidPeerPort,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 0 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } }"),
+    );
+    // The peer endpoint must not collide with the client one.
+    try testing.expectError(
+        error.InvalidPeerPort,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 60006 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } }"),
+    );
+    // The peer table has one slot per host.
+    try testing.expectError(
+        error.InvalidPeerCount,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" } }"),
+    );
+    // The own slot stays empty.
+    try testing.expectError(
+        error.InvalidOwnPeer,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"10.0.0.1\" \"10.0.0.2\" \"10.0.0.3\" } }"),
+    );
+    // Every other entry is present and parseable.
+    try testing.expectError(
+        error.InvalidPeerAddress,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"\" \"10.0.0.3\" } }"),
+    );
+    try testing.expectError(
+        error.InvalidPeerAddress,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"host-two\" \"10.0.0.3\" } }"),
+    );
+    // Duplicates are rejected, including aliases of one loopback address.
+    try testing.expectError(
+        error.InvalidPeerDuplicate,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" \"10.0.0.2\" } }"),
+    );
+    try testing.expectError(
+        error.InvalidPeerDuplicate,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"localhost\" \"localhost\" } }"),
+    );
+    // The reorder window is a power of two of at least two.
+    try testing.expectError(
+        error.InvalidReorderWindow,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } reorder_window = 1 }"),
+    );
+    try testing.expectError(
+        error.InvalidReorderWindow,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } reorder_window = 3 }"),
+    );
+    // Inflight frames are at least one and no wider than the window.
+    try testing.expectError(
+        error.InvalidInflightFrames,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } inflight_frames = 0 }"),
+    );
+    try testing.expectError(
+        error.InvalidInflightFrames,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } inflight_frames = 17 }"),
+    );
+    // At least one handshake slot per front.
+    try testing.expectError(
+        error.InvalidHandshakeSlots,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } handshake_slots = 0 }"),
+    );
+    // The cross-task pool covers every front's handshake table.
+    try testing.expectError(
+        error.InvalidCrossTaskSlots,
+        manager.fromText(cluster_doc ++
+            "cluster = { peer_port = 7001 peers = { \"\" \"10.0.0.2\" \"10.0.0.3\" } }" ++
+            "\ncross_task_slots = 64"),
+    );
+    // A multi-host group requires the block, a single-host one forbids it.
+    try testing.expectError(
+        error.InvalidClusterMode,
+        manager.fromText("wal = plain { dir = \"wal\" hosts = 2 }\nhost_index = 0"),
+    );
+    try testing.expectError(
+        error.InvalidClusterMode,
+        manager.fromText(wal_doc ++ "cluster = { peer_port = 7001 peers = { \"\" } }"),
+    );
+}
+
 test "the rendered default document re-parses" {
     var manager = testManager();
     defer manager.deinit();
@@ -1002,6 +1251,9 @@ test "the rendered default document re-parses" {
     try testing.expect(std.mem.indexOf(u8, text, "lba = 4KiB") != null);
     try testing.expect(std.mem.indexOf(u8, text, "pool_frame_size = 512") != null);
     try testing.expect(std.mem.indexOf(u8, text, "size_barrier = 256MiB") != null);
+    // The canonical document keeps a single host, so no cluster block is
+    // rendered.
+    try testing.expect(std.mem.indexOf(u8, text, "cluster") == null);
 
     const config = try manager.fromText(text);
     try testing.expect(config.wal == .plain);

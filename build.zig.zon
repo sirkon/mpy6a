@@ -44,12 +44,12 @@
             .hash = "zigring-0.0.15-Srja3xkvAwCRPqiod2LMZXBPlPPuA7Upu6qe7fwH_nCh",
         },
         .blog = .{
-            .url = "git+https://github.com/sirkon/blog.git?ref=master#4843799a7d3e6c1156d3a671c276aef124d823c1",
-            .hash = "blog-0.0.18-IN2Y35u6BQAW2buWSJwSypc6I_ffYOXhqEltBMfozs9u",
+            .url = "git+https://github.com/sirkon/blog.git?ref=master#1d66a408a8347a579870485dbe2db1bf9cfa1c6e",
+            .hash = "blog-0.0.19-IN2Y32S7BQCPQWaX4KcHK0YOnVk3u7GOK3WaFB-pwWMc",
         },
         .dap = .{
-            .url = "git+https://github.com/sirkon/dap.git?ref=master#2abdabcd4efbb4965f838343d1175c30573a11d3",
-            .hash = "dap-0.0.9-XZkAImIzBQC0uhjtpEwr4qouXGIavS9fUmHktU-feKVy",
+            .url = "git+https://github.com/sirkon/dap.git?ref=master#dbdea6938fdb8e2c037a0194c0b11dfc805ccfdf",
+            .hash = "dap-0.0.11-XZkAImYfBgAi1MOAbT7PCd2BuCpnLXAZzs9Oc9PREwvt",
         },
         .siggy = .{
             .url = "git+https://github.com/sirkon/siggy.git?ref=master#9933fec6d2088d57e01e3c067e95eef53b96e705",
