@@ -2,9 +2,10 @@
 //!
 //! This file owns the fixed parts of the index-to-index protocol: the greet and
 //! reply codecs of the handshake, the frame layout the receive path parses, the
-//! verdict and op-code number spaces, the sequence-number lift and the link
-//! state names. The socket lifecycle, the io_uring pushes and the reorder
-//! plumbing live with the threads that run them; nothing here performs I/O.
+//! verdict and op-code number spaces, the per-op payload codecs, the
+//! sequence-number lift and the link state names. The socket lifecycle, the
+//! io_uring pushes and the reorder plumbing live with the threads that run
+//! them; nothing here performs I/O.
 
 const std = @import("std");
 const posix = std.posix;
@@ -20,17 +21,84 @@ pub const GREET_LEN = 5;
 /// The acceptor's fixed reply: the greet fields plus the two-byte verdict.
 pub const REPLY_LEN = 7;
 
-/// The smallest legal frame: prefix, vector clock, op, empty payload, empty
-/// envelope.
-pub const FRAME_MIN = 24;
+/// The smallest legal control or transport frame: prefix, vector clock, op and
+/// the empty payload length.
+pub const FRAME_MIN: usize = 23;
+
+/// The smallest legal consensus frame: the broad minimum plus the two state
+/// fields and the envelope length.
+pub const FRAME_MIN_CONSENSUS: usize = 56;
 
 /// The largest frame the v1 transport accepts.
 pub const FRAME_CAP = 4096;
 
-/// Link liveness ops. The rest of the number space belongs to the catch-up,
-/// snapshot and consensus families.
+/// The largest data slice a `LogData`/`Snapshot`/`Log` arm can carry: the
+/// frame cap minus the 33 bytes of prefix, payload length, `host_id`, transfer
+/// `seq_id`, oneof tag, data-length uvarint and `final` bool (§3.4). The
+/// chunker uses this bound.
+pub const CHUNK_DATA_MAX: usize = FRAME_CAP - 33;
+
+/// The three op-code classes. The class is a range test on `op_code`; there is
+/// no second tag.
+pub const FrameClass = enum {
+    control,
+    transport,
+    consensus,
+};
+
+/// The class of `op`, or null when the op code has no class. Values inside a
+/// valid range are class members even when unassigned; `0x80..0xFF` has none.
+pub fn frameClass(op: u8) ?FrameClass {
+    return switch (op) {
+        0x00...0x0F => .control,
+        0x10...0x1F => .transport,
+        0x20...0x7F => .consensus,
+        else => null,
+    };
+}
+
+/// The smallest legal frame length for `class`.
+pub fn frameMin(class: FrameClass) usize {
+    return switch (class) {
+        .control, .transport => FRAME_MIN,
+        .consensus => FRAME_MIN_CONSENSUS,
+    };
+}
+
+/// Control-wire ops. `0x04..0x0F` are reserved.
 pub const OP_PULSE: u8 = 0x00;
 pub const OP_PULSE_ACK: u8 = 0x01;
+pub const OP_EMERGENCY_STOP: u8 = 0x02;
+pub const OP_DECISION: u8 = 0x03;
+
+/// Transport-wire ops. `0x16..0x1F` are reserved.
+pub const OP_DELIVER_LOG: u8 = 0x10;
+pub const OP_DELIVER_LOG_RESPONSE: u8 = 0x11;
+pub const OP_DELIVER_LOG_COMMIT: u8 = 0x12;
+pub const OP_DELIVER_SNAPSHOT: u8 = 0x13;
+pub const OP_DELIVER_SNAPSHOT_RESPONSE: u8 = 0x14;
+pub const OP_DELIVER_SNAPSHOT_COMMIT: u8 = 0x15;
+
+/// Consensus-wire ops. `0x2A..0x7F` are reserved.
+pub const OP_CREATE: u8 = 0x20;
+pub const OP_APPEND: u8 = 0x21;
+pub const OP_OVERWRITE: u8 = 0x22;
+pub const OP_CLOSE: u8 = 0x23;
+pub const OP_REPEAT: u8 = 0x24;
+pub const OP_COMPENSATE: u8 = 0x25;
+pub const OP_ISOLATE: u8 = 0x26;
+pub const OP_CAPTURE: u8 = 0x27;
+pub const OP_CAPTURE_COMPENSATE: u8 = 0x28;
+pub const OP_NOP: u8 = 0x29;
+
+/// The flat `Decision` kind byte. Tags `4..255` are reserved and malformed at
+/// decode.
+pub const DecisionKind = enum(u8) {
+    confirmed = 0,
+    rejected_update_yourself = 1,
+    rejected_you_are_late = 2,
+    data_integrity_violated = 3,
+};
 
 /// The dial retry bounds: exponential from `RETRY_MIN` to `RETRY_MAX`,
 /// reset on a successful link.
@@ -38,7 +106,9 @@ pub const RETRY_MIN: u64 = 100 * std.time.ns_per_ms;
 pub const RETRY_MAX: u64 = 5 * std.time.ns_per_s;
 
 comptime {
-    std.debug.assert(FRAME_MIN == 4 + 1 + 16 + 1 + 1 + 1);
+    std.debug.assert(FRAME_MIN == 4 + 1 + 16 + 1 + 1);
+    std.debug.assert(FRAME_MIN_CONSENSUS == 4 + 1 + 16 + 1 + 16 + 16 + 1 + 1);
+    std.debug.assert(CHUNK_DATA_MAX == 4063);
 }
 
 /// The pinned `blog` exports only the varint half of its encoder, so the
@@ -54,6 +124,7 @@ inline fn appendScalar(dst: [*]u8, value: anytype) usize {
 
     switch (bits) {
         16 => std.mem.writeInt(u16, @ptrCast(dst), value, .little),
+        32 => std.mem.writeInt(u32, @ptrCast(dst), value, .little),
         64 => std.mem.writeInt(u64, @ptrCast(dst), value, .little),
         else => @compileError("unsupported scalar width"),
     }
@@ -447,24 +518,49 @@ pub const CommitEnvelope = struct {
 
 /// A frame as the encoder consumes it. The frame has no index field: the link
 /// it travels on already names the `(index thread, peer host)` pair.
+///
+/// The class comes from `op_code`. A consensus frame carries both state fields
+/// and may carry an envelope; a control or transport frame carries neither.
+/// Keeping the fields optional makes a class mismatch visible to `encodeFrame`
+/// instead of silently encoding zeros (§2.3).
 pub const Frame = struct {
     seq_id: u16,
     vector_clock_frame: VectorClockFrame,
     op_code: u8,
     op_payload: []const u8,
-    commit_envelope: CommitEnvelope = .{},
+    state_id: ?u128 = null,
+    prev_state_id: ?u128 = null,
+    commit_envelope: ?CommitEnvelope = null,
 };
 
-pub const EncodeError = error{FrameTooLarge};
+pub const EncodeError = error{
+    FrameTooLarge,
+    InvalidOpCode,
+    FrameClassMismatch,
+};
+
+/// Writes a `u128` low half first (§2.1). Returns the bytes written.
+inline fn appendU128(dst: [*]u8, value: u128) usize {
+    var pos: usize = 0;
+    pos += appendScalar(dst + pos, @as(u64, @truncate(value)));
+    pos += appendScalar(dst + pos, @as(u64, @truncate(value >> 64)));
+    return pos;
+}
 
 /// Encodes `frame` into `dst` and returns its total length, which is also the
 /// value back-patched into `frame_len` at offset 2.
 ///
-/// An encoding that would exceed `FRAME_CAP` returns `error.FrameTooLarge`
-/// before the caller can submit it; `dst` is unspecified in that case.
+/// The class is derived from `op_code`: a consensus frame writes `stateID`,
+/// `prevStateID`, the payload and the envelope; a control or transport frame
+/// writes the payload and nothing else. Optional fields that disagree with the
+/// class return `error.FrameClassMismatch`, because no decoder could observe
+/// such a frame; an op outside every class returns `error.InvalidOpCode`. An
+/// encoding that would exceed `FRAME_CAP` returns `error.FrameTooLarge` before
+/// the caller can submit it; `dst` is unspecified in those cases.
 pub fn encodeFrame(dst: []u8, frame: Frame) EncodeError!usize {
     const cap = @min(dst.len, FRAME_CAP);
-    if (cap < FRAME_MIN) {
+    const class = frameClass(frame.op_code) orelse return error.InvalidOpCode;
+    if (cap < frameMin(class)) {
         return error.FrameTooLarge;
     }
 
@@ -485,6 +581,22 @@ pub fn encodeFrame(dst: []u8, frame: Frame) EncodeError!usize {
     // The op code.
     pos += appendScalar(dst.ptr + pos, frame.op_code);
 
+    switch (class) {
+        .consensus => {
+            const state_id = frame.state_id orelse return error.FrameClassMismatch;
+            const prev_state_id = frame.prev_state_id orelse return error.FrameClassMismatch;
+            if (pos + 32 > cap) return error.FrameTooLarge;
+            pos += appendU128(dst.ptr + pos, state_id);
+            pos += appendU128(dst.ptr + pos, prev_state_id);
+        },
+        .control, .transport => {
+            if (frame.state_id != null or frame.prev_state_id != null) {
+                return error.FrameClassMismatch;
+            }
+            if (frame.commit_envelope != null) return error.FrameClassMismatch;
+        },
+    }
+
     // The payload is a slice through `blog.append`, so its own uvarint length
     // precedes it; an empty payload is the single byte 0x00.
     const payload_len = frame.op_payload.len;
@@ -495,24 +607,27 @@ pub fn encodeFrame(dst: []u8, frame: Frame) EncodeError!usize {
     @memcpy(dst[pos .. pos + payload_len], frame.op_payload);
     pos += payload_len;
 
-    // The commit envelope. The bitmap is a raw copy: `no_of_decisions` already
-    // carries its length. An empty envelope is the single byte 0x00.
-    const decisions = frame.commit_envelope.decisions;
-    const decisions_prefix = varintSize(decisions.len);
-    const decisions_body: usize = if (decisions.len == 0) 0 else 16 + decisions.len;
-    if (pos + decisions_prefix + decisions_body > cap) return error.FrameTooLarge;
+    if (class == .consensus) {
+        // The envelope is a consensus-only tail. A null envelope encodes as the
+        // single byte 0x00, exactly like an empty one (§2.4). The bitmap is a
+        // raw copy: the leading uvarint already carries its length.
+        const envelope = frame.commit_envelope orelse CommitEnvelope{};
+        const decisions = envelope.decisions;
+        const decisions_prefix = varintSize(decisions.len);
+        const decisions_body: usize = if (decisions.len == 0) 0 else 16 + decisions.len;
+        if (pos + decisions_prefix + decisions_body > cap) return error.FrameTooLarge;
 
-    _ = blog.appendVarint(dst.ptr + pos, @as(u64, @intCast(decisions.len)));
-    pos += decisions_prefix;
+        _ = blog.appendVarint(dst.ptr + pos, @as(u64, @intCast(decisions.len)));
+        pos += decisions_prefix;
 
-    if (decisions.len != 0) {
-        pos += appendScalar(dst.ptr + pos, @as(u64, @truncate(frame.commit_envelope.start_state_idx)));
-        pos += appendScalar(dst.ptr + pos, @as(u64, @truncate(frame.commit_envelope.start_state_idx >> 64)));
-        @memcpy(dst[pos .. pos + decisions.len], decisions);
-        pos += decisions.len;
+        if (decisions.len != 0) {
+            pos += appendU128(dst.ptr + pos, envelope.start_state_idx);
+            @memcpy(dst[pos .. pos + decisions.len], decisions);
+            pos += decisions.len;
+        }
     }
 
-    std.debug.assert(pos >= FRAME_MIN);
+    std.debug.assert(pos >= frameMin(class));
     std.debug.assert(pos <= cap);
 
     const len_field: *[2]u8 = @ptrCast(dst.ptr + 2);
@@ -525,6 +640,14 @@ pub fn encodeFrame(dst: []u8, frame: Frame) EncodeError!usize {
 /// range. A length outside it is a link failure, not a skippable frame.
 pub fn frameLenValid(frame_len: usize) bool {
     return frame_len >= FRAME_MIN and frame_len <= FRAME_CAP;
+}
+
+/// True when `frame_len` is legal for the class of `op`. A length inside the
+/// broad bound but below the class minimum of its own op is a link failure
+/// (§2.3).
+pub fn frameLenValidFor(op: u8, frame_len: usize) bool {
+    const class = frameClass(op) orelse return false;
+    return frame_len >= frameMin(class) and frame_len <= FRAME_CAP;
 }
 
 /// Lifts the 16-bit `seq_id` to its unique absolute index in
@@ -544,6 +667,709 @@ pub fn lift(wave: u64, seq_id: u16, window: u16) ?u64 {
     return if (candidate < wave) candidate + 0x10000 else candidate;
 }
 
+// ---------------------------------------------------------------------------
+// Payload codecs (§3)
+// ---------------------------------------------------------------------------
+
+/// `diag` is a UTF-8 string capped at this many bytes. An over-cap value is a
+/// malformed payload, never a truncated one (§2.1).
+pub const DIAG_CAP: usize = 256;
+
+/// The payload codec's failures. `PayloadTooLarge` is encode-side: the
+/// caller's buffer cannot hold the encoding. The other tags are decode-side
+/// malformations that close the link (§4.9); the encoders reject the same
+/// structural violations so they cannot emit a payload a peer must kill.
+pub const PayloadError = error{
+    PayloadTooLarge,
+    TruncatedPayload,
+    TrailingBytes,
+    InvalidBool,
+    InvalidUtf8,
+    DiagTooLong,
+    UnknownOneofTag,
+    UnknownDecisionKind,
+    SnapshotFinalViolation,
+    ZeroStateId,
+    ZeroCount,
+};
+
+/// The payload writer: little-endian scalars, a `uvarint` length before every
+/// variable-size field, no padding (§2.1).
+const PayloadWriter = struct {
+    dst: []u8,
+    pos: usize = 0,
+
+    fn put(self: *PayloadWriter, data: []const u8) PayloadError!void {
+        if (data.len > self.dst.len - self.pos) return error.PayloadTooLarge;
+        @memcpy(self.dst[self.pos..][0..data.len], data);
+        self.pos += data.len;
+    }
+
+    fn putVarint(self: *PayloadWriter, value: usize) PayloadError!void {
+        const width = varintSize(value);
+        if (width > self.dst.len - self.pos) return error.PayloadTooLarge;
+        _ = blog.appendVarint(self.dst.ptr + self.pos, @as(u64, @intCast(value)));
+        self.pos += width;
+    }
+
+    fn putScalar(self: *PayloadWriter, value: anytype) PayloadError!void {
+        const width = @bitSizeOf(@TypeOf(value)) / 8;
+        if (width > self.dst.len - self.pos) return error.PayloadTooLarge;
+        _ = appendScalar(self.dst.ptr + self.pos, value);
+        self.pos += width;
+    }
+
+    fn putU128(self: *PayloadWriter, value: u128) PayloadError!void {
+        try self.putScalar(@as(u64, @truncate(value)));
+        try self.putScalar(@as(u64, @truncate(value >> 64)));
+    }
+
+    fn putBool(self: *PayloadWriter, value: bool) PayloadError!void {
+        try self.putScalar(@as(u8, @intFromBool(value)));
+    }
+
+    fn putBytes(self: *PayloadWriter, value: []const u8) PayloadError!void {
+        try self.putVarint(value.len);
+        try self.put(value);
+    }
+
+    fn putString(self: *PayloadWriter, value: []const u8) PayloadError!void {
+        try self.putBytes(value);
+    }
+
+    fn putDiag(self: *PayloadWriter, value: []const u8) PayloadError!void {
+        if (value.len > DIAG_CAP) return error.DiagTooLong;
+        try self.putBytes(value);
+    }
+};
+
+/// The payload reader. Every read is bounds-checked and every decode ends by
+/// requiring that the fields tile the payload exactly.
+const PayloadReader = struct {
+    src: []const u8,
+    pos: usize = 0,
+
+    fn take(self: *PayloadReader, count: usize) PayloadError![]const u8 {
+        if (self.pos > self.src.len or count > self.src.len - self.pos) {
+            return error.TruncatedPayload;
+        }
+        const data = self.src[self.pos..][0..count];
+        self.pos += count;
+        return data;
+    }
+
+    fn varint(self: *PayloadReader) PayloadError!usize {
+        var value: u64 = 0;
+        var shift: u32 = 0;
+        var i = self.pos;
+
+        while (i < self.src.len) : (i += 1) {
+            const byte = self.src[i];
+            if (shift >= 64) return error.TruncatedPayload;
+
+            const bits: u64 = byte & 0x7f;
+            if (shift == 63 and bits > 1) return error.TruncatedPayload;
+            value |= bits << @as(u6, @intCast(shift));
+
+            if (byte & 0x80 == 0) {
+                self.pos = i + 1;
+                return std.math.cast(usize, value) orelse error.TruncatedPayload;
+            }
+            shift += 7;
+        }
+
+        return error.TruncatedPayload;
+    }
+
+    fn scalar(self: *PayloadReader, comptime T: type) PayloadError!T {
+        const raw = try self.take(@sizeOf(T));
+        return std.mem.readInt(T, raw[0..@sizeOf(T)], .little);
+    }
+
+    fn getU128(self: *PayloadReader) PayloadError!u128 {
+        const low = try self.scalar(u64);
+        const high = try self.scalar(u64);
+        return @as(u128, low) | (@as(u128, high) << 64);
+    }
+
+    fn boolean(self: *PayloadReader) PayloadError!bool {
+        return switch (try self.scalar(u8)) {
+            0 => false,
+            1 => true,
+            else => error.InvalidBool,
+        };
+    }
+
+    fn bytes(self: *PayloadReader) PayloadError![]const u8 {
+        const length = try self.varint();
+        return self.take(length);
+    }
+
+    fn string(self: *PayloadReader) PayloadError![]const u8 {
+        const value = try self.bytes();
+        if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+        return value;
+    }
+
+    fn diag(self: *PayloadReader) PayloadError![]const u8 {
+        const value = try self.string();
+        if (value.len > DIAG_CAP) return error.DiagTooLong;
+        return value;
+    }
+
+    fn expectEnd(self: *PayloadReader) PayloadError!void {
+        if (self.pos != self.src.len) return error.TrailingBytes;
+    }
+};
+
+/// A consensus `Create` payload. The new session id is the frame's `stateID`,
+/// so the payload carries no id (§3.1).
+pub const CreatePayload = struct {
+    compensator: []const u8,
+    payload: []const u8,
+};
+
+pub const AppendPayload = struct {
+    session_id: u128,
+    payload: []const u8,
+};
+
+pub const OverwritePayload = struct {
+    session_id: u128,
+    payload: []const u8,
+};
+
+pub const ClosePayload = struct {
+    session_id: u128,
+};
+
+pub const RepeatPayload = struct {
+    session_id: u128,
+    timeout_seconds: u32,
+};
+
+pub const CompensatePayload = struct {
+    new_id: u128,
+    original_id: u128,
+};
+
+pub const IsolatePayload = struct {
+    host_id: u8,
+    lost_host_state_id: u128,
+};
+
+pub const CapturePayload = struct {
+    lost_host_id: u8,
+    host_id: u8,
+    host_state_id: u128,
+    n: u32,
+    timeout_seconds: u32,
+};
+
+pub const CaptureCompensatePayload = struct {
+    lost_host_id: u8,
+    host_id: u8,
+    host_state_id: u128,
+    n: u32,
+};
+
+pub fn encodeCreate(dst: []u8, value: CreatePayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putString(value.compensator);
+    try w.putBytes(value.payload);
+    return w.pos;
+}
+
+pub fn decodeCreate(src: []const u8) PayloadError!CreatePayload {
+    var r = PayloadReader{ .src = src };
+    const compensator = try r.string();
+    const payload = try r.bytes();
+    try r.expectEnd();
+    return .{ .compensator = compensator, .payload = payload };
+}
+
+pub fn encodeAppend(dst: []u8, value: AppendPayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putU128(value.session_id);
+    try w.putBytes(value.payload);
+    return w.pos;
+}
+
+pub fn decodeAppend(src: []const u8) PayloadError!AppendPayload {
+    var r = PayloadReader{ .src = src };
+    const session_id = try r.getU128();
+    const payload = try r.bytes();
+    try r.expectEnd();
+    return .{ .session_id = session_id, .payload = payload };
+}
+
+pub fn encodeOverwrite(dst: []u8, value: OverwritePayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putU128(value.session_id);
+    try w.putBytes(value.payload);
+    return w.pos;
+}
+
+pub fn decodeOverwrite(src: []const u8) PayloadError!OverwritePayload {
+    var r = PayloadReader{ .src = src };
+    const session_id = try r.getU128();
+    const payload = try r.bytes();
+    try r.expectEnd();
+    return .{ .session_id = session_id, .payload = payload };
+}
+
+pub fn encodeClose(dst: []u8, value: ClosePayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putU128(value.session_id);
+    return w.pos;
+}
+
+pub fn decodeClose(src: []const u8) PayloadError!ClosePayload {
+    var r = PayloadReader{ .src = src };
+    const session_id = try r.getU128();
+    try r.expectEnd();
+    return .{ .session_id = session_id };
+}
+
+pub fn encodeRepeat(dst: []u8, value: RepeatPayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putU128(value.session_id);
+    try w.putScalar(value.timeout_seconds);
+    return w.pos;
+}
+
+pub fn decodeRepeat(src: []const u8) PayloadError!RepeatPayload {
+    var r = PayloadReader{ .src = src };
+    const session_id = try r.getU128();
+    const timeout_seconds = try r.scalar(u32);
+    try r.expectEnd();
+    return .{ .session_id = session_id, .timeout_seconds = timeout_seconds };
+}
+
+pub fn encodeCompensate(dst: []u8, value: CompensatePayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putU128(value.new_id);
+    try w.putU128(value.original_id);
+    return w.pos;
+}
+
+pub fn decodeCompensate(src: []const u8) PayloadError!CompensatePayload {
+    var r = PayloadReader{ .src = src };
+    const new_id = try r.getU128();
+    const original_id = try r.getU128();
+    try r.expectEnd();
+    return .{ .new_id = new_id, .original_id = original_id };
+}
+
+pub fn encodeIsolate(dst: []u8, value: IsolatePayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.host_id);
+    try w.putU128(value.lost_host_state_id);
+    return w.pos;
+}
+
+pub fn decodeIsolate(src: []const u8) PayloadError!IsolatePayload {
+    var r = PayloadReader{ .src = src };
+    const host_id = try r.scalar(u8);
+    const lost_host_state_id = try r.getU128();
+    try r.expectEnd();
+    return .{ .host_id = host_id, .lost_host_state_id = lost_host_state_id };
+}
+
+pub fn encodeCapture(dst: []u8, value: CapturePayload) PayloadError!usize {
+    if (value.n == 0) return error.ZeroCount;
+
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.lost_host_id);
+    try w.putScalar(value.host_id);
+    try w.putU128(value.host_state_id);
+    try w.putScalar(value.n);
+    try w.putScalar(value.timeout_seconds);
+    return w.pos;
+}
+
+pub fn decodeCapture(src: []const u8) PayloadError!CapturePayload {
+    var r = PayloadReader{ .src = src };
+    const lost_host_id = try r.scalar(u8);
+    const host_id = try r.scalar(u8);
+    const host_state_id = try r.getU128();
+    const n = try r.scalar(u32);
+    const timeout_seconds = try r.scalar(u32);
+    try r.expectEnd();
+
+    if (n == 0) return error.ZeroCount;
+
+    return .{
+        .lost_host_id = lost_host_id,
+        .host_id = host_id,
+        .host_state_id = host_state_id,
+        .n = n,
+        .timeout_seconds = timeout_seconds,
+    };
+}
+
+pub fn encodeCaptureCompensate(dst: []u8, value: CaptureCompensatePayload) PayloadError!usize {
+    if (value.n == 0) return error.ZeroCount;
+
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.lost_host_id);
+    try w.putScalar(value.host_id);
+    try w.putU128(value.host_state_id);
+    try w.putScalar(value.n);
+    return w.pos;
+}
+
+pub fn decodeCaptureCompensate(src: []const u8) PayloadError!CaptureCompensatePayload {
+    var r = PayloadReader{ .src = src };
+    const lost_host_id = try r.scalar(u8);
+    const host_id = try r.scalar(u8);
+    const host_state_id = try r.getU128();
+    const n = try r.scalar(u32);
+    try r.expectEnd();
+
+    if (n == 0) return error.ZeroCount;
+
+    return .{
+        .lost_host_id = lost_host_id,
+        .host_id = host_id,
+        .host_state_id = host_state_id,
+        .n = n,
+    };
+}
+
+/// Writes an op with no payload: zero bytes.
+pub fn encodeEmpty(dst: []u8) PayloadError!usize {
+    _ = dst;
+    return 0;
+}
+
+/// Accepts only the empty payload; the op carries no bytes.
+pub fn decodeEmpty(src: []const u8) PayloadError!void {
+    if (src.len != 0) return error.TrailingBytes;
+}
+
+pub fn encodeNop(dst: []u8) PayloadError!usize {
+    return encodeEmpty(dst);
+}
+
+pub fn decodeNop(src: []const u8) PayloadError!void {
+    return decodeEmpty(src);
+}
+
+pub fn encodePulse(dst: []u8) PayloadError!usize {
+    return encodeEmpty(dst);
+}
+
+pub fn decodePulse(src: []const u8) PayloadError!void {
+    return decodeEmpty(src);
+}
+
+pub fn encodePulseAck(dst: []u8) PayloadError!usize {
+    return encodeEmpty(dst);
+}
+
+pub fn decodePulseAck(src: []const u8) PayloadError!void {
+    return decodeEmpty(src);
+}
+
+pub const EmergencyStopPayload = struct {
+    level: u8,
+};
+
+pub const DecisionPayload = struct {
+    state_id: u128,
+    decision: DecisionKind,
+};
+
+pub fn encodeEmergencyStop(dst: []u8, value: EmergencyStopPayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.level);
+    return w.pos;
+}
+
+pub fn decodeEmergencyStop(src: []const u8) PayloadError!EmergencyStopPayload {
+    var r = PayloadReader{ .src = src };
+    const level = try r.scalar(u8);
+    try r.expectEnd();
+    return .{ .level = level };
+}
+
+/// The decision payload repeats the decided op's `stateID`. A control frame
+/// carries no state fields, so this is the only copy on the wire; there is no
+/// frame field to compare it with (§3.2).
+pub fn encodeDecision(dst: []u8, value: DecisionPayload) PayloadError!usize {
+    if (value.state_id == 0) return error.ZeroStateId;
+
+    var w = PayloadWriter{ .dst = dst };
+    try w.putU128(value.state_id);
+    try w.putScalar(@as(u8, @backingInt(value.decision)));
+    return w.pos;
+}
+
+pub fn decodeDecision(src: []const u8) PayloadError!DecisionPayload {
+    var r = PayloadReader{ .src = src };
+    const state_id = try r.getU128();
+    if (state_id == 0) return error.ZeroStateId;
+
+    const tag = try r.scalar(u8);
+    if (tag > @backingInt(DecisionKind.data_integrity_violated)) {
+        return error.UnknownDecisionKind;
+    }
+    try r.expectEnd();
+
+    return .{ .state_id = state_id, .decision = @fromBackingInt(tag) };
+}
+
+/// The `LogDelivery` oneof tags. These numeric values are the wire tags.
+pub const LogDeliveryTag = enum(u8) {
+    out_of_date = 0,
+    log_data = 1,
+    delivery_failure = 2,
+};
+
+pub const LogDelivery = union(LogDeliveryTag) {
+    out_of_date: struct { state_id: u128 },
+    log_data: struct { data: []const u8, final: bool },
+    delivery_failure: struct { diag: []const u8 },
+};
+
+/// The `SnapshotDelivery` oneof tags. These numeric values are the wire tags.
+pub const SnapshotDeliveryTag = enum(u8) {
+    snapshot = 0,
+    log = 1,
+    delivery_failure = 2,
+};
+
+pub const SnapshotDelivery = union(SnapshotDeliveryTag) {
+    snapshot: struct { data: []const u8, final: bool },
+    log: struct { data: []const u8, final: bool },
+    delivery_failure: struct { diag: []const u8 },
+};
+
+fn writeLogDelivery(w: *PayloadWriter, value: LogDelivery) PayloadError!void {
+    switch (value) {
+        .out_of_date => |arm| {
+            try w.putScalar(@as(u8, @backingInt(LogDeliveryTag.out_of_date)));
+            try w.putU128(arm.state_id);
+        },
+        .log_data => |arm| {
+            try w.putScalar(@as(u8, @backingInt(LogDeliveryTag.log_data)));
+            try w.putBytes(arm.data);
+            try w.putBool(arm.final);
+        },
+        .delivery_failure => |arm| {
+            try w.putScalar(@as(u8, @backingInt(LogDeliveryTag.delivery_failure)));
+            try w.putDiag(arm.diag);
+        },
+    }
+}
+
+fn readLogDelivery(r: *PayloadReader) PayloadError!LogDelivery {
+    return switch (try r.scalar(u8)) {
+        @backingInt(LogDeliveryTag.out_of_date) => .{
+            .out_of_date = .{ .state_id = try r.getU128() },
+        },
+        @backingInt(LogDeliveryTag.log_data) => blk: {
+            const data = try r.bytes();
+            const final = try r.boolean();
+            break :blk .{ .log_data = .{ .data = data, .final = final } };
+        },
+        @backingInt(LogDeliveryTag.delivery_failure) => .{
+            .delivery_failure = .{ .diag = try r.diag() },
+        },
+        else => error.UnknownOneofTag,
+    };
+}
+
+fn writeSnapshotDelivery(w: *PayloadWriter, value: SnapshotDelivery) PayloadError!void {
+    switch (value) {
+        .snapshot => |arm| {
+            if (arm.final) return error.SnapshotFinalViolation;
+            try w.putScalar(@as(u8, @backingInt(SnapshotDeliveryTag.snapshot)));
+            try w.putBytes(arm.data);
+            try w.putBool(arm.final);
+        },
+        .log => |arm| {
+            try w.putScalar(@as(u8, @backingInt(SnapshotDeliveryTag.log)));
+            try w.putBytes(arm.data);
+            try w.putBool(arm.final);
+        },
+        .delivery_failure => |arm| {
+            try w.putScalar(@as(u8, @backingInt(SnapshotDeliveryTag.delivery_failure)));
+            try w.putDiag(arm.diag);
+        },
+    }
+}
+
+fn readSnapshotDelivery(r: *PayloadReader) PayloadError!SnapshotDelivery {
+    return switch (try r.scalar(u8)) {
+        @backingInt(SnapshotDeliveryTag.snapshot) => blk: {
+            const data = try r.bytes();
+            const final = try r.boolean();
+            if (final) return error.SnapshotFinalViolation;
+            break :blk .{ .snapshot = .{ .data = data, .final = final } };
+        },
+        @backingInt(SnapshotDeliveryTag.log) => blk: {
+            const data = try r.bytes();
+            const final = try r.boolean();
+            break :blk .{ .log = .{ .data = data, .final = final } };
+        },
+        @backingInt(SnapshotDeliveryTag.delivery_failure) => .{
+            .delivery_failure = .{ .diag = try r.diag() },
+        },
+        else => error.UnknownOneofTag,
+    };
+}
+
+pub fn encodeLogDelivery(dst: []u8, value: LogDelivery) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try writeLogDelivery(&w, value);
+    return w.pos;
+}
+
+pub fn decodeLogDelivery(src: []const u8) PayloadError!LogDelivery {
+    var r = PayloadReader{ .src = src };
+    const value = try readLogDelivery(&r);
+    try r.expectEnd();
+    return value;
+}
+
+pub fn encodeSnapshotDelivery(dst: []u8, value: SnapshotDelivery) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try writeSnapshotDelivery(&w, value);
+    return w.pos;
+}
+
+pub fn decodeSnapshotDelivery(src: []const u8) PayloadError!SnapshotDelivery {
+    var r = PayloadReader{ .src = src };
+    const value = try readSnapshotDelivery(&r);
+    try r.expectEnd();
+    return value;
+}
+
+pub const DeliverLogPayload = struct {
+    host_id: u8,
+    after_state_id: u128,
+};
+
+pub const DeliverLogResponsePayload = struct {
+    host_id: u8,
+    seq_id: u32,
+    data: LogDelivery,
+};
+
+pub const DeliverLogCommitPayload = struct {
+    host_id: u8,
+    seq_id: u32,
+};
+
+pub const DeliverSnapshotPayload = struct {
+    host_id: u8,
+};
+
+pub const DeliverSnapshotResponsePayload = struct {
+    host_id: u8,
+    seq_id: u32,
+    data: SnapshotDelivery,
+};
+
+pub const DeliverSnapshotCommitPayload = struct {
+    host_id: u8,
+    seq_id: u32,
+};
+
+pub fn encodeDeliverLog(dst: []u8, value: DeliverLogPayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.host_id);
+    try w.putU128(value.after_state_id);
+    return w.pos;
+}
+
+pub fn decodeDeliverLog(src: []const u8) PayloadError!DeliverLogPayload {
+    var r = PayloadReader{ .src = src };
+    const host_id = try r.scalar(u8);
+    const after_state_id = try r.getU128();
+    try r.expectEnd();
+    return .{ .host_id = host_id, .after_state_id = after_state_id };
+}
+
+pub fn encodeDeliverLogResponse(dst: []u8, value: DeliverLogResponsePayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.host_id);
+    try w.putScalar(value.seq_id);
+    try writeLogDelivery(&w, value.data);
+    return w.pos;
+}
+
+pub fn decodeDeliverLogResponse(src: []const u8) PayloadError!DeliverLogResponsePayload {
+    var r = PayloadReader{ .src = src };
+    const host_id = try r.scalar(u8);
+    const seq_id = try r.scalar(u32);
+    const data = try readLogDelivery(&r);
+    try r.expectEnd();
+    return .{ .host_id = host_id, .seq_id = seq_id, .data = data };
+}
+
+pub fn encodeDeliverLogCommit(dst: []u8, value: DeliverLogCommitPayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.host_id);
+    try w.putScalar(value.seq_id);
+    return w.pos;
+}
+
+pub fn decodeDeliverLogCommit(src: []const u8) PayloadError!DeliverLogCommitPayload {
+    var r = PayloadReader{ .src = src };
+    const host_id = try r.scalar(u8);
+    const seq_id = try r.scalar(u32);
+    try r.expectEnd();
+    return .{ .host_id = host_id, .seq_id = seq_id };
+}
+
+pub fn encodeDeliverSnapshot(dst: []u8, value: DeliverSnapshotPayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.host_id);
+    return w.pos;
+}
+
+pub fn decodeDeliverSnapshot(src: []const u8) PayloadError!DeliverSnapshotPayload {
+    var r = PayloadReader{ .src = src };
+    const host_id = try r.scalar(u8);
+    try r.expectEnd();
+    return .{ .host_id = host_id };
+}
+
+pub fn encodeDeliverSnapshotResponse(dst: []u8, value: DeliverSnapshotResponsePayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.host_id);
+    try w.putScalar(value.seq_id);
+    try writeSnapshotDelivery(&w, value.data);
+    return w.pos;
+}
+
+pub fn decodeDeliverSnapshotResponse(src: []const u8) PayloadError!DeliverSnapshotResponsePayload {
+    var r = PayloadReader{ .src = src };
+    const host_id = try r.scalar(u8);
+    const seq_id = try r.scalar(u32);
+    const data = try readSnapshotDelivery(&r);
+    try r.expectEnd();
+    return .{ .host_id = host_id, .seq_id = seq_id, .data = data };
+}
+
+pub fn encodeDeliverSnapshotCommit(dst: []u8, value: DeliverSnapshotCommitPayload) PayloadError!usize {
+    var w = PayloadWriter{ .dst = dst };
+    try w.putScalar(value.host_id);
+    try w.putScalar(value.seq_id);
+    return w.pos;
+}
+
+pub fn decodeDeliverSnapshotCommit(src: []const u8) PayloadError!DeliverSnapshotCommitPayload {
+    var r = PayloadReader{ .src = src };
+    const host_id = try r.scalar(u8);
+    const seq_id = try r.scalar(u32);
+    try r.expectEnd();
+    return .{ .host_id = host_id, .seq_id = seq_id };
+}
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
@@ -560,11 +1386,77 @@ test "the verdict, op and link state numbers are the pinned ones" {
 
     try expectEqual(@as(u8, 0x00), OP_PULSE);
     try expectEqual(@as(u8, 0x01), OP_PULSE_ACK);
+    try expectEqual(@as(u8, 0x02), OP_EMERGENCY_STOP);
+    try expectEqual(@as(u8, 0x03), OP_DECISION);
+
+    try expectEqual(@as(u8, 0x10), OP_DELIVER_LOG);
+    try expectEqual(@as(u8, 0x11), OP_DELIVER_LOG_RESPONSE);
+    try expectEqual(@as(u8, 0x12), OP_DELIVER_LOG_COMMIT);
+    try expectEqual(@as(u8, 0x13), OP_DELIVER_SNAPSHOT);
+    try expectEqual(@as(u8, 0x14), OP_DELIVER_SNAPSHOT_RESPONSE);
+    try expectEqual(@as(u8, 0x15), OP_DELIVER_SNAPSHOT_COMMIT);
+
+    try expectEqual(@as(u8, 0x20), OP_CREATE);
+    try expectEqual(@as(u8, 0x21), OP_APPEND);
+    try expectEqual(@as(u8, 0x22), OP_OVERWRITE);
+    try expectEqual(@as(u8, 0x23), OP_CLOSE);
+    try expectEqual(@as(u8, 0x24), OP_REPEAT);
+    try expectEqual(@as(u8, 0x25), OP_COMPENSATE);
+    try expectEqual(@as(u8, 0x26), OP_ISOLATE);
+    try expectEqual(@as(u8, 0x27), OP_CAPTURE);
+    try expectEqual(@as(u8, 0x28), OP_CAPTURE_COMPENSATE);
+    try expectEqual(@as(u8, 0x29), OP_NOP);
+
+    try expectEqual(@as(u8, 0), @backingInt(DecisionKind.confirmed));
+    try expectEqual(@as(u8, 1), @backingInt(DecisionKind.rejected_update_yourself));
+    try expectEqual(@as(u8, 2), @backingInt(DecisionKind.rejected_you_are_late));
+    try expectEqual(@as(u8, 3), @backingInt(DecisionKind.data_integrity_violated));
+
+    try expectEqual(@as(usize, 23), frameMin(.control));
+    try expectEqual(@as(usize, 23), frameMin(.transport));
+    try expectEqual(@as(usize, 56), frameMin(.consensus));
 
     try expectEqual(@as(u8, 0), @backingInt(LinkState.none));
     try expectEqual(@as(u8, 1), @backingInt(LinkState.greeting));
     try expectEqual(@as(u8, 2), @backingInt(LinkState.parked));
     try expectEqual(@as(u8, 3), @backingInt(LinkState.up));
+}
+
+test "every op code maps to its wire class" {
+    try expectEqual(@as(?FrameClass, .control), frameClass(OP_PULSE));
+    try expectEqual(@as(?FrameClass, .control), frameClass(OP_PULSE_ACK));
+    try expectEqual(@as(?FrameClass, .control), frameClass(OP_EMERGENCY_STOP));
+    try expectEqual(@as(?FrameClass, .control), frameClass(OP_DECISION));
+
+    try expectEqual(@as(?FrameClass, .transport), frameClass(OP_DELIVER_LOG));
+    try expectEqual(@as(?FrameClass, .transport), frameClass(OP_DELIVER_LOG_RESPONSE));
+    try expectEqual(@as(?FrameClass, .transport), frameClass(OP_DELIVER_LOG_COMMIT));
+    try expectEqual(@as(?FrameClass, .transport), frameClass(OP_DELIVER_SNAPSHOT));
+    try expectEqual(@as(?FrameClass, .transport), frameClass(OP_DELIVER_SNAPSHOT_RESPONSE));
+    try expectEqual(@as(?FrameClass, .transport), frameClass(OP_DELIVER_SNAPSHOT_COMMIT));
+
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_CREATE));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_APPEND));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_OVERWRITE));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_CLOSE));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_REPEAT));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_COMPENSATE));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_ISOLATE));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_CAPTURE));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_CAPTURE_COMPENSATE));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(OP_NOP));
+
+    // Reserved values inside a valid range still belong to that class.
+    try expectEqual(@as(?FrameClass, .control), frameClass(0x04));
+    try expectEqual(@as(?FrameClass, .control), frameClass(0x0F));
+    try expectEqual(@as(?FrameClass, .transport), frameClass(0x16));
+    try expectEqual(@as(?FrameClass, .transport), frameClass(0x1F));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(0x2A));
+    try expectEqual(@as(?FrameClass, .consensus), frameClass(0x7F));
+
+    // `0x80..0xFF` has no class.
+    try expectEqual(@as(?FrameClass, null), frameClass(0x80));
+    try expectEqual(@as(?FrameClass, null), frameClass(0xFF));
 }
 
 test "greet and reply round-trip" {
@@ -618,32 +1510,46 @@ test "an unknown verdict code is a decode error" {
 }
 
 test "the length check accepts exactly the wire bounds" {
-    try expect(!frameLenValid(23));
+    try expect(!frameLenValid(22));
+    try expect(frameLenValid(23));
     try expect(frameLenValid(24));
     try expect(frameLenValid(4096));
     try expect(!frameLenValid(4097));
+
+    // The broad bound is class-blind; the companion applies the op's own
+    // minimum (§2.3).
+    try expect(frameLenValidFor(OP_PULSE, 23));
+    try expect(!frameLenValidFor(OP_PULSE, 22));
+    try expect(frameLenValidFor(OP_DELIVER_LOG, 23));
+    try expect(!frameLenValidFor(OP_NOP, 55));
+    try expect(frameLenValidFor(OP_NOP, 56));
+    try expect(frameLenValidFor(OP_NOP, 4096));
+    try expect(!frameLenValidFor(OP_NOP, 4097));
+    try expect(!frameLenValidFor(0x80, 56));
 }
 
-test "the frame layout is field after field, with the length back-patched" {
+test "a consensus layout is state fields, payload, then the envelope" {
     var dst: [FRAME_CAP]u8 = undefined;
     const payload = [_]u8{ 0xAA, 0xBB, 0xCC };
     const state: u128 = 0x0102_0304_0506_0708_1112_1314_1516_1718;
-    const start: u128 = 0x2122_2324_2526_2728_3132_3334_3536_3738;
+    const prev_state: u128 = 0x2122_2324_2526_2728_3132_3334_3536_3738;
 
     const len = try encodeFrame(&dst, .{
         .seq_id = 0x1234,
         .vector_clock_frame = .{ .host_idx = 7, .state = state },
-        .op_code = 0x20,
+        .op_code = OP_CREATE,
         .op_payload = &payload,
-        .commit_envelope = .{ .start_state_idx = start, .decisions = &.{0x05} },
+        .state_id = state,
+        .prev_state_id = prev_state,
+        .commit_envelope = .{ .start_state_idx = prev_state, .decisions = &.{0x05} },
     });
 
-    try expectEqual(@as(usize, 44), len);
+    try expectEqual(@as(usize, 76), len);
 
     // Prefix.
     try expectEqual(@as(u8, 0x34), dst[0]);
     try expectEqual(@as(u8, 0x12), dst[1]);
-    try expectEqual(@as(u16, 44), std.mem.readInt(u16, dst[2..4], .little));
+    try expectEqual(@as(u16, 76), std.mem.readInt(u16, dst[2..4], .little));
 
     // Vector clock: host byte, then the low and the high half, both little
     // endian.
@@ -651,55 +1557,79 @@ test "the frame layout is field after field, with the length back-patched" {
     try expectEqual(@as(u64, 0x1112_1314_1516_1718), std.mem.readInt(u64, dst[5..13], .little));
     try expectEqual(@as(u64, 0x0102_0304_0506_0708), std.mem.readInt(u64, dst[13..21], .little));
 
-    // Op code, then the payload behind its own uvarint length.
-    try expectEqual(@as(u8, 0x20), dst[21]);
-    try expectEqual(@as(u8, 3), dst[22]);
-    try expectEqualSlices(u8, &payload, dst[23..26]);
+    // Op code, then the two state fields, low half first.
+    try expectEqual(@as(u8, OP_CREATE), dst[21]);
+    try expectEqual(@as(u64, 0x1112_1314_1516_1718), std.mem.readInt(u64, dst[22..30], .little));
+    try expectEqual(@as(u64, 0x0102_0304_0506_0708), std.mem.readInt(u64, dst[30..38], .little));
+    try expectEqual(@as(u64, 0x3132_3334_3536_3738), std.mem.readInt(u64, dst[38..46], .little));
+    try expectEqual(@as(u64, 0x2122_2324_2526_2728), std.mem.readInt(u64, dst[46..54], .little));
+
+    // Payload behind its own uvarint length at 54.
+    try expectEqual(@as(u8, 3), dst[54]);
+    try expectEqualSlices(u8, &payload, dst[55..58]);
 
     // Envelope: count, the start state as two halves, then the raw bitmap.
-    try expectEqual(@as(u8, 1), dst[26]);
-    try expectEqual(@as(u64, 0x3132_3334_3536_3738), std.mem.readInt(u64, dst[27..35], .little));
-    try expectEqual(@as(u64, 0x2122_2324_2526_2728), std.mem.readInt(u64, dst[35..43], .little));
-    try expectEqual(@as(u8, 0x05), dst[43]);
+    try expectEqual(@as(u8, 1), dst[58]);
+    try expectEqual(@as(u64, 0x3132_3334_3536_3738), std.mem.readInt(u64, dst[59..67], .little));
+    try expectEqual(@as(u64, 0x2122_2324_2526_2728), std.mem.readInt(u64, dst[67..75], .little));
+    try expectEqual(@as(u8, 0x05), dst[75]);
 }
 
-test "an empty payload and an empty envelope are one zero byte each" {
+test "a control frame is the broad minimum and ends after its payload" {
     var dst: [FRAME_CAP]u8 = undefined;
     const len = try encodeFrame(&dst, .{
         .seq_id = 0,
         .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
         .op_code = OP_PULSE,
         .op_payload = &.{},
-        .commit_envelope = .{},
     });
 
-    try expectEqual(@as(usize, FRAME_MIN), len);
+    try expectEqual(FRAME_MIN, len);
+    try expectEqual(@as(u16, FRAME_MIN), std.mem.readInt(u16, dst[2..4], .little));
     try expectEqual(@as(u8, OP_PULSE), dst[21]);
     try expectEqual(@as(u8, 0x00), dst[22]);
-    try expectEqual(@as(u8, 0x00), dst[23]);
 }
 
-test "the decisions bitmap is a raw copy without a varint prefix" {
+test "a consensus bitmap is a raw copy at the envelope tail" {
     var dst: [FRAME_CAP]u8 = undefined;
     const len = try encodeFrame(&dst, .{
         .seq_id = 0,
         .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
-        .op_code = OP_PULSE_ACK,
+        .op_code = OP_NOP,
         .op_payload = &.{},
+        .state_id = 1,
+        .prev_state_id = 0,
         .commit_envelope = .{ .decisions = &.{ 0x02, 0x00 } },
     });
 
-    // 4 prefix + 17 clock + 1 op + 1 empty payload + 1 count + 16 state + 2 bits.
-    try expectEqual(@as(usize, 42), len);
-    try expectEqual(@as(u8, 2), dst[23]);
-    try expectEqual(@as(u8, 0x02), dst[40]);
-    try expectEqual(@as(u8, 0x00), dst[41]);
+    // 54 state fields + 1 empty payload + 1 count + 16 start + 2 bits.
+    try expectEqual(@as(usize, 74), len);
+    try expectEqual(@as(u8, 0x00), dst[54]);
+    try expectEqual(@as(u8, 2), dst[55]);
+    try expectEqual(@as(u64, 0), std.mem.readInt(u64, dst[56..64], .little));
+    try expectEqual(@as(u64, 0), std.mem.readInt(u64, dst[64..72], .little));
+    try expectEqual(@as(u8, 0x02), dst[72]);
+    try expectEqual(@as(u8, 0x00), dst[73]);
 }
 
 test "every encode back-patches its own validated length" {
     var dst: [FRAME_CAP]u8 = undefined;
     var payload: [1000]u8 = undefined;
     @memset(&payload, 0x5A);
+
+    for ([_]usize{ 0, 1, 127, 128, 1000 }) |payload_len| {
+        const len = try encodeFrame(&dst, .{
+            .seq_id = 9,
+            .vector_clock_frame = .{ .host_idx = 4, .state = 0xDEAD_BEEF },
+            .op_code = OP_PULSE,
+            .op_payload = payload[0..payload_len],
+        });
+
+        try expect(frameLenValid(len));
+        try expect(frameLenValidFor(OP_PULSE, len));
+        try expectEqual(@as(u16, @intCast(len)), std.mem.readInt(u16, dst[2..4], .little));
+        try expectEqual(@as(u16, 9), std.mem.readInt(u16, dst[0..2], .little));
+    }
 
     for ([_]usize{ 0, 1, 127, 128, 1000 }) |payload_len| {
         for ([_]usize{ 0, 1, 2 }) |decisions_len| {
@@ -709,12 +1639,15 @@ test "every encode back-patches its own validated length" {
             const len = try encodeFrame(&dst, .{
                 .seq_id = 9,
                 .vector_clock_frame = .{ .host_idx = 4, .state = 0xDEAD_BEEF },
-                .op_code = OP_PULSE,
+                .op_code = OP_NOP,
                 .op_payload = payload[0..payload_len],
+                .state_id = 0xDEAD_BEEF,
+                .prev_state_id = 1,
                 .commit_envelope = .{ .decisions = decisions[0..decisions_len] },
             });
 
             try expect(frameLenValid(len));
+            try expect(frameLenValidFor(OP_NOP, len));
             try expectEqual(@as(u16, @intCast(len)), std.mem.readInt(u16, dst[2..4], .little));
             try expectEqual(@as(u16, 9), std.mem.readInt(u16, dst[0..2], .little));
         }
@@ -726,11 +1659,12 @@ test "the frame cap is exact and one byte over is refused" {
     var payload: [FRAME_CAP]u8 = undefined;
     @memset(&payload, 0);
 
+    // Control: 22 prefix + 2 length + 4072 = 4096.
     const full = try encodeFrame(&dst, .{
         .seq_id = 0,
         .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
         .op_code = OP_PULSE,
-        .op_payload = payload[0..4071],
+        .op_payload = payload[0..4072],
     });
     try expectEqual(@as(usize, FRAME_CAP), full);
 
@@ -738,16 +1672,192 @@ test "the frame cap is exact and one byte over is refused" {
         .seq_id = 0,
         .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
         .op_code = OP_PULSE,
-        .op_payload = payload[0..4072],
+        .op_payload = payload[0..4073],
     }));
+
+    // Consensus: 54 prefix + 2 length + 4039 + 1 empty envelope = 4096.
+    const consensus_full = try encodeFrame(&dst, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = OP_NOP,
+        .op_payload = payload[0..4039],
+        .state_id = 1,
+        .prev_state_id = 0,
+    });
+    try expectEqual(@as(usize, FRAME_CAP), consensus_full);
 
     try std.testing.expectError(error.FrameTooLarge, encodeFrame(&dst, .{
         .seq_id = 0,
         .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
-        .op_code = OP_PULSE,
-        .op_payload = payload[0..4060],
-        .commit_envelope = .{ .decisions = payload[0..10] },
+        .op_code = OP_NOP,
+        .op_payload = payload[0..4040],
+        .state_id = 1,
+        .prev_state_id = 0,
     }));
+}
+
+test "a transport chunk carries at most 4063 data bytes" {
+    var dst: [FRAME_CAP]u8 = undefined;
+    var payload: [FRAME_CAP]u8 = undefined;
+    var data: [CHUNK_DATA_MAX + 1]u8 = undefined;
+    @memset(&data, 0x5a);
+
+    // 22 prefix + 2 payload length + 1 host_id + 4 seq_id + 1 tag
+    // + 2 data length + 4063 data + 1 final = 4096.
+    const full_value = DeliverLogResponsePayload{
+        .host_id = 3,
+        .seq_id = 1,
+        .data = .{ .log_data = .{ .data = data[0..CHUNK_DATA_MAX], .final = true } },
+    };
+    const payload_len = try encodeDeliverLogResponse(&payload, full_value);
+    try expectEqual(@as(usize, 4072), payload_len);
+
+    const full = try encodeFrame(&dst, .{
+        .seq_id = 0x1234,
+        .vector_clock_frame = .{ .host_idx = 3, .state = 1 },
+        .op_code = OP_DELIVER_LOG_RESPONSE,
+        .op_payload = payload[0..payload_len],
+    });
+    try expectEqual(@as(usize, FRAME_CAP), full);
+
+    // One more data byte makes the same frame 4097, which the cap refuses.
+    const over_value = DeliverLogResponsePayload{
+        .host_id = 3,
+        .seq_id = 2,
+        .data = .{ .log_data = .{ .data = data[0 .. CHUNK_DATA_MAX + 1], .final = true } },
+    };
+    const over_len = try encodeDeliverLogResponse(&payload, over_value);
+    try expectEqual(@as(usize, 4073), over_len);
+
+    try std.testing.expectError(error.FrameTooLarge, encodeFrame(&dst, .{
+        .seq_id = 0x1234,
+        .vector_clock_frame = .{ .host_idx = 3, .state = 1 },
+        .op_code = OP_DELIVER_LOG_RESPONSE,
+        .op_payload = payload[0..over_len],
+    }));
+
+    // The snapshot response shares the overhead, so a `Snapshot` arm at the
+    // bound is exactly 4096 as well.
+    const snapshot_value = DeliverSnapshotResponsePayload{
+        .host_id = 3,
+        .seq_id = 3,
+        .data = .{ .snapshot = .{ .data = data[0..CHUNK_DATA_MAX], .final = false } },
+    };
+    const snapshot_len = try encodeDeliverSnapshotResponse(&payload, snapshot_value);
+    try expectEqual(@as(usize, 4072), snapshot_len);
+
+    const snapshot_full = try encodeFrame(&dst, .{
+        .seq_id = 0x1234,
+        .vector_clock_frame = .{ .host_idx = 3, .state = 1 },
+        .op_code = OP_DELIVER_SNAPSHOT_RESPONSE,
+        .op_payload = payload[0..snapshot_len],
+    });
+    try expectEqual(@as(usize, FRAME_CAP), snapshot_full);
+}
+
+test "a frame's optional fields must agree with its class" {
+    var dst: [FRAME_CAP]u8 = undefined;
+
+    // A consensus frame needs both state fields.
+    try std.testing.expectError(error.FrameClassMismatch, encodeFrame(&dst, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = OP_NOP,
+        .op_payload = &.{},
+    }));
+    try std.testing.expectError(error.FrameClassMismatch, encodeFrame(&dst, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = OP_NOP,
+        .op_payload = &.{},
+        .state_id = 1,
+    }));
+
+    // A control frame carries neither state field.
+    try std.testing.expectError(error.FrameClassMismatch, encodeFrame(&dst, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = OP_PULSE,
+        .op_payload = &.{},
+        .state_id = 1,
+        .prev_state_id = 0,
+    }));
+
+    // Neither a control nor a transport frame carries an envelope, even an
+    // empty one.
+    try std.testing.expectError(error.FrameClassMismatch, encodeFrame(&dst, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = OP_PULSE,
+        .op_payload = &.{},
+        .commit_envelope = .{},
+    }));
+    try std.testing.expectError(error.FrameClassMismatch, encodeFrame(&dst, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = OP_DELIVER_LOG,
+        .op_payload = &.{},
+        .commit_envelope = .{},
+    }));
+
+    // An op outside every class has no layout to encode.
+    try std.testing.expectError(error.InvalidOpCode, encodeFrame(&dst, .{
+        .seq_id = 0,
+        .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
+        .op_code = 0x80,
+        .op_payload = &.{},
+    }));
+}
+
+test "the conformance vectors match byte for byte" {
+    var dst: [FRAME_CAP]u8 = undefined;
+    var payload: [64]u8 = undefined;
+
+    const pulse_vector = [_]u8{
+        0x34, 0x12, 0x17, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    const pulse_len = try encodeFrame(&dst, .{
+        .seq_id = 0x1234,
+        .vector_clock_frame = .{ .host_idx = 3, .state = 1 },
+        .op_code = OP_PULSE,
+        .op_payload = &.{},
+    });
+    try expectEqual(@as(usize, 23), pulse_len);
+    try expectEqualSlices(u8, &pulse_vector, dst[0..pulse_len]);
+
+    const decision_vector = [_]u8{
+        0x34, 0x12, 0x28, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x11, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    const decision_payload = try encodeDecision(&payload, .{
+        .state_id = 1,
+        .decision = .confirmed,
+    });
+    const decision_len = try encodeFrame(&dst, .{
+        .seq_id = 0x1234,
+        .vector_clock_frame = .{ .host_idx = 3, .state = 1 },
+        .op_code = OP_DECISION,
+        .op_payload = payload[0..decision_payload],
+    });
+    try expectEqual(@as(usize, 40), decision_len);
+    try expectEqualSlices(u8, &decision_vector, dst[0..decision_len]);
+
+    const stop_vector = [_]u8{
+        0x34, 0x12, 0x18, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01,
+    };
+    const stop_payload = try encodeEmergencyStop(&payload, .{ .level = 1 });
+    const stop_len = try encodeFrame(&dst, .{
+        .seq_id = 0x1234,
+        .vector_clock_frame = .{ .host_idx = 3, .state = 1 },
+        .op_code = OP_EMERGENCY_STOP,
+        .op_payload = payload[0..stop_payload],
+    });
+    try expectEqual(@as(usize, 24), stop_len);
+    try expectEqualSlices(u8, &stop_vector, dst[0..stop_len]);
 }
 
 test "the lift picks the unique absolute in the 16-bit window" {
@@ -878,4 +1988,397 @@ test "a connection reset clears the counters, the reservation and the task map" 
     // The descriptor and the state are the caller's, not the reset's.
     try expectEqual(@as(posix.fd_t, 7), entry.fd);
     try expectEqual(LinkState.up, entry.state);
+}
+test "every consensus payload round-trips" {
+    var buf: [FRAME_CAP]u8 = undefined;
+
+    {
+        const value = CreatePayload{ .compensator = "compensator", .payload = "create" };
+        const len = try encodeCreate(&buf, value);
+        const got = try decodeCreate(buf[0..len]);
+        try expectEqualSlices(u8, value.compensator, got.compensator);
+        try expectEqualSlices(u8, value.payload, got.payload);
+    }
+    {
+        const value = AppendPayload{
+            .session_id = 0x0102_0304_0506_0708_1112_1314_1516_1718,
+            .payload = "append",
+        };
+        const len = try encodeAppend(&buf, value);
+        const got = try decodeAppend(buf[0..len]);
+        try expectEqual(value.session_id, got.session_id);
+        try expectEqualSlices(u8, value.payload, got.payload);
+    }
+    {
+        const value = OverwritePayload{
+            .session_id = 0x2122_2324_2526_2728_3132_3334_3536_3738,
+            .payload = "overwrite",
+        };
+        const len = try encodeOverwrite(&buf, value);
+        const got = try decodeOverwrite(buf[0..len]);
+        try expectEqual(value.session_id, got.session_id);
+        try expectEqualSlices(u8, value.payload, got.payload);
+    }
+    {
+        const value = ClosePayload{ .session_id = 7 };
+        const len = try encodeClose(&buf, value);
+        try expectEqual(@as(usize, 16), len);
+        try expectEqual(value.session_id, (try decodeClose(buf[0..len])).session_id);
+    }
+    {
+        const value = RepeatPayload{ .session_id = 8, .timeout_seconds = 30 };
+        const len = try encodeRepeat(&buf, value);
+        try expectEqual(@as(usize, 20), len);
+        const got = try decodeRepeat(buf[0..len]);
+        try expectEqual(value.session_id, got.session_id);
+        try expectEqual(value.timeout_seconds, got.timeout_seconds);
+    }
+    {
+        const value = CompensatePayload{ .new_id = 9, .original_id = 10 };
+        const len = try encodeCompensate(&buf, value);
+        try expectEqual(@as(usize, 32), len);
+        const got = try decodeCompensate(buf[0..len]);
+        try expectEqual(value.new_id, got.new_id);
+        try expectEqual(value.original_id, got.original_id);
+    }
+    {
+        const value = IsolatePayload{ .host_id = 3, .lost_host_state_id = 11 };
+        const len = try encodeIsolate(&buf, value);
+        try expectEqual(@as(usize, 17), len);
+        const got = try decodeIsolate(buf[0..len]);
+        try expectEqual(value.host_id, got.host_id);
+        try expectEqual(value.lost_host_state_id, got.lost_host_state_id);
+    }
+    {
+        const value = CapturePayload{
+            .lost_host_id = 1,
+            .host_id = 2,
+            .host_state_id = 12,
+            .n = 4,
+            .timeout_seconds = 5,
+        };
+        const len = try encodeCapture(&buf, value);
+        try expectEqual(@as(usize, 26), len);
+        const got = try decodeCapture(buf[0..len]);
+        try expectEqual(value.lost_host_id, got.lost_host_id);
+        try expectEqual(value.host_id, got.host_id);
+        try expectEqual(value.host_state_id, got.host_state_id);
+        try expectEqual(value.n, got.n);
+        try expectEqual(value.timeout_seconds, got.timeout_seconds);
+    }
+    {
+        const value = CaptureCompensatePayload{
+            .lost_host_id = 6,
+            .host_id = 7,
+            .host_state_id = 13,
+            .n = 8,
+        };
+        const len = try encodeCaptureCompensate(&buf, value);
+        try expectEqual(@as(usize, 22), len);
+        const got = try decodeCaptureCompensate(buf[0..len]);
+        try expectEqual(value.lost_host_id, got.lost_host_id);
+        try expectEqual(value.host_id, got.host_id);
+        try expectEqual(value.host_state_id, got.host_state_id);
+        try expectEqual(value.n, got.n);
+    }
+    {
+        const len = try encodeNop(&buf);
+        try expectEqual(@as(usize, 0), len);
+        try decodeNop(buf[0..len]);
+    }
+}
+
+test "every control payload round-trips" {
+    var buf: [FRAME_CAP]u8 = undefined;
+
+    const pulse_len = try encodePulse(&buf);
+    try expectEqual(@as(usize, 0), pulse_len);
+    try decodePulse(buf[0..pulse_len]);
+
+    const ack_len = try encodePulseAck(&buf);
+    try expectEqual(@as(usize, 0), ack_len);
+    try decodePulseAck(buf[0..ack_len]);
+
+    const stop_len = try encodeEmergencyStop(&buf, .{ .level = 4 });
+    try expectEqual(@as(usize, 1), stop_len);
+    try expectEqual(@as(u8, 4), (try decodeEmergencyStop(buf[0..stop_len])).level);
+
+    const decision_len = try encodeDecision(&buf, .{
+        .state_id = 0x0102_0304_0506_0708_1112_1314_1516_1718,
+        .decision = .rejected_you_are_late,
+    });
+    try expectEqual(@as(usize, 17), decision_len);
+    const decision = try decodeDecision(buf[0..decision_len]);
+    try expectEqual(
+        @as(u128, 0x0102_0304_0506_0708_1112_1314_1516_1718),
+        decision.state_id,
+    );
+    try expectEqual(DecisionKind.rejected_you_are_late, decision.decision);
+}
+
+test "every transport payload round-trips" {
+    var buf: [FRAME_CAP]u8 = undefined;
+
+    {
+        const value = DeliverLogPayload{ .host_id = 3, .after_state_id = 14 };
+        const len = try encodeDeliverLog(&buf, value);
+        try expectEqual(@as(usize, 17), len);
+        const got = try decodeDeliverLog(buf[0..len]);
+        try expectEqual(value.host_id, got.host_id);
+        try expectEqual(value.after_state_id, got.after_state_id);
+    }
+    {
+        const value = DeliverLogResponsePayload{
+            .host_id = 4,
+            .seq_id = 9,
+            .data = .{ .out_of_date = .{ .state_id = 15 } },
+        };
+        const len = try encodeDeliverLogResponse(&buf, value);
+        try expectEqual(@as(usize, 1 + 4 + 1 + 16), len);
+        const got = try decodeDeliverLogResponse(buf[0..len]);
+        try expectEqual(value.host_id, got.host_id);
+        try expectEqual(value.seq_id, got.seq_id);
+        try expectEqual(value.data.out_of_date.state_id, got.data.out_of_date.state_id);
+    }
+    {
+        const value = DeliverLogResponsePayload{
+            .host_id = 4,
+            .seq_id = 10,
+            .data = .{ .log_data = .{ .data = "chunk", .final = true } },
+        };
+        const len = try encodeDeliverLogResponse(&buf, value);
+        const got = try decodeDeliverLogResponse(buf[0..len]);
+        try expectEqual(value.seq_id, got.seq_id);
+        try expectEqualSlices(u8, value.data.log_data.data, got.data.log_data.data);
+        try expectEqual(value.data.log_data.final, got.data.log_data.final);
+    }
+    {
+        const value = DeliverLogResponsePayload{
+            .host_id = 4,
+            .seq_id = 11,
+            .data = .{ .delivery_failure = .{ .diag = "gone" } },
+        };
+        const len = try encodeDeliverLogResponse(&buf, value);
+        const got = try decodeDeliverLogResponse(buf[0..len]);
+        try expectEqualSlices(u8, value.data.delivery_failure.diag, got.data.delivery_failure.diag);
+    }
+    {
+        const value = DeliverLogCommitPayload{ .host_id = 5, .seq_id = 12 };
+        const len = try encodeDeliverLogCommit(&buf, value);
+        try expectEqual(@as(usize, 5), len);
+        const got = try decodeDeliverLogCommit(buf[0..len]);
+        try expectEqual(value.host_id, got.host_id);
+        try expectEqual(value.seq_id, got.seq_id);
+    }
+    {
+        const value = DeliverSnapshotPayload{ .host_id = 6 };
+        const len = try encodeDeliverSnapshot(&buf, value);
+        try expectEqual(@as(usize, 1), len);
+        try expectEqual(value.host_id, (try decodeDeliverSnapshot(buf[0..len])).host_id);
+    }
+    {
+        const value = DeliverSnapshotResponsePayload{
+            .host_id = 7,
+            .seq_id = 13,
+            .data = .{ .snapshot = .{ .data = "snapshot", .final = false } },
+        };
+        const len = try encodeDeliverSnapshotResponse(&buf, value);
+        const got = try decodeDeliverSnapshotResponse(buf[0..len]);
+        try expectEqual(value.seq_id, got.seq_id);
+        try expectEqualSlices(u8, value.data.snapshot.data, got.data.snapshot.data);
+        try expectEqual(value.data.snapshot.final, got.data.snapshot.final);
+    }
+    {
+        const value = DeliverSnapshotResponsePayload{
+            .host_id = 7,
+            .seq_id = 14,
+            .data = .{ .log = .{ .data = &.{}, .final = true } },
+        };
+        const len = try encodeDeliverSnapshotResponse(&buf, value);
+        const got = try decodeDeliverSnapshotResponse(buf[0..len]);
+        try expectEqual(@as(usize, 0), got.data.log.data.len);
+        try expectEqual(true, got.data.log.final);
+    }
+    {
+        const value = DeliverSnapshotResponsePayload{
+            .host_id = 7,
+            .seq_id = 15,
+            .data = .{ .delivery_failure = .{ .diag = "unknowable" } },
+        };
+        const len = try encodeDeliverSnapshotResponse(&buf, value);
+        const got = try decodeDeliverSnapshotResponse(buf[0..len]);
+        try expectEqualSlices(u8, value.data.delivery_failure.diag, got.data.delivery_failure.diag);
+    }
+    {
+        const value = DeliverSnapshotCommitPayload{ .host_id = 8, .seq_id = 16 };
+        const len = try encodeDeliverSnapshotCommit(&buf, value);
+        try expectEqual(@as(usize, 5), len);
+        const got = try decodeDeliverSnapshotCommit(buf[0..len]);
+        try expectEqual(value.host_id, got.host_id);
+        try expectEqual(value.seq_id, got.seq_id);
+    }
+}
+
+test "u128 scalars are written low half first" {
+    var buf: [FRAME_CAP]u8 = undefined;
+    const id: u128 = 0x0102_0304_0506_0708_1112_1314_1516_1718;
+
+    const len = try encodeAppend(&buf, .{ .session_id = id, .payload = &.{} });
+    try expectEqual(@as(usize, 17), len);
+    try expectEqual(@as(u64, 0x1112_1314_1516_1718), std.mem.readInt(u64, buf[0..8], .little));
+    try expectEqual(@as(u64, 0x0102_0304_0506_0708), std.mem.readInt(u64, buf[8..16], .little));
+    try expectEqual(id, (try decodeAppend(buf[0..len])).session_id);
+}
+
+test "a zero-length variable field is one zero byte" {
+    var buf: [FRAME_CAP]u8 = undefined;
+
+    const len = try encodeCreate(&buf, .{ .compensator = &.{}, .payload = &.{} });
+    try expectEqual(@as(usize, 2), len);
+    try expectEqual(@as(u8, 0), buf[0]);
+    try expectEqual(@as(u8, 0), buf[1]);
+
+    const append_len = try encodeAppend(&buf, .{ .session_id = 1, .payload = &.{} });
+    try expectEqual(@as(usize, 17), append_len);
+    try expectEqual(@as(u8, 0), buf[16]);
+}
+
+test "a bool other than zero or one is malformed" {
+    // LogData with an empty chunk and a final byte of 2.
+    const malformed = [_]u8{ 1, 0x00, 0x02 };
+    try std.testing.expectError(error.InvalidBool, decodeLogDelivery(&malformed));
+}
+
+test "invalid UTF-8 in a string is malformed" {
+    var buf: [FRAME_CAP]u8 = undefined;
+    buf[0] = 1;
+    buf[1] = 0xFF;
+    buf[2] = 0x00;
+    try std.testing.expectError(error.InvalidUtf8, decodeCreate(buf[0..3]));
+
+    // A diag validates the same way.
+    const failure = [_]u8{ 2, 1, 0xFF };
+    try std.testing.expectError(error.InvalidUtf8, decodeLogDelivery(&failure));
+}
+
+test "an unknown oneof tag is malformed" {
+    const log_tag = [_]u8{3};
+    try std.testing.expectError(error.UnknownOneofTag, decodeLogDelivery(&log_tag));
+
+    const snapshot_tag = [_]u8{3};
+    try std.testing.expectError(error.UnknownOneofTag, decodeSnapshotDelivery(&snapshot_tag));
+}
+
+test "an unknown DecisionKind tag is malformed" {
+    var payload: [17]u8 = @splat(0);
+    payload[0] = 1;
+    payload[16] = 4;
+    try std.testing.expectError(error.UnknownDecisionKind, decodeDecision(&payload));
+}
+
+test "a truncated oneof arm is malformed" {
+    // OutOfDate announces its tag but carries four of the sixteen id bytes.
+    const short = [_]u8{ 0, 1, 2, 3, 4 };
+    try std.testing.expectError(error.TruncatedPayload, decodeLogDelivery(&short));
+
+    // LogData announces a one-byte chunk and the payload ends before it.
+    const missing = [_]u8{ 1, 1 };
+    try std.testing.expectError(error.TruncatedPayload, decodeLogDelivery(&missing));
+}
+
+test "a payload with a trailing byte is malformed" {
+    var buf: [FRAME_CAP]u8 = undefined;
+    const len = try encodeClose(&buf, .{ .session_id = 1 });
+    buf[len] = 0x00;
+    try std.testing.expectError(error.TrailingBytes, decodeClose(buf[0 .. len + 1]));
+}
+
+test "a Snapshot arm with Final set is malformed" {
+    var buf: [FRAME_CAP]u8 = undefined;
+    try std.testing.expectError(error.SnapshotFinalViolation, encodeSnapshotDelivery(&buf, .{
+        .snapshot = .{ .data = &.{}, .final = true },
+    }));
+
+    const final_snapshot = [_]u8{ 0, 0, 1 };
+    try std.testing.expectError(error.SnapshotFinalViolation, decodeSnapshotDelivery(&final_snapshot));
+
+    // The Log arm may be final; an empty final Log ends the transfer cleanly.
+    const terminator = [_]u8{ 1, 0, 1 };
+    const value = try decodeSnapshotDelivery(&terminator);
+    try expectEqual(@as(usize, 0), value.log.data.len);
+    try expectEqual(true, value.log.final);
+}
+
+test "Decision is the fixed 17-byte state id and kind" {
+    var buf: [FRAME_CAP]u8 = undefined;
+    const len = try encodeDecision(&buf, .{ .state_id = 1, .decision = .confirmed });
+    try expectEqual(@as(usize, 17), len);
+    try expectEqual(@as(u8, 1), buf[0]);
+    try expectEqual(@as(u8, 0), buf[16]);
+
+    // A control frame has no state field, so the standalone payload decode has
+    // nothing to compare the repeated id with.
+    const got = try decodeDecision(buf[0..len]);
+    try expectEqual(@as(u128, 1), got.state_id);
+    try expectEqual(DecisionKind.confirmed, got.decision);
+
+    var zero_id: [17]u8 = @splat(0);
+    zero_id[16] = 0;
+    try std.testing.expectError(error.ZeroStateId, decodeDecision(&zero_id));
+}
+
+test "EmergencyStop is the single level byte" {
+    var buf: [FRAME_CAP]u8 = undefined;
+    const len = try encodeEmergencyStop(&buf, .{ .level = 7 });
+    try expectEqual(@as(usize, 1), len);
+    try expectEqual(@as(u8, 7), buf[0]);
+    try expectEqual(@as(u8, 7), (try decodeEmergencyStop(buf[0..len])).level);
+}
+
+test "a zero capture count is malformed" {
+    var buf: [FRAME_CAP]u8 = undefined;
+
+    try std.testing.expectError(error.ZeroCount, encodeCapture(&buf, .{
+        .lost_host_id = 1,
+        .host_id = 2,
+        .host_state_id = 3,
+        .n = 0,
+        .timeout_seconds = 5,
+    }));
+
+    var capture_bytes: [26]u8 = @splat(0);
+    try std.testing.expectError(error.ZeroCount, decodeCapture(&capture_bytes));
+
+    try std.testing.expectError(error.ZeroCount, encodeCaptureCompensate(&buf, .{
+        .lost_host_id = 1,
+        .host_id = 2,
+        .host_state_id = 3,
+        .n = 0,
+    }));
+
+    var compensate_bytes: [22]u8 = @splat(0);
+    try std.testing.expectError(error.ZeroCount, decodeCaptureCompensate(&compensate_bytes));
+}
+
+test "a diag over the cap is malformed" {
+    var over: [DIAG_CAP + 1]u8 = @splat('x');
+    var buf: [FRAME_CAP]u8 = undefined;
+
+    try std.testing.expectError(error.DiagTooLong, encodeLogDelivery(&buf, .{
+        .delivery_failure = .{ .diag = &over },
+    }));
+
+    // Tag 2, then the two-byte varint for 257, then the bytes.
+    var wire: [3 + DIAG_CAP + 1]u8 = undefined;
+    wire[0] = 2;
+    wire[1] = 0x81;
+    wire[2] = 0x02;
+    @memset(wire[3..], 'x');
+    try std.testing.expectError(error.DiagTooLong, decodeLogDelivery(&wire));
+
+    // Exactly the cap is legal.
+    var at_cap: [DIAG_CAP]u8 = @splat('x');
+    const len = try encodeLogDelivery(&buf, .{ .delivery_failure = .{ .diag = &at_cap } });
+    const got = try decodeLogDelivery(buf[0..len]);
+    try expectEqual(DIAG_CAP, got.delivery_failure.diag.len);
 }

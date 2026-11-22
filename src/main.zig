@@ -19,6 +19,13 @@ const messages = @import("messages.zig");
 /// Path used when `-c/--config` is not given.
 const default_config_path = "mpy6a.cfg";
 
+/// Types of supported shells
+const ShellType = dap.Enumeration(.{
+    .bash = dap.Enum{ .help = "Bash." },
+    .zsh = dap.Enum{ .help = "Zsh." },
+    .fish = dap.Enum{ .help = "Fish" },
+});
+
 const cliDecl = .{
     .run = dap.Command(
         .{ .help = "Run mpy6a with the given config file." },
@@ -31,28 +38,45 @@ const cliDecl = .{
             },
         },
     ),
-    .config = dap.Command(.{
-        .help = "A set of commands to show config, validate config and so on.",
-    }, .{
-        .show_dev = dap.Command(
-            .{
-                .name = "show-dev",
-                .help = "Print the default development configuration file into the stdout and exit.",
-            },
-            .{},
-        ),
-        .validate = dap.Command(
-            .{
-                .help = "Validate config file.",
-            },
-            .{
-                .path = dap.Argument([]const u8){
-                    .validation = dap.Validate.stringNotEmpty,
-                    .help = "Path to the configuration file.",
+    .config = dap.Command(
+        .{
+            .help = "A set of commands to show config, validate config and so on.",
+        },
+        .{
+            .show_dev = dap.Command(
+                .{
+                    .name = "show-dev",
+                    .help = "Print the default development configuration file into the stdout and exit.",
                 },
+                .{},
+            ),
+            .validate = dap.Command(
+                .{
+                    .help = "Validate config file.",
+                },
+                .{
+                    .path = dap.Argument([]const u8){
+                        .validation = dap.Validate.stringNotEmpty,
+                        .help = "Path to the configuration file.",
+                    },
+                },
+            ),
+        },
+    ),
+    .completion = dap.Command(
+        .{
+            .help = "Show or install shell completion for mpy6a.",
+        },
+        .{
+            .install = dap.Flag(bool){
+                .short = "i",
+                .help = "Install completion for the shell of choice instead of showing it off.",
             },
-        ),
-    }),
+            .shell = dap.Argument(ShellType){
+                .help = "Shell type of choice.",
+            },
+        },
+    ),
     .version = dap.Command(
         .{ .help = "Show current mpy6a version." },
         .{},
@@ -88,9 +112,17 @@ fn printDefaultConfig(allocator: std.mem.Allocator, io: std.Io) !void {
     const document = try manager.default();
     defer allocator.free(document);
 
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writer(io, &buf);
     try file_writer.interface.writeAll(document);
+    try file_writer.interface.flush();
+}
+
+/// Output completion script to standard out.
+fn printCompletion(io: std.Io, completion: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writer(io, &buf);
+    try file_writer.interface.writeAll(completion);
     try file_writer.interface.flush();
 }
 
@@ -137,6 +169,22 @@ pub fn main(init: std.process.Init) !void {
             try CLI.usage(c);
             std.debug.print("\x1b[1;91mno config subcommand specified\x1b[0m\n", .{});
             std.process.exit(1);
+        },
+        .completion => |c| {
+            const shell_type: dap.Completion.Shell = switch (c.shell.view) {
+                .bash => .bash,
+                .zsh => .zsh,
+                .fish => .fish,
+            };
+            const completion = CLI.completion(arena, "mpy6a", shell_type);
+
+            if (c.install) {
+                try completion.install(io, init.minimal.environ);
+                return;
+            }
+
+            try completion.show(io);
+            return;
         },
         .version => {
             printVersion(init.io);

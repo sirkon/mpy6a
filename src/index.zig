@@ -970,7 +970,7 @@ fn probeCandidate(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
     if (entry.state != .up or entry.candidate_state != .parked) return;
     if (entry.predicate_task != null) return;
 
-    sendFrame(frame, entry, cluster_transport.OP_PULSE, &.{}, .{}) catch |err| switch (err) {
+    sendFrame(frame, entry, cluster_transport.OP_PULSE, &.{}, null) catch |err| switch (err) {
         error.Backpressure, error.RingFull, error.NoFreeSlots, error.OutOfMemory => return,
         else => {
             killLink(frame, entry, "pulse could not be submitted");
@@ -1195,7 +1195,7 @@ fn onKeepaliveTick(
 /// peer's answer on a pulse that never left.
 fn sendKeepalivePulse(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
     if (entry.state != .up) return;
-    sendFrame(frame, entry, cluster_transport.OP_PULSE, &.{}, .{}) catch |err| switch (err) {
+    sendFrame(frame, entry, cluster_transport.OP_PULSE, &.{}, null) catch |err| switch (err) {
         error.Backpressure, error.RingFull, error.NoFreeSlots, error.OutOfMemory => {
             entry.keepalive_pending = true;
             return;
@@ -1438,7 +1438,7 @@ fn dispatchFrame(
     const op = bytes[21];
     switch (op) {
         cluster_transport.OP_PULSE => {
-            sendFrame(frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, .{}) catch |err| switch (err) {
+            sendFrame(frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, null) catch |err| switch (err) {
                 error.Backpressure, error.RingFull => return .retry,
                 else => return .death,
             };
@@ -1462,7 +1462,7 @@ fn sendFrame(
     entry: *cluster_transport.LinkEntry,
     op: u8,
     payload: []const u8,
-    envelope: cluster_transport.CommitEnvelope,
+    envelope: ?cluster_transport.CommitEnvelope,
 ) !void {
     const seq = entry.freeSendBuffer() orelse return error.Backpressure;
     const buf = entry.sendBuffer(seq);
@@ -3815,7 +3815,7 @@ test "the send path encodes a frame and advances the sequence" {
     entry.fd = fds[0];
     entry.state = .up;
 
-    try sendFrame(&f.frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, .{});
+    try sendFrame(&f.frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, null);
     try testing.expectEqual(@as(u64, 1), entry.seq_abs);
     try testing.expect(entry.sendBusy(0));
 
@@ -3855,7 +3855,7 @@ test "the send path reports backpressure when every buffer is busy" {
     while (seq < entry.inflight) : (seq += 1) entry.setSendBusy(seq, true);
     try testing.expectError(
         error.Backpressure,
-        sendFrame(&f.frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, .{}),
+        sendFrame(&f.frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, null),
     );
 }
 
@@ -3907,16 +3907,21 @@ test "an unknown op code is a link death and a consensus op is retried" {
     var len = try cluster_transport.encodeFrame(&wire, .{
         .seq_id = 0,
         .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
-        .op_code = 0x80,
+        .op_code = cluster_transport.OP_PULSE,
         .op_payload = &.{},
     });
+    // `0x80..0xFF` has no class, so no encoder emits it; a hostile peer can.
+    wire[21] = 0x80;
     try testing.expectEqual(DispatchResult.death, dispatchFrame(&f.frame, entry, wire[0..len]));
 
+    // A consensus op is retried until the class switch lands (§8.1).
     len = try cluster_transport.encodeFrame(&wire, .{
         .seq_id = 0,
         .vector_clock_frame = .{ .host_idx = 0, .state = 0 },
-        .op_code = 0x20,
+        .op_code = cluster_transport.OP_CREATE,
         .op_payload = &.{},
+        .state_id = 1,
+        .prev_state_id = 0,
     });
     try testing.expectEqual(DispatchResult.retry, dispatchFrame(&f.frame, entry, wire[0..len]));
 }
@@ -4400,7 +4405,7 @@ test "the drain closes every link and reaps the close completions" {
     try testing.expectEqual(cluster_transport.LinkState.parked, entry.candidate_state);
 
     // One packet the link had queued, so the drain meets a live send too.
-    try sendFrame(&f.frame, entry, cluster_transport.OP_PULSE, &.{}, .{});
+    try sendFrame(&f.frame, entry, cluster_transport.OP_PULSE, &.{}, null);
 
     teardownLinks(&f.frame);
 
