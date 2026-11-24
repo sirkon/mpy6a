@@ -19,13 +19,6 @@ const messages = @import("messages.zig");
 /// Path used when `-c/--config` is not given.
 const default_config_path = "mpy6a.cfg";
 
-/// Types of supported shells
-const ShellType = dap.Enumeration(.{
-    .bash = dap.Enum{ .help = "Bash." },
-    .zsh = dap.Enum{ .help = "Zsh." },
-    .fish = dap.Enum{ .help = "Fish" },
-});
-
 const cliDecl = .{
     .run = dap.Command(
         .{ .help = "Run mpy6a with the given config file." },
@@ -35,6 +28,7 @@ const cliDecl = .{
                 .default = dap.defaultValue([]const u8, default_config_path),
                 .validation = dap.Validate.stringNotEmpty,
                 .help = "Path to the configuration file.",
+                .completion = .{ .fs = .{} },
             },
         },
     ),
@@ -72,7 +66,7 @@ const cliDecl = .{
                 .short = "i",
                 .help = "Install completion for the shell of choice instead of showing it off.",
             },
-            .shell = dap.Argument(ShellType){
+            .shell = dap.Argument(dap.Completion.ShellType){
                 .help = "Shell type of choice.",
             },
         },
@@ -138,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
     var diag: dap.Diag = .{};
     defer diag.deinit(arena);
 
-    var cli = try CLI.parse(arena, init.minimal.environ, args, &diag);
+    var cli = try CLI.parse(arena, init.minimal.environ, null, args, &diag);
     defer CLI.deinit(&cli, arena);
     var config_path: []const u8 = undefined;
     if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -176,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
                 .zsh => .zsh,
                 .fish => .fish,
             };
-            const completion = CLI.completion(arena, "mpy6a", shell_type);
+            const completion = CLI.completion(arena, "mpy6a", shell_type, &CLI.default_locale);
 
             if (c.install) {
                 try completion.install(io, init.minimal.environ);

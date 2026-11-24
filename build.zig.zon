@@ -48,8 +48,8 @@
             .hash = "blog-0.0.19-IN2Y32S7BQCPQWaX4KcHK0YOnVk3u7GOK3WaFB-pwWMc",
         },
         .dap = .{
-            .url = "git+https://github.com/sirkon/dap.git?ref=master#a69d470e46ea888870571388499f331033ce5f2d",
-            .hash = "dap-0.0.17-XZkAImyNCwDi25jzbVfyrdg_nwuIYaeFg_B5aAQ-OM8p",
+            .url = "git+https://github.com/sirkon/dap.git?ref=master#1c6800d0cb1c773a436686bda8d4ad4193020573",
+            .hash = "dap-0.0.23-XZkAIoqFFADkivwUvt8bVM1cey_aW9zf4X3psTkHGq2g",
         },
         .siggy = .{
             .url = "git+https://github.com/sirkon/siggy.git?ref=master#9933fec6d2088d57e01e3c067e95eef53b96e705",
