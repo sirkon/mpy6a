@@ -1,0 +1,22 @@
+{
+  "dap": {
+    "version": 2,
+    "path": ".contexts/DAP.md"
+  },
+  "mailbox": {
+    "version": 1,
+    "path": ".contexts/MAILBOX.md"
+  },
+  "siggy": {
+    "version": 1,
+    "path": ".contexts/SIGGY-SDK.md"
+  },
+  "zigring": {
+    "version": 1,
+    "path": ".contexts/ZIGRING-SDK.md"
+  },
+  "zunit": {
+    "version": 1,
+    "path": ".contexts/ZUNIT-SDK.md"
+  }
+}

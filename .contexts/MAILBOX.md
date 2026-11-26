@@ -14,10 +14,13 @@ progress is an **iteration**, and each iteration is a **file** that stays on
 disk. History is preserved by construction: a later iteration never overwrites
 an earlier one.
 
+The thread starts from a **prelude**: the raw document or task the human hands
+over to open the subject. The letters refine it; the final design supersedes it.
+
 ## When to use
 
-- The work is a design document, a plan, or a review that will take more than
-  one round.
+- The work starts from a prelude — a raw design document, a plan, or a review —
+  and will take more than one round.
 - The human will answer asynchronously, possibly days apart.
 - Ambiguities must be tracked explicitly across rounds rather than resolved
   silently.
@@ -41,6 +44,8 @@ Do **not** use this skill for quick one-shot questions. Those belong in chat.
   `front-handshake`.
 - `<N>.md` is the N-th letter in that subject. Numbers are dense and monotonic;
   they are never reused.
+- The prelude is not numbered. It is the input that opens the subject, whereas
+  `1.md` is the agent's first letter.
 - Different subjects never share a directory. Cross-subject references are made
   by slug, not by copying content.
 - When a subject is closed, the final letter is **compiled** (not copied) into
@@ -115,8 +120,9 @@ section below the pad (see \"Rules for the critical section\").
 
 ## Iteration protocol
 
-1. **Agent writes letter N.** It reads letter `N-1`, the filled `# Pad` from
-   `N-1`, and any referenced sources. It produces `.mailbox/<subject>/<N>.md`.
+1. **Agent writes letter N.** It reads letter `N-1` (for `1.md`, the prelude),
+   the filled `# Pad` from `N-1`, and any referenced sources. It produces
+   `.mailbox/<subject>/<N>.md`.
 2. **Human replies in place.** They edit `# Pad` of letter `N`. They may also
    add inline comments to the body, but the pad is the authoritative channel
    for answers to `U`.
@@ -159,11 +165,12 @@ the earlier one, with the header noting the supersession.
 
 ## Promotion to a design document
 
-When `U open` is empty and every `# Critical` item raised by the human has been
-resolved:
+The prelude is raw material: it is refined into the design, never combined with
+it. When `U open` is empty and every `# Critical` item raised by the human has
+been resolved:
 
 1. **Compile, do not copy.** Write `designs/<subject>.md` as a fresh,
-   self-contained document composed from the final letter, rewording and
+   self-contained design composed from the final letter, rewording and
    reordering freely while preserving every decision. Every resolved `U` is
    **inlined**: stated as plain normative fact at the point in the plan where
    the question was anchored.
