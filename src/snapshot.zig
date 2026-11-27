@@ -3,16 +3,17 @@
 //! startup recovery (designs/snapshot-refactor.md).
 //!
 //! This file owns policy only. Every resource it touches — the slot pool, the
-//! adoption marks, the descriptors, the registry — stays on `lifetime.Controller`
-//! and the job stays a `lifetime.SnapshotJob`. The import rule is one-way:
-//! `snapshot.zig` may import `lifetime.zig`; `lifetime.zig` must never import
+//! adoption marks, the descriptors, the registry — stays on `resources.Controller`
+//! and the job stays a `resources.SnapshotJob`. The import rule is one-way:
+//! `snapshot.zig` may import `resources.zig`; `resources.zig` must never import
 //! this file.
 
 const std = @import("std");
 const posix = std.posix;
 const zigring = @import("zigring");
 const config = @import("config.zig");
-const lifetime = @import("lifetime.zig");
+const resources = @import("resources.zig");
+const res_handle = @import("resources_handle.zig");
 const logging = @import("logging.zig");
 const messages = @import("messages.zig");
 const state = @import("state.zig");
@@ -130,8 +131,8 @@ pub const CompositeWriter = struct {
 /// The resource bundle a driver entry point may touch. It carries no behaviour,
 /// no context pointer and no function pointer; it is passed by value everywhere.
 pub const Host = struct {
-    ctrl: *lifetime.Controller,
-    ring: *lifetime.RingStuff,
+    ctrl: *resources.Controller,
+    ring: *resources.RingStuff,
     log: *logging.Logger,
     ring_idx: u16,
     index_idx: u16,
@@ -141,7 +142,7 @@ pub const Host = struct {
 /// The procedure's policy state: what the index frame's snapshot side owns.
 pub const State = struct {
     serve: Serve = .serving,
-    procedure: ?*lifetime.SnapshotJob = null,
+    procedure: ?*resources.SnapshotJob = null,
     pending_push: ?PendingPush = null,
     window: ?CompositeWriter = null,
     ticks: u32 = 0,
@@ -213,12 +214,12 @@ pub const State = struct {
                 .ring_idx = host.ring_idx,
                 .fd = fd,
             });
-            _ = std.os.linux.close(fd);
+            host.ctrl.closeFd(fd);
             return;
         };
 
         // The index owns the descriptor from here on; the job is its one owner.
-        job.fd = fd;
+        job.fd = host.ctrl.adoptFd(fd);
         const host_idx = job.host_idx;
         const index_idx = job.index_idx;
 
@@ -253,11 +254,11 @@ pub const State = struct {
         // Step 3: the adopt. Temp ring `k` is minted, the writer opens over the
         // transferred fd, publishes the ordinal-0 terminator carrying `Y` and
         // chains from it. Rung 4 is memory-only.
-        const new_writer = host.ctrl.walAdoptWrite(host_idx, index_idx, job.k, job.clone.state, job.fd) catch |err| {
+        const new_writer = host.ctrl.walAdoptWrite(host_idx, index_idx, job.k, job.clone.state, res_handle.borrow(&job.fd)) catch |err| {
             // The adopt owns the descriptor from the moment it is called and
             // closes it on every failure path, so the job must not hand a stale
             // number to the cleanup elephant.
-            job.fd = -1;
+            host.ctrl.disownFd(&job.fd);
             log.warn("snapshot adopt failed; unwinding", .{
                 .ring_idx = host.ring_idx,
                 .host_idx = host_idx,
@@ -268,7 +269,7 @@ pub const State = struct {
             return;
         };
         // The writer owns the descriptor now.
-        job.fd = -1;
+        host.ctrl.disownFd(&job.fd);
         new_writer.attachStream(&host.ring.sqstream, &host.ring.slots);
 
         // Step 4: the composite. The pair's write interface is new-first, then
@@ -282,8 +283,7 @@ pub const State = struct {
                 .host_idx = host_idx,
                 .index_idx = index_idx,
             });
-            new_writer.close() catch {};
-            host.ctrl.allocator.destroy(new_writer);
+            host.ctrl.closeWalWrite(null, new_writer);
             self.unwindA(host, job, .{ .mark_published = true, .writer_built = null });
             return;
         };
@@ -440,7 +440,7 @@ pub const State = struct {
     /// Validate the window and arm the revert continuation; no completion is
     /// read here. A frozen thread stays frozen: the failed procedure brings no
     /// swap, so no revival is coming (§5, §8 rung 10).
-    fn beginRevert(self: *State, host: Host, job: *lifetime.SnapshotJob) void {
+    fn beginRevert(self: *State, host: Host, job: *resources.SnapshotJob) void {
         if (self.window == null) {
             // No window to revert: nothing was installed, but the procedure's
             // files and slot still need their terminal elephant.
@@ -514,9 +514,7 @@ pub const State = struct {
         // clears on `SnapshotDone`.
         const new_writer = window.new;
         const old_writer = window.old;
-        job.old_fd = old_writer.fd;
-        host.ctrl.allocator.destroy(old_writer);
-        host.ctrl.wal_writers[pair] = new_writer;
+        job.old_fd = host.ctrl.retireWalWrite(pair, old_writer, new_writer);
         window.pending.deinit(host.ctrl.allocator);
         self.window = null;
 
@@ -536,20 +534,11 @@ pub const State = struct {
         var window = self.window orelse return;
         self.window = null;
 
-        // The close is safe precisely because the drain made the writer quiet.
-        // The descriptor comes back through the sentinel: after the close the
-        // writer holds `-1`, so the job's field does too.
-        window.new.close() catch |err| {
-            log.warn("snapshot unwind close failed", .{
-                .ring_idx = host.ring_idx,
-                .host_idx = job.host_idx,
-                .index_idx = job.index_idx,
-                .err = @errorName(err),
-            });
-        };
-        job.fd = window.new.fd;
+        // The retirement is safe precisely because the drain made the writer
+        // quiet. The job holds nothing: the adopt took ownership at `fdPass`
+        // and the writer is its one owner until now.
+        host.ctrl.closeWalWrite(null, window.new);
         window.pending.deinit(host.ctrl.allocator);
-        host.ctrl.allocator.destroy(window.new);
 
         host.ctrl.clearAdoptionMark(job.host_idx, job.index_idx) catch |err| {
             log.err("snapshot mark clear failed", .{
@@ -692,8 +681,8 @@ pub const State = struct {
     /// path has already closed the descriptor it was handed) and the mark, if it
     /// was published, is cleared. The cleanup elephant owns the files, the
     /// descriptor and the slot from the dispatch on.
-    fn unwindA(self: *State, host: Host, job: *lifetime.SnapshotJob, opts: UnwindOpts) void {
-        if (opts.writer_built) |writer| host.ctrl.allocator.destroy(writer);
+    fn unwindA(self: *State, host: Host, job: *resources.SnapshotJob, opts: UnwindOpts) void {
+        if (opts.writer_built) |writer| host.ctrl.releaseWalWrite(writer);
 
         if (opts.mark_published) {
             host.ctrl.clearAdoptionMark(job.host_idx, job.index_idx) catch |err| {
@@ -723,7 +712,7 @@ const UnwindOpts = struct {
 /// four requests and the terminal replies. It owns no resource; every field is
 /// borrowed from the controller that the elephant thread was started with.
 pub const Elephant = struct {
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     log: *logging.Logger,
     ring_idx: u16,
 
@@ -749,7 +738,7 @@ pub const Elephant = struct {
     /// file holding the failed attempt's flushed prefix, and that stale prefix
     /// would survive the plain-mode walk as if it were content. One
     /// `fdatasync` before the reply makes the empty length durable.
-    pub fn createSnapshot(self: *Elephant, job: *lifetime.SnapshotJob) void {
+    pub fn createSnapshot(self: *Elephant, job: *resources.SnapshotJob) void {
         const ctrl = self.ctrl;
         const log = self.log;
 
@@ -763,39 +752,21 @@ pub const Elephant = struct {
             return;
         };
 
-        const fd_raw = std.os.linux.open(job.wal_path, .{
-            .ACCMODE = .RDWR,
-            .CREAT = true,
-            .TRUNC = true,
-        }, 0o644);
-        const errno = std.os.linux.errno(fd_raw);
-        if (errno != .SUCCESS) {
+        job.fd = ctrl.openSnapshotWal(job.wal_path) catch |err| {
             log.err("snapshot create failed", .{
                 .ring_idx = job.ring_idx,
                 .host_idx = job.host_idx,
                 .index_idx = job.index_idx,
-                .err = @tagName(errno),
+                .err = @errorName(err),
             });
             self.replyTo(job.ring_idx, .{ .SnapshotCreateFailed = .{} });
             return;
-        }
-        const fd: posix.fd_t = @intCast(fd_raw);
+        };
 
-        const synced = std.os.linux.errno(std.os.linux.fdatasync(fd));
-        if (synced != .SUCCESS) {
-            _ = std.os.linux.close(fd);
-            log.err("snapshot create sync failed", .{
-                .ring_idx = job.ring_idx,
-                .host_idx = job.host_idx,
-                .index_idx = job.index_idx,
-                .err = @tagName(synced),
-            });
-            self.replyTo(job.ring_idx, .{ .SnapshotCreateFailed = .{} });
-            return;
-        }
-
-        job.fd = fd;
-        self.replyTo(job.ring_idx, .{ .SnapshotFd = .{ .fd = fd } });
+        // The reply is the handover: the index receives the number and the job
+        // keeps nothing. `take` is exact because a reply cannot fail.
+        const wire = ctrl.takeFd(&job.fd);
+        self.replyTo(job.ring_idx, .{ .SnapshotFd = .{ .fd = wire } });
     }
 
     /// F2: dumps the clone, commits the registry line, and answers.
@@ -805,7 +776,7 @@ pub const Elephant = struct {
     /// answers `SnapshotAbandon`; a corrupt registry is the runtime fatality,
     /// requested before any abandon, and gets no reply because the process is
     /// coming down.
-    pub fn dumpSnapshot(self: *Elephant, job: *lifetime.SnapshotJob) void {
+    pub fn dumpSnapshot(self: *Elephant, job: *resources.SnapshotJob) void {
         const ctrl = self.ctrl;
         const log = self.log;
 
@@ -865,23 +836,20 @@ pub const Elephant = struct {
     /// procedure still finishes. The slot returns to the pool and the job shell
     /// dies here; the index clears its in-flight flag on the `SnapshotDone`
     /// reply.
-    pub fn closeSnapshot(self: *Elephant, job: *lifetime.SnapshotJob) void {
+    pub fn closeSnapshot(self: *Elephant, job: *resources.SnapshotJob) void {
         const ctrl = self.ctrl;
         const log = self.log;
         const ring_idx = job.ring_idx;
         const k = job.k;
 
-        if (job.old_fd != -1) {
-            const errno = std.os.linux.errno(std.os.linux.close(job.old_fd));
-            if (errno != .SUCCESS) {
-                log.warn("snapshot final close failed", .{
-                    .ring_idx = ring_idx,
-                    .host_idx = job.host_idx,
-                    .index_idx = job.index_idx,
-                    .err = @tagName(errno),
-                });
-            }
-            job.old_fd = -1;
+        const errno = ctrl.closeHeld(&job.old_fd);
+        if (errno != .SUCCESS) {
+            log.warn("snapshot final close failed", .{
+                .ring_idx = ring_idx,
+                .host_idx = job.host_idx,
+                .index_idx = job.index_idx,
+                .err = @tagName(errno),
+            });
         }
 
         ctrl.snapshot_slots.at(k).status = .idle;
@@ -896,7 +864,7 @@ pub const Elephant = struct {
     /// the slot and releases it, then destroys the job shell and answers
     /// `SnapshotDone`. Absent files are success: the create-failure rung has
     /// none.
-    pub fn cleanupSnapshot(self: *Elephant, job: *lifetime.SnapshotJob) void {
+    pub fn cleanupSnapshot(self: *Elephant, job: *resources.SnapshotJob) void {
         const ctrl = self.ctrl;
         const log = self.log;
         const ring_idx = job.ring_idx;
@@ -905,14 +873,8 @@ pub const Elephant = struct {
         self.unlinkBestEffort(job.wal_path, job, "wal");
         self.unlinkBestEffort(job.snapshot_path, job, "snapshot");
 
-        if (job.fd != -1) {
-            _ = std.os.linux.close(job.fd);
-            job.fd = -1;
-        }
-        if (job.old_fd != -1) {
-            _ = std.os.linux.close(job.old_fd);
-            job.old_fd = -1;
-        }
+        _ = ctrl.closeHeld(&job.fd);
+        _ = ctrl.closeHeld(&job.old_fd);
 
         if (ctrl.snapshot_slots.at(k).status != .rollback) {
             log.warn("snapshot cleanup arrived with a non-rollback slot status", .{
@@ -928,42 +890,23 @@ pub const Elephant = struct {
         self.replyTo(ring_idx, .{ .SnapshotDone = .{} });
     }
 
-    fn jobOf(ptr: usize) *lifetime.SnapshotJob {
+    fn jobOf(ptr: usize) *resources.SnapshotJob {
         return @ptrFromInt(ptr);
     }
 
-    fn writeSnapshotFile(self: *Elephant, job: *lifetime.SnapshotJob) !void {
+    fn writeSnapshotFile(self: *Elephant, job: *resources.SnapshotJob) !void {
         var out: std.ArrayList(u8) = .empty;
         try self.ctrl.dumpIndexState(&job.clone, &out);
-
-        const fd_raw = std.os.linux.open(job.snapshot_path, .{
-            .ACCMODE = .RDWR,
-            .CREAT = true,
-            .TRUNC = true,
-        }, 0o644);
-        const errno = std.os.linux.errno(fd_raw);
-        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-        const fd: posix.fd_t = @intCast(fd_raw);
-
-        writeAll(fd, out.items) catch |err| {
-            _ = std.os.linux.close(fd);
-            return err;
-        };
-        syncFd(fd) catch |err| {
-            _ = std.os.linux.close(fd);
-            return err;
-        };
-        const closed = std.os.linux.errno(std.os.linux.close(fd));
-        if (closed != .SUCCESS) return std.posix.unexpectedErrno(closed);
+        try self.ctrl.writeSnapshotDump(job.snapshot_path, out.items);
     }
 
     fn unlinkBestEffort(
         self: *Elephant,
         path: [:0]const u8,
-        job: *lifetime.SnapshotJob,
+        job: *resources.SnapshotJob,
         kind: []const u8,
     ) void {
-        const errno = std.os.linux.errno(std.os.linux.unlink(path));
+        const errno = self.ctrl.unlinkFile(path);
         if (errno == .SUCCESS or errno == .NOENT) return;
         self.log.warn("snapshot cleanup could not unlink a file", .{
             .ring_idx = job.ring_idx,
@@ -1024,22 +967,6 @@ pub const Elephant = struct {
     }
 };
 
-fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const res = std.os.linux.write(fd, bytes[done..].ptr, bytes.len - done);
-        const errno = std.os.linux.errno(res);
-        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-        if (res == 0) return error.WriteZero;
-        done += res;
-    }
-}
-
-fn syncFd(fd: posix.fd_t) !void {
-    const errno = std.os.linux.errno(std.os.linux.fdatasync(fd));
-    if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-}
-
 /// Retries a submission backpressure parked: its own writer cannot re-drive it
 /// without a write, and no completion is owed for it.
 fn retryParkedFlush(writer: *wal.WalWriteFile) void {
@@ -1070,7 +997,7 @@ pub fn armTicker(host: Host) void {
 /// The startup replay's sink: the record's state becomes `st.state` before the
 /// op is applied, which is `applyIndexOp`'s contract.
 const StartupReplay = struct {
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     st: *state.IndexState,
 
     fn apply(ctx: ?*anyopaque, state_idx: u128, op: []const u8) anyerror!void {
@@ -1094,8 +1021,8 @@ const StartupReplay = struct {
 /// snapshot and that head. The sink moves `st.state` through each of them, so
 /// the pair ends at the walked head.
 pub fn recoverPair(
-    ctrl: *lifetime.Controller,
-    ring: *lifetime.RingStuff,
+    ctrl: *resources.Controller,
+    ring: *resources.RingStuff,
     log: *logging.Logger,
     index_idx: u16,
     host_idx: u8,
@@ -1133,7 +1060,7 @@ pub fn recoverPair(
     };
     defer if (entries) |list| ctrl.freeRegistry(list);
 
-    const entry = if (entries) |list| lifetime.Controller.lastLineFor(list, host_idx) else null;
+    const entry = if (entries) |list| resources.Controller.lastLineFor(list, host_idx) else null;
     const winning = entry orelse {
         log.warn("no registry line names the pair; starting it empty", .{
             .index_idx = index_idx,
@@ -1145,7 +1072,7 @@ pub fn recoverPair(
 
     // The snapshot: the whole dump, loaded into a fresh state that replaces
     // the thread's empty placeholder (§7.1 step 3).
-    const snapshot_bytes = try readWholeFile(ctrl.allocator, winning.snapshot_path);
+    const snapshot_bytes = try ctrl.readWholeFile(winning.snapshot_path);
     defer ctrl.allocator.free(snapshot_bytes);
     const loaded = try ctrl.loadIndexState(snapshot_bytes);
     ctrl.deinitIndexState(st);
@@ -1179,7 +1106,7 @@ pub fn recoverPair(
     switch (adoption) {
         .aborted => |abort| {
             if (ctrl.cfg.wal.isPmem()) {
-                var tail = lifetime.Controller.TailSink.init(ctrl.allocator);
+                var tail = resources.Controller.TailSink.init(ctrl.allocator);
                 defer tail.deinit();
                 try ctrl.bringTail(host_idx, index_idx, abort.k, abort.tag, writer, writer.head, &tail);
             }
@@ -1200,36 +1127,6 @@ pub fn recoverPair(
     });
     defer reader.endRead(ctrl.allocator, process);
     try process.drive(.{ .stream = &ring.sqstream, .slots = &ring.slots });
-}
-
-/// Reads `path` whole, raw: the snapshot's bytes before `loadIndexState`.
-fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const path_z = try allocator.dupeSentinel(u8, path, 0);
-    defer allocator.free(path_z);
-
-    const fd_raw = std.os.linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
-    const errno = std.os.linux.errno(fd_raw);
-    if (errno != .SUCCESS) return switch (errno) {
-        .NOENT => error.FileNotFound,
-        else => std.posix.unexpectedErrno(errno),
-    };
-    const fd: posix.fd_t = @intCast(fd_raw);
-    defer _ = std.os.linux.close(fd);
-
-    const size = try wal.fileSize(fd);
-    const bytes = try allocator.alloc(u8, @intCast(size));
-    errdefer allocator.free(bytes);
-
-    var got: usize = 0;
-    while (got < bytes.len) {
-        const at: posix.off_t = @intCast(got);
-        const res = std.os.linux.pread(fd, bytes[got..].ptr, bytes.len - got, at);
-        const read_errno = std.os.linux.errno(res);
-        if (read_errno != .SUCCESS) return std.posix.unexpectedErrno(read_errno);
-        if (res == 0) return error.EndOfStream;
-        got += res;
-    }
-    return bytes;
 }
 
 /// The config every moved tick test starts from: one front, one index, a plain
@@ -1255,9 +1152,9 @@ fn testConfig(dir: []const u8, hosts: u32, elephants: u16, snapshots: config.Sna
 }
 
 fn testHost(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     ring_idx: u16,
-    logger: *lifetime.LoggerStuff,
+    logger: *resources.LoggerStuff,
     data_sets: []state.IndexState,
 ) Host {
     return .{
@@ -1270,9 +1167,8 @@ fn testHost(
     };
 }
 
-fn dropTestLogger(ctrl: *lifetime.Controller, logger: *lifetime.LoggerStuff) void {
-    logger.deinit(ctrl.allocator);
-    ctrl.allocator.destroy(logger);
+fn dropTestLogger(ctrl: *resources.Controller, logger: *resources.LoggerStuff) void {
+    ctrl.releaseLogger(logger);
 }
 
 /// Spins until the ring yields one completion or the deadline passes.
@@ -1284,44 +1180,6 @@ fn cqeBefore(ring: *zigring.Ring, deadline_ns: u64) ?zigring.CQE {
     return null;
 }
 
-/// Creates (or empties) the WAL file a snapshot would have handed over.
-/// Creation itself is elephant-side (`designs/wal-impl.md` §1.1), so the test
-/// stands in for it.
-fn createWalFile(path: [:0]const u8) !posix.fd_t {
-    const fd_raw = std.os.linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
-    const errno = std.os.linux.errno(fd_raw);
-    if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-    return @intCast(fd_raw);
-}
-
-/// Opens the pair at `host` with the given tag and writes `records` one after
-/// another, creating the WAL file the elephant normally creates.
-fn testWriter(
-    ctrl: *lifetime.Controller,
-    host: u8,
-    tag: u128,
-    records: u32,
-    record_len: usize,
-) !void {
-    const dir = try ctrl.indexDirPath(0);
-    defer ctrl.allocator.free(dir);
-    const path = try wal.walPath(ctrl.allocator, dir, host, 0, tag);
-    defer ctrl.allocator.free(path);
-
-    const created = try createWalFile(path);
-    _ = std.os.linux.close(created);
-
-    const writer = try ctrl.walOpenWrite(host, 0, tag);
-    const data = try ctrl.allocator.alloc(u8, record_len);
-    defer ctrl.allocator.free(data);
-    @memset(data, 0x5a);
-
-    var i: u32 = 0;
-    while (i < records) : (i += 1) {
-        try writer.write(tag + 1 + i, tag + i, data);
-    }
-}
-
 test "the tick pass ends on each skip guard" {
     const testing = std.testing;
 
@@ -1331,7 +1189,7 @@ test "the tick pass ends on each skip guard" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 0, .{ .size_barrier = config.mib(1), .interval = config.seconds(1), .slots = 2, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1367,7 +1225,7 @@ test "the tick pass ends on each skip guard" {
     try testing.expect(st.procedure == null);
 
     // One procedure per index: its own flag ends the pass.
-    var job: lifetime.SnapshotJob = undefined;
+    var job: resources.SnapshotJob = undefined;
     st.serve = .serving;
     st.procedure = &job;
     st.tickPass(host);
@@ -1385,6 +1243,44 @@ test "the tick pass ends on each skip guard" {
     st.pending_push = null;
 }
 
+/// Creates (or empties) the WAL file a snapshot would have handed over.
+/// Creation itself is elephant-side (`designs/wal-impl.md` §1.1), so the test
+/// stands in for it.
+fn createWalFile(path: [:0]const u8) !posix.fd_t {
+    const fd_raw = std.os.linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
+    const errno = std.os.linux.errno(fd_raw);
+    if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
+    return @intCast(fd_raw);
+}
+
+/// Opens the pair at `host` with the given tag and writes `records` one after
+/// another, creating the WAL file the elephant normally creates.
+fn testWriter(
+    ctrl: *resources.Controller,
+    host: u8,
+    tag: u128,
+    records: u32,
+    record_len: usize,
+) !void {
+    const dir = try ctrl.indexDirPath(0);
+    defer ctrl.allocator.free(dir);
+    const path = try wal.walPath(ctrl.allocator, dir, host, 0, tag);
+    defer ctrl.allocator.free(path);
+
+    const created = try createWalFile(path);
+    _ = std.os.linux.close(created);
+
+    const writer = try ctrl.walOpenWrite(host, 0, tag);
+    const data = try ctrl.allocator.alloc(u8, record_len);
+    defer ctrl.allocator.free(data);
+    @memset(data, 0x5a);
+
+    var i: u32 = 0;
+    while (i < records) : (i += 1) {
+        try writer.write(tag + 1 + i, tag + i, data);
+    }
+}
+
 test "the tick picks the largest pair and dispatches the create" {
     const testing = std.testing;
 
@@ -1394,7 +1290,7 @@ test "the tick picks the largest pair and dispatches the create" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 2, 1, .{ .size_barrier = config.mib(1), .interval = config.seconds(1), .slots = 2, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1453,7 +1349,7 @@ test "an exhausted snapshot pool ends the tick quietly" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 0, .{ .size_barrier = config.mib(1), .interval = config.seconds(1), .slots = 1, .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1492,7 +1388,7 @@ test "a refused dispatch parks in the pending op and the retry lands it" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{});
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1568,7 +1464,7 @@ test "a refused dispatch parks in the pending op and the retry lands it" {
 
 /// Creates the WAL file the elephant would have created and opens its writer:
 /// the window's old side, registered on its pair.
-fn openPairWriter(ctrl: *lifetime.Controller, host: u8, index: u16, tag: u128) !*wal.WalWriteFile {
+fn openPairWriter(ctrl: *resources.Controller, host: u8, index: u16, tag: u128) !*wal.WalWriteFile {
     try ctrl.ensureIndexDir(index);
     const dir = try ctrl.indexDirPath(index);
     defer ctrl.allocator.free(dir);
@@ -1582,7 +1478,7 @@ fn openPairWriter(ctrl: *lifetime.Controller, host: u8, index: u16, tag: u128) !
 /// The window's new side: the file created the elephant's way, then adopted on
 /// temp ring `k`, chained from the clone state.
 fn adoptWindowWriter(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     host: u8,
     index: u16,
     k: u32,
@@ -1600,26 +1496,25 @@ fn adoptWindowWriter(
 
 /// Tears a synthetic window down without an elephant: the new writer is the
 /// caller's, the pair's writer stays registered.
-fn dropWindow(ctrl: *lifetime.Controller, st: *State) void {
+fn dropWindow(ctrl: *resources.Controller, st: *State) void {
     if (st.window) |*window| {
-        _ = std.os.linux.close(window.new.fd);
-        ctrl.allocator.destroy(window.new);
+        ctrl.closeWalWrite(null, window.new);
         window.pending.deinit(ctrl.allocator);
         st.window = null;
     }
 }
 
 /// Releases a test's job the way its terminal elephant would.
-fn dropTestJob(ctrl: *lifetime.Controller, job: *lifetime.SnapshotJob) void {
+fn dropTestJob(ctrl: *resources.Controller, job: *resources.SnapshotJob) void {
     ctrl.snapshot_slots.at(job.k).status = .idle;
     ctrl.snapshot_slots.release(job.k);
-    if (job.fd != -1) _ = std.os.linux.close(job.fd);
-    if (job.old_fd != -1) _ = std.os.linux.close(job.old_fd);
+    _ = res_handle.close(&job.fd);
+    _ = res_handle.close(&job.old_fd);
     ctrl.releaseSnapshotJob(job);
 }
 
 /// The pair's control line, as the restart rule reads it.
-fn pairControlLine(ctrl: *lifetime.Controller) *wal.BufferHeader {
+fn pairControlLine(ctrl: *resources.Controller) *wal.BufferHeader {
     return wal.controlLineOf(
         ctrl.wal_battery.?[0..ctrl.wal_area_stride],
         ctrl.cfg.wal.buffers(),
@@ -1635,7 +1530,7 @@ fn readFileBytes(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
     const fd: posix.fd_t = @intCast(fd_raw);
     defer _ = std.os.linux.close(fd);
 
-    const size = try wal.fileSize(fd);
+    const size = try res_handle.fileSize(fd);
     const bytes = try allocator.alloc(u8, @intCast(size));
     errdefer allocator.free(bytes);
 
@@ -1652,7 +1547,7 @@ fn readFileBytes(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
 
 /// Steps one ring completion the way the index's flush arm does, keeping a
 /// synthetic window's flushes flowing without importing the index.
-fn stepWindowCQE(ctrl: *lifetime.Controller, host: Host, st: *State, cqe: zigring.CQE) void {
+fn stepWindowCQE(ctrl: *resources.Controller, host: Host, st: *State, cqe: zigring.CQE) void {
     const ctx = ctrl.rings[host.ring_idx].slots.get(cqe.taskIdx()) orelse return;
     switch (ctx) {
         .wal_flush => |flush| {
@@ -1665,7 +1560,7 @@ fn stepWindowCQE(ctrl: *lifetime.Controller, host: Host, st: *State, cqe: zigrin
 }
 
 /// Runs the pump's continuation to quiescence without the index's loop.
-fn drainToQuiet(ctrl: *lifetime.Controller, host: Host, st: *State) void {
+fn drainToQuiet(ctrl: *resources.Controller, host: Host, st: *State) void {
     while (st.drainPending()) {
         if (st.drainQuiet()) {
             st.onDrained(host);
@@ -1688,7 +1583,7 @@ test "unwind A clears a published mark, rolls the slot back and dispatches clean
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1727,7 +1622,7 @@ test "unwind A clears a published mark, rolls the slot back and dispatches clean
 
     // The slot rolls back and the procedure's phase names its dispatch.
     try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(job.k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.cleanup_sent, job.phase);
 
     // The flag stays until the terminal `SnapshotDone` (§4).
     try testing.expectEqual(job, st.procedure.?);
@@ -1749,7 +1644,7 @@ test "the handler pass marks, clones, adopts, composites and re-dispatches the d
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2, .size_barrier = config.mib(1), .interval = config.seconds(1), .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1810,7 +1705,7 @@ test "the handler pass marks, clones, adopts, composites and re-dispatches the d
     // new writer from Y and put it on temp ring k.
     try testing.expectEqual(@as(u128, 0x102), job.clone.state);
     try testing.expectEqual(@as(u128, 0x102), job.clone.sessions.get(0x102).?.id);
-    try testing.expectEqual(@as(posix.fd_t, -1), job.fd);
+    try testing.expect(!job.fd.isHeld());
 
     const window = &st.window.?;
     try testing.expectEqual(@as(u128, 0x102), window.new.head);
@@ -1855,7 +1750,7 @@ test "the handler pass marks, clones, adopts, composites and re-dispatches the d
     try testing.expect(std.mem.indexOf(u8, new_bytes, &op) != null);
 
     // The dump is re-dispatched, cursor pick 2.
-    try testing.expectEqual(lifetime.SnapshotPhase.dump_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.dump_sent, job.phase);
     const dump_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotDispatchTimeout;
     const dump_slot: u32 = @intCast(dump_cqe.res);
@@ -1872,7 +1767,7 @@ test "a clone allocation failure unwinds A, clears the mark and dispatches clean
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2, .size_barrier = config.mib(1), .interval = config.seconds(1), .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1922,9 +1817,9 @@ test "a clone allocation failure unwinds A, clears the mark and dispatches clean
     const line = pairControlLine(&ctrl);
     try testing.expectEqual(@as(u8, 0), line.snapshot_in_progress);
     try testing.expect(st.window == null);
-    try testing.expectEqual(fd, job.fd);
+    try testing.expectEqual(fd, res_handle.borrow(&job.fd));
     try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(job.k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.cleanup_sent, job.phase);
 
     const cleanup_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotDispatchTimeout;
@@ -1945,7 +1840,7 @@ test "an adopt allocation failure unwinds A and the descriptor is already closed
     // object is its next allocation.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2, .size_barrier = config.mib(1), .interval = config.seconds(1), .registry_keep = 8 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(failing.allocator(), &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -1989,13 +1884,13 @@ test "an adopt allocation failure unwinds A and the descriptor is already closed
     // Rung 4: no window opened, the mark is cleared, and the descriptor the
     // adopt closed is not left in the job for a second close.
     try testing.expect(st.window == null);
-    try testing.expectEqual(@as(posix.fd_t, -1), job.fd);
+    try testing.expect(!job.fd.isHeld());
     try testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(
         std.os.linux.fcntl(fd, std.os.linux.F.GETFD, 0),
     ));
     try testing.expectEqual(@as(u8, 0), pairControlLine(&ctrl).snapshot_in_progress);
     try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(job.k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.cleanup_sent, job.phase);
 
     const cleanup_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotDispatchTimeout;
@@ -2032,7 +1927,7 @@ test "a composite event completes only when both sides' flushes cover it" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{});
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
 
@@ -2043,8 +1938,7 @@ test "a composite event completes only when both sides' flushes cover it" {
     const k = try ctrl.snapshot_slots.acquire();
     const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x101, 0x100);
     defer {
-        _ = std.os.linux.close(new.fd);
-        ctrl.allocator.destroy(new);
+        ctrl.closeWalWrite(null, new);
         ctrl.snapshot_slots.release(k);
     }
 
@@ -2122,7 +2016,7 @@ test "unwind B reverts to the old writer, closes the new one and dispatches clea
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2140,11 +2034,10 @@ test "unwind B reverts to the old writer, closes the new one and dispatches clea
     const old = try openPairWriter(&ctrl, 0, 0, 0x100);
     const k = try ctrl.snapshot_slots.acquire();
     const new = try adoptWindowWriter(&ctrl, 0, 0, k, 0x100, 0x100);
-    const new_fd = new.fd;
+    const new_fd = res_handle.borrow(&new.fd);
 
     const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
     defer dropTestJob(&ctrl, job);
-    job.fd = -1;
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     const host = testHost(&ctrl, 1, logger, &sets);
@@ -2170,12 +2063,12 @@ test "unwind B reverts to the old writer, closes the new one and dispatches clea
     try testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(
         std.os.linux.fcntl(new_fd, std.os.linux.F.GETFD, 0),
     ));
-    try testing.expectEqual(@as(posix.fd_t, -1), job.fd);
+    try testing.expect(!job.fd.isHeld());
 
     const line = pairControlLine(&ctrl);
     try testing.expectEqual(@as(u8, 0), line.snapshot_in_progress);
     try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(k).status);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.cleanup_sent, job.phase);
 
     const cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
         return error.SnapshotDispatchTimeout;
@@ -2194,7 +2087,7 @@ test "an old-side flush fault freezes the front and a new-side fault stops it" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2241,7 +2134,7 @@ test "the window's old side hitting capacity freezes the front" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2306,7 +2199,7 @@ test "a failed procedure while frozen leaves the stop standing" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2327,7 +2220,6 @@ test "a failed procedure while frozen leaves the stop standing" {
 
     const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
     defer dropTestJob(&ctrl, job);
-    job.fd = -1;
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     const host = testHost(&ctrl, 1, logger, &sets);
@@ -2345,7 +2237,7 @@ test "a failed procedure while frozen leaves the stop standing" {
 
     try testing.expectEqual(Serve.frozen, st.serve);
     try testing.expect(st.window == null);
-    try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.cleanup_sent, job.phase);
     try testing.expectEqual(cross_task.SnapshotSlotStatus.rollback, ctrl.snapshot_slots.at(k).status);
 
     const cleanup_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
@@ -2389,7 +2281,7 @@ const StartupPmem = struct {
     dir: []u8,
     device: []u8,
     cfg: config.Config,
-    ctrl: lifetime.Controller,
+    ctrl: resources.Controller,
     live: bool = false,
 
     fn init(self: *StartupPmem, hosts: u32) !void {
@@ -2451,7 +2343,7 @@ const StartupPlain = struct {
     tmp: std.testing.TmpDir,
     dir: []u8,
     cfg: config.Config,
-    ctrl: lifetime.Controller,
+    ctrl: resources.Controller,
 
     fn init(self: *StartupPlain) !void {
         const allocator = std.testing.allocator;
@@ -2525,8 +2417,7 @@ test "startup recovers a snapshotted pair: snapshot, walked head and replay" {
     try writer.write(y + 1, y, &op_a);
     try writer.write(y + 2, y + 1, &op_b);
     try f.ctrl.publishAdoptionMark(host, index, 0, x);
-    _ = std.os.linux.close(writer.fd);
-    f.ctrl.allocator.destroy(writer);
+    f.ctrl.closeWalWrite(null, writer);
 
     // The registry: two compacted predecessors and the winning line. With
     // `registry_keep = 2` the file holds keep + 1 lines, last one wins.
@@ -2555,7 +2446,7 @@ test "startup recovers a snapshotted pair: snapshot, walked head and replay" {
 
     const registry_path = try f.ctrl.registryPath(index);
     defer allocator.free(registry_path);
-    const before_registry = try readWholeFile(allocator, registry_path);
+    const before_registry = try f.ctrl.readWholeFile(registry_path);
     defer allocator.free(before_registry);
 
     // The crash-and-restart.
@@ -2565,10 +2456,7 @@ test "startup recovers a snapshotted pair: snapshot, walked head and replay" {
     try f.ctrl.initRing(ring_idx, 1);
     defer f.ctrl.rings[ring_idx].deinit();
     const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
+    defer f.ctrl.releaseLogger(logger);
 
     var st: state.IndexState = undefined;
     try f.ctrl.initIndexState(&st);
@@ -2602,9 +2490,9 @@ test "startup recovers a snapshotted pair: snapshot, walked head and replay" {
     const entries = (try f.ctrl.loadRegistry(index)).?;
     defer f.ctrl.freeRegistry(entries);
     try std.testing.expectEqual(@as(usize, 3), entries.len);
-    try std.testing.expectEqual(y, lifetime.Controller.lastLineFor(entries, host).?.state);
+    try std.testing.expectEqual(y, resources.Controller.lastLineFor(entries, host).?.state);
 
-    const after_registry = try readWholeFile(allocator, registry_path);
+    const after_registry = try f.ctrl.readWholeFile(registry_path);
     defer allocator.free(after_registry);
     try std.testing.expectEqualSlices(u8, before_registry, after_registry);
 }
@@ -2654,10 +2542,7 @@ test "plain mode corrects an empty new WAL's tag with the registry's state" {
     try f.ctrl.initRing(ring_idx, 1);
     defer f.ctrl.rings[ring_idx].deinit();
     const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
+    defer f.ctrl.releaseLogger(logger);
 
     var st: state.IndexState = undefined;
     try f.ctrl.initIndexState(&st);
@@ -2693,10 +2578,7 @@ test "startup recovery re-captures the stream window after the landing handshake
     defer f.ctrl.deinitIndexState(&st);
 
     const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
+    defer f.ctrl.releaseLogger(logger);
 
     // No registry: the pair starts empty, and the recovery's first act is the
     // re-capture the later replay and the loop's flushes rely on.
@@ -2719,10 +2601,7 @@ test "startup with an absent registry starts the pair empty" {
     try f.ctrl.initRing(ring_idx, 1);
     defer f.ctrl.rings[ring_idx].deinit();
     const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
+    defer f.ctrl.releaseLogger(logger);
 
     try recoverPair(&f.ctrl, &f.ctrl.rings[ring_idx], &logger.logger, 0, 0, &st);
 
@@ -2750,10 +2629,7 @@ test "startup's corrupt registry line is a returned fatality" {
     try f.ctrl.initRing(ring_idx, 1);
     defer f.ctrl.rings[ring_idx].deinit();
     const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
+    defer f.ctrl.releaseLogger(logger);
 
     try std.testing.expectError(
         error.RegistryCorrupt,
@@ -2802,10 +2678,7 @@ test "startup surfaces a missing WAL file raw" {
     try f.ctrl.initRing(ring_idx, 1);
     defer f.ctrl.rings[ring_idx].deinit();
     const logger = try f.ctrl.getLogger(ring_idx);
-    defer {
-        logger.deinit(f.ctrl.allocator);
-        f.ctrl.allocator.destroy(logger);
-    }
+    defer f.ctrl.releaseLogger(logger);
 
     try std.testing.expectError(
         error.FileNotFound,
@@ -2817,8 +2690,8 @@ const ElephantFixture = struct {
     tmp: std.testing.TmpDir,
     dir: []u8,
     cfg: config.Config,
-    ctrl: lifetime.Controller,
-    logger: *lifetime.LoggerStuff = undefined,
+    ctrl: resources.Controller,
+    logger: *resources.LoggerStuff = undefined,
 
     fn init(self: *ElephantFixture) !void {
         self.tmp = std.testing.tmpDir(.{});
@@ -2837,8 +2710,7 @@ const ElephantFixture = struct {
     }
 
     fn deinit(self: *ElephantFixture) void {
-        self.logger.deinit(self.ctrl.allocator);
-        self.ctrl.allocator.destroy(self.logger);
+        self.ctrl.releaseLogger(self.logger);
         self.ctrl.rings[1].deinit();
         self.ctrl.deinit();
         std.testing.allocator.free(self.dir);
@@ -2857,12 +2729,11 @@ const ElephantFixture = struct {
 const index_ring_idx: u16 = 1;
 const elephant_ring_idx: u16 = 2;
 
-fn dropLogger(ctrl: *lifetime.Controller, logger: *lifetime.LoggerStuff) void {
-    logger.deinit(ctrl.allocator);
-    ctrl.allocator.destroy(logger);
+fn dropLogger(ctrl: *resources.Controller, logger: *resources.LoggerStuff) void {
+    ctrl.releaseLogger(logger);
 }
 
-fn recvReply(ctrl: *lifetime.Controller, deadline_ns: u64) !cross_task.CrossTask {
+fn recvReply(ctrl: *resources.Controller, deadline_ns: u64) !cross_task.CrossTask {
     while (zigring.monotonicNs() < deadline_ns) {
         if (ctrl.rings[index_ring_idx].ring.popCQE()) |cqe| {
             try std.testing.expectEqual(messages.CrossTaskMessageIdx, cqe.taskIdx());
@@ -2891,7 +2762,7 @@ fn cqeWithin(ring: *zigring.Ring, deadline_ns: u64) ?zigring.CQE {
     return null;
 }
 
-fn mintJob(f: *ElephantFixture, tag: u128) !*lifetime.SnapshotJob {
+fn mintJob(f: *ElephantFixture, tag: u128) !*resources.SnapshotJob {
     const k = try f.ctrl.snapshot_slots.acquire();
     return f.ctrl.mintSnapshotJob(0, 0, tag, k, index_ring_idx);
 }
@@ -2909,7 +2780,7 @@ fn writeRawFile(path: []const u8, bytes: []const u8) !void {
     if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
     const fd: posix.fd_t = @intCast(fd_raw);
     defer _ = std.os.linux.close(fd);
-    try writeAll(fd, bytes);
+    try res_handle.writeAll(fd, bytes);
 }
 
 fn readRawFile(path: []const u8) ![]u8 {
@@ -2922,7 +2793,7 @@ fn readRawFile(path: []const u8) ![]u8 {
     const fd: posix.fd_t = @intCast(fd_raw);
     defer _ = std.os.linux.close(fd);
 
-    const size = try wal.fileSize(fd);
+    const size = try res_handle.fileSize(fd);
     const bytes = try std.testing.allocator.alloc(u8, @intCast(size));
     errdefer std.testing.allocator.free(bytes);
 
@@ -2977,15 +2848,14 @@ test "create truncates a stale prefix and replies the descriptor" {
         .SnapshotFd => |r| r.fd,
         else => return error.UnexpectedReply,
     };
-    try std.testing.expectEqual(fd, job.fd);
-    try std.testing.expectEqual(@as(u64, 0), try wal.fileSize(fd));
+    try std.testing.expect(!job.fd.isHeld());
+    try std.testing.expectEqual(@as(u64, 0), try res_handle.fileSize(fd));
 
     const on_disk = try readRawFile(job.wal_path);
     defer std.testing.allocator.free(on_disk);
     try std.testing.expectEqual(@as(usize, 0), on_disk.len);
 
     _ = std.os.linux.close(fd);
-    job.fd = -1;
 }
 
 test "create failure replies SnapshotCreateFailed and holds no descriptor" {
@@ -3006,11 +2876,11 @@ test "create failure replies SnapshotCreateFailed and holds no descriptor" {
 
     const reply = try recvReply(&f.ctrl, replyDeadline());
     try std.testing.expectEqual(cross_task.CrossTask.SnapshotCreateFailed, std.meta.activeTag(reply));
-    try std.testing.expectEqual(@as(posix.fd_t, -1), job.fd);
+    try std.testing.expect(!job.fd.isHeld());
     try std.testing.expectEqual(f.ctrl.snapshot_slots.freeCount(), f.ctrl.snapshot_slots.tasks.len - 1);
 }
 
-fn makeClone(f: *ElephantFixture, job: *lifetime.SnapshotJob, state_y: u128) !void {
+fn makeClone(f: *ElephantFixture, job: *resources.SnapshotJob, state_y: u128) !void {
     var live: state.IndexState = undefined;
     try f.ctrl.initIndexState(&live);
     defer f.ctrl.deinitIndexState(&live);
@@ -3160,7 +3030,7 @@ test "a dump failure replies SnapshotDumpFailed and frees the arena" {
     el.dumpSnapshot(job);
     try std.testing.expectEqual(cross_task.CrossTask.SnapshotDumpFailed, std.meta.activeTag(try recvReply(&f.ctrl, replyDeadline())));
     try std.testing.expectEqual(
-        @as(?[]lifetime.Controller.RegistryEntry, null),
+        @as(?[]resources.Controller.RegistryEntry, null),
         try f.ctrl.loadRegistry(0),
     );
 }
@@ -3173,7 +3043,7 @@ test "close is terminal: the old fd dies, the slot returns, the job is gone" {
     const job = try mintJob(&f, 0x31);
     const k = job.k;
     const old_fd = try openRaw("/dev/null", .{ .ACCMODE = .RDONLY });
-    job.old_fd = old_fd;
+    job.old_fd = res_handle.adopt(old_fd);
     f.ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     var el = f.elephant();
@@ -3201,7 +3071,7 @@ test "cleanup unlinks both files, closes the live fd and tolerates absences" {
     try writeRawFile(wal_path, "wal");
     try writeRawFile(snapshot_path, "snapshot");
     const live_fd = try openRaw(wal_path, .{ .ACCMODE = .RDONLY });
-    job.fd = live_fd;
+    job.fd = res_handle.adopt(live_fd);
     f.ctrl.snapshot_slots.at(k).* = .{ .status = .rollback, .job = @intFromPtr(job) };
 
     var el = f.elephant();

@@ -1,7 +1,7 @@
 //! Shapes of the per-index session state.
 //!
 //! This file holds structures and the mechanical accessors that belong to
-//! them. Every behavioral function lives on `lifetime.Controller`, the
+//! them. Every behavioral function lives on `resources.Controller`, the
 //! registry for resources: when work needs memory, the compensator registry or
 //! the config, it goes there.
 //!
@@ -27,7 +27,7 @@ pub const CompensatorEndpoint = struct {
 };
 
 /// The compensator registry's shape; the instance lives on the
-/// `lifetime.Controller` (the registry for resources).
+/// `resources.Controller` (the registry for resources).
 pub const CompensatorMap = verztable.HashMapWithFns(
     []const u8,
     CompensatorEndpoint,

@@ -1,7 +1,7 @@
 //! Front thread: accepts client connections and routes them to its indexes.
 //!
 //! A front owns one io_uring ring and is the only producer for the inboxes of
-//! its indexes. Its phase A is handled by `lifetime.Controller.runThread`; this
+//! its indexes. Its phase A is handled by `resources.Controller.runThread`; this
 //! file implements the reaction to `START_WORK`, the input loop and the
 //! shutdown choreography from docs/startup-en-reworked.md.
 
@@ -9,7 +9,8 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const zigring = @import("zigring");
-const lifetime = @import("lifetime.zig");
+const resources = @import("resources.zig");
+const res_handle = @import("resources_handle.zig");
 const messages = @import("messages.zig");
 const indexmod = @import("index.zig");
 const logging = @import("logging.zig");
@@ -25,19 +26,21 @@ const tick_ns: u64 = 500 * std.time.ns_per_ms;
 
 /// State a front keeps across its service loop.
 const Ctx = struct {
-    ctrl: *lifetime.Controller,
-    role: lifetime.Role,
-    ring: *lifetime.RingStuff,
+    ctrl: *resources.Controller,
+    role: resources.Role,
+    ring: *resources.RingStuff,
     log: *logging.Logger,
 
     listening: bool = false,
+    /// The client listener's number, borrowed from the process thread that
+    /// owns the handle; the front never closes it.
     listen_fd: posix.fd_t = -1,
     accept_task_idx: ?u64 = null,
     cancel_task_idx: ?u64 = null,
 
     /// The shared peer listener and this front's own arm on it. The client arm
     /// above stays single-purpose, so each pair is matched only by its own
-    /// task index.
+    /// task index. The number is borrowed from the process thread's handle.
     peer_fd: posix.fd_t = -1,
     peer_listening: bool = false,
     peer_accept_task_idx: ?u64 = null,
@@ -83,7 +86,7 @@ const PeerHandshake = struct {
     const State = enum { free, reading, replying, posting, done };
 
     state: State = .free,
-    fd: posix.fd_t = -1,
+    fd: res_handle.SocketHandle = .{},
     filled: usize = 0,
     host_idx: u8 = 0,
     index_idx: u16 = 0,
@@ -115,13 +118,13 @@ const PeerHandshake = struct {
     /// Whether the slot may go back to the table.
     fn settled(self: *const Self) bool {
         return self.state == .free or
-            (self.state == .done and self.fd < 0 and !self.busy() and self.post_slot == null);
+            (self.state == .done and !self.fd.isHeld() and !self.busy() and self.post_slot == null);
     }
 };
 
 /// Runs the front thread to completion. `role` is the role the thread derived
 /// from its `ring_idx` before reporting `INITIALIZED`.
-pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.LoggerStuff) void {
+pub fn run(ctrl: *resources.Controller, role: resources.Role, logger: *resources.LoggerStuff) void {
     const front = role.front;
     var ctx = Ctx{
         .ctrl = ctrl,
@@ -272,13 +275,14 @@ fn handleCqe(ctx: *Ctx, cqe: zigring.CQE) void {
             }
             return;
         }
+        var accepted = ctx.ctrl.adoptSocket(@intCast(cqe.res));
         if (ctx.draining) {
             // Accepts were cancelled at shutdown; anything already accepted is
             // dropped rather than handed to an index that may be draining.
-            _ = std.os.linux.close(@intCast(cqe.res));
+            ctx.ctrl.closeSocket(&accepted);
             return;
         }
-        routeAccepted(ctx, @intCast(cqe.res));
+        routeAccepted(ctx, &accepted);
         if (!cqe.hasMore()) {
             // The multishot ended: either it was cancelled for shutdown or it
             // failed. Only re-arm while the front is not draining.
@@ -348,20 +352,20 @@ fn handlePeerAccept(ctx: *Ctx, cqe: zigring.CQE) void {
             });
         }
     } else {
-        const fd: posix.fd_t = @intCast(cqe.res);
+        var accepted = ctx.ctrl.adoptSocket(@intCast(cqe.res));
         if (ctx.draining) {
             // Accepts were cancelled at shutdown; anything already accepted is
             // dropped rather than handed to an index that may be draining.
-            _ = std.os.linux.close(fd);
+            ctx.ctrl.closeSocket(&accepted);
         } else {
-            openHandshake(ctx, fd) catch |err| switch (err) {
+            openHandshake(ctx, &accepted) catch |err| switch (err) {
                 // No entry was claimed, so the descriptor is still ours.
                 error.NoHandshakeEntry => {
                     ctx.log.warn("peer connection refused: no handshake entry", .{
                         .ring_idx = ctx.front().ring_idx,
-                        .fd = fd,
+                        .fd = ctx.ctrl.borrowSocket(&accepted),
                     });
-                    _ = std.os.linux.close(fd);
+                    ctx.ctrl.closeSocket(&accepted);
                 },
                 // The handshake claimed the descriptor and its own cleanup has
                 // already closed it.
@@ -419,13 +423,15 @@ fn classifyGreet(
 
 /// Claims the first free handshake entry and arms the greet read plus its one
 /// deadline. A failure leaves no descriptor open and no completion unowned.
-fn openHandshake(ctx: *Ctx, fd: posix.fd_t) !void {
+fn openHandshake(ctx: *Ctx, accepted: *res_handle.SocketHandle) !void {
     const cluster = ctx.ctrl.cfg.cluster orelse return error.NoHandshakeEntry;
     const entry_idx = findFreeHandshake(ctx) orelse return error.NoHandshakeEntry;
     const index: u32 = @intCast(entry_idx);
 
     const entry = &ctx.handshakes[entry_idx];
-    entry.* = .{ .state = .reading, .fd = fd };
+    entry.* = .{ .state = .reading };
+    ctx.ctrl.moveSocket(&entry.fd, accepted);
+    const fd = ctx.ctrl.borrowSocket(&entry.fd);
     setDeadlineSpec(&entry.deadline_spec, cluster.handshake_timeout.value());
 
     const read_idx = ctx.ring.slots.add(.{ .greet_read = .{ .entry = index } }) catch |err| {
@@ -494,7 +500,7 @@ fn handleGreetRead(ctx: *Ctx, task_idx: u64, entry_idx: u32, cqe: zigring.CQE) v
     if (cqe.res < 0) {
         ctx.log.warn("peer greet read failed", .{
             .ring_idx = ctx.front().ring_idx,
-            .fd = entry.fd,
+            .fd = ctx.ctrl.borrowSocket(&entry.fd),
             .err = @tagName(cqe.errno()),
         });
         closeEntry(ctx, entry_idx);
@@ -503,7 +509,7 @@ fn handleGreetRead(ctx: *Ctx, task_idx: u64, entry_idx: u32, cqe: zigring.CQE) v
     if (cqe.res == 0) {
         ctx.log.warn("peer closed before the greet landed", .{
             .ring_idx = ctx.front().ring_idx,
-            .fd = entry.fd,
+            .fd = ctx.ctrl.borrowSocket(&entry.fd),
         });
         closeEntry(ctx, entry_idx);
         return;
@@ -528,7 +534,7 @@ fn rearmGreetRead(ctx: *Ctx, entry_idx: u32) void {
         return;
     };
     entry.read_idx = read_idx;
-    ctx.ring.ring.pushRecv(entry.fd, read_idx, entry.greet[entry.filled..], .{}) catch |err| {
+    ctx.ring.ring.pushRecv(ctx.ctrl.borrowSocket(&entry.fd), read_idx, entry.greet[entry.filled..], .{}) catch |err| {
         ctx.ring.slots.del(read_idx);
         entry.read_idx = null;
         ctx.log.warn("could not re-arm the greet read", .{
@@ -558,7 +564,7 @@ fn handleGreetDeadline(ctx: *Ctx, task_idx: u64, entry_idx: u32) void {
 
     ctx.log.warn("peer greet deadline", .{
         .ring_idx = ctx.front().ring_idx,
-        .fd = entry.fd,
+        .fd = ctx.ctrl.borrowSocket(&entry.fd),
     });
     closeEntry(ctx, entry_idx);
 }
@@ -578,7 +584,7 @@ fn onGreetComplete(ctx: *Ctx, entry_idx: u32) void {
         .route => |route| {
             entry.host_idx = route.host_idx;
             entry.index_idx = route.index_idx;
-            entry.source_ok = peerSourceOk(ctx, entry.fd, route.host_idx);
+            entry.source_ok = peerSourceOk(ctx, ctx.ctrl.borrowSocket(&entry.fd), route.host_idx);
             entry.state = .posting;
             cancelDeadline(ctx, entry);
             tryPost(ctx, entry_idx);
@@ -602,7 +608,7 @@ fn beginReject(ctx: *Ctx, entry_idx: u32, verdict: cluster_transport.Verdict) vo
 
     ctx.log.warn("peer greet rejected", .{
         .ring_idx = ctx.front().ring_idx,
-        .fd = entry.fd,
+        .fd = ctx.ctrl.borrowSocket(&entry.fd),
         .verdict = @tagName(verdict),
     });
 
@@ -612,7 +618,7 @@ fn beginReject(ctx: *Ctx, entry_idx: u32, verdict: cluster_transport.Verdict) vo
         return;
     };
     entry.reply_idx = reply_idx;
-    ctx.ring.ring.pushSend(entry.fd, reply_idx, &entry.reply, cluster_transport.REPLY_LEN, .{}) catch |err| {
+    ctx.ring.ring.pushSend(ctx.ctrl.borrowSocket(&entry.fd), reply_idx, &entry.reply, cluster_transport.REPLY_LEN, .{}) catch |err| {
         ctx.ring.slots.del(reply_idx);
         entry.reply_idx = null;
         ctx.log.warn("peer reject reply could not be submitted", .{ .err = @errorName(err) });
@@ -629,7 +635,7 @@ fn handleReplySend(ctx: *Ctx, task_idx: u64, entry_idx: u32, cqe: zigring.CQE) v
     if (cqe.res != cluster_transport.REPLY_LEN) {
         ctx.log.warn("peer reject reply did not leave whole", .{
             .ring_idx = ctx.front().ring_idx,
-            .fd = entry.fd,
+            .fd = ctx.ctrl.borrowSocket(&entry.fd),
             .sent = cqe.res,
         });
     }
@@ -638,20 +644,10 @@ fn handleReplySend(ctx: *Ctx, task_idx: u64, entry_idx: u32, cqe: zigring.CQE) v
 
 fn closeAfterReply(ctx: *Ctx, entry_idx: u32) void {
     const entry = &ctx.handshakes[entry_idx];
-    const fd = entry.fd;
-    entry.fd = -1;
+    const fd = ctx.ctrl.borrowSocket(&entry.fd);
     entry.state = .done;
 
-    if (fd >= 0) {
-        if (ctx.ring.slots.add(.{ .close = .{ .fd = fd } })) |close_idx| {
-            ctx.ring.ring.pushClose(close_idx, fd, .{}) catch {
-                ctx.ring.slots.del(close_idx);
-                _ = std.os.linux.close(fd);
-            };
-        } else |_| {
-            _ = std.os.linux.close(fd);
-        }
-    }
+    ctx.ctrl.closeSocketViaRing(ctx.ring, .{ .close = .{ .fd = fd } }, &entry.fd);
     maybeRelease(ctx, entry_idx);
 }
 
@@ -687,7 +683,7 @@ fn tryPost(ctx: *Ctx, entry_idx: u32) void {
             error.CrossTaskFull => return,
         };
         ctx.ctrl.cross_slots.at(slot_idx).* = .{ .PeerLink = .{
-            .fd = entry.fd,
+            .fd = ctx.ctrl.borrowSocket(&entry.fd),
             .host_idx = entry.host_idx,
             .index_idx = entry.index_idx,
             .version = cluster_transport.VERSION,
@@ -711,7 +707,7 @@ fn tryPost(ctx: *Ctx, entry_idx: u32) void {
     ctx.ring.ring.streamedSQ(&ctx.ring.sqstream);
 
     entry.post_slot = null;
-    entry.fd = -1;
+    ctx.ctrl.disownSocket(&entry.fd);
     entry.state = .done;
     ctx.log.info("peer link handed over", .{
         .ring_idx = ctx.front().ring_idx,
@@ -765,10 +761,7 @@ fn closeEntry(ctx: *Ctx, entry_idx: u32) void {
     const entry = &ctx.handshakes[entry_idx];
     cancelRead(ctx, entry);
     cancelDeadline(ctx, entry);
-    if (entry.fd >= 0) {
-        _ = std.os.linux.close(entry.fd);
-        entry.fd = -1;
-    }
+    ctx.ctrl.closeSocket(&entry.fd);
     entry.state = .done;
     maybeRelease(ctx, entry_idx);
 }
@@ -925,16 +918,19 @@ fn allDrained(ctx: *const Ctx) bool {
     return true;
 }
 
-fn routeAccepted(ctx: *Ctx, fd: posix.fd_t) void {
+fn routeAccepted(ctx: *Ctx, accepted: *res_handle.SocketHandle) void {
     const k = ctx.round_robin % ctx.front().index_count;
     ctx.round_robin +%= 1;
 
+    const fd = ctx.ctrl.borrowSocket(accepted);
     ctx.ownInbox(k).push(.{ .create = .{ .fd = fd } }) catch {
         // The HLD failure policy: when the queue is full the front drops the
         // connection immediately instead of keeping a backlog of its own.
         ctx.log.warn("index inbox full, dropping connection", .{ .ring_idx = ctx.front().ring_idx, .fd = fd });
-        _ = std.os.linux.close(fd);
+        ctx.ctrl.closeSocket(accepted);
+        return;
     };
+    ctx.ctrl.disownSocket(accepted);
 }
 
 fn reportDone(ctx: *Ctx) void {
@@ -948,7 +944,7 @@ fn reportDone(ctx: *Ctx) void {
 }
 
 test "children are addressed by ring offset" {
-    const role: lifetime.Role = .{ .front = .{
+    const role: resources.Role = .{ .front = .{
         .ring_idx = 0,
         .first_index = .{ .ring_idx = 2, .inbox_idx = 0 },
         .index_count = 2,
@@ -1015,7 +1011,7 @@ test "the greet checks run version, host and index in that order" {
 }
 
 test "a handshake entry is settled only after its completions land" {
-    var entry = PeerHandshake{ .state = .done, .fd = -1 };
+    var entry = PeerHandshake{ .state = .done };
     try std.testing.expect(entry.settled());
 
     // A read still in flight keeps the slot reserved for its CQE.
@@ -1027,7 +1023,7 @@ test "a handshake entry is settled only after its completions land" {
 
     // An unposted hand-over still owns both its descriptor and its slot.
     entry.state = .posting;
-    entry.fd = 3;
+    entry.fd = res_handle.adopt(3);
     entry.post_slot = 4;
     try std.testing.expect(!entry.settled());
 }

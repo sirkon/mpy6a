@@ -8,12 +8,12 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 const dap = @import("dap");
 const zigring = @import("zigring");
 
 const config = @import("config.zig");
-const lifetime = @import("lifetime.zig");
+const resources = @import("resources.zig");
+const res_handle = @import("resources_handle.zig");
 const messages = @import("messages.zig");
 
 /// Path used when `-c/--config` is not given.
@@ -132,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
     var diag: dap.Diag = .{};
     defer diag.deinit(arena);
 
-    var cli = try CLI.parse(arena, init.minimal.environ, null, args, &diag);
+    var cli = try CLI.parse(arena, init, null, args, &diag);
     defer CLI.deinit(&cli, arena);
     var config_path: []const u8 = undefined;
     if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -218,17 +218,14 @@ pub fn main(init: std.process.Init) !void {
 /// Runs one shard instance to completion: phase A, launch, signal wait, phase
 /// B shutdown. Returns only once every working thread has been joined.
 fn runShard(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
-    // Block the stop signals in the process thread before any worker starts:
-    // pthreads inherit the mask, so no worker can swallow one.
-    var signal_mask = posix.sigemptyset();
-    posix.sigaddset(&signal_mask, posix.SIG.INT);
-    posix.sigaddset(&signal_mask, posix.SIG.TERM);
-    posix.sigaddset(&signal_mask, posix.SIG.HUP);
-    posix.sigprocmask(posix.SIG.BLOCK, &signal_mask, null);
-
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(allocator, cfg);
     defer ctrl.deinit();
+
+    // Block the stop signals in the process thread before any worker starts:
+    // pthreads inherit the mask, so no worker can swallow one.
+    var guard = try ctrl.openStopGuard();
+    defer ctrl.closeStopGuard(&guard);
 
     const total: u16 = cfg.fronts + cfg.indexes + cfg.elephants;
     if (total > max_threads) return error.TooManyThreads;
@@ -245,34 +242,24 @@ fn runShard(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         std.process.exit(1);
     };
 
-    const listen_fd = try ctrl.createServerSocket();
-    defer _ = linux.close(listen_fd);
+    var listen_sock = try ctrl.createServerSocket();
+    defer ctrl.closeSocket(&listen_sock);
 
     // The peer listener exists exactly when the replication group spans more
     // than one host. Its descriptor travels to the fronts through a slot, and
     // it is closed only after every front has stopped, so no arm outlives the
     // listener.
-    const peer_fd: ?posix.fd_t = if (cfg.cluster != null)
-        try ctrl.createPeerServerSocket()
-    else
-        null;
-    defer {
-        if (peer_fd) |fd| _ = linux.close(fd);
-    }
+    var peer_sock: res_handle.SocketHandle = .{};
+    if (cfg.cluster != null) peer_sock = try ctrl.createPeerServerSocket();
+    defer ctrl.closeSocket(&peer_sock);
 
-    if (peer_fd) |fd| try postPeerListener(&ctrl, total, fd);
+    if (cfg.cluster != null) try postPeerListener(&ctrl, total, ctrl.borrowSocket(&peer_sock));
 
-    try broadcastStartWork(&ctrl, total, listen_fd);
+    try broadcastStartWork(&ctrl, total, ctrl.borrowSocket(&listen_sock));
 
     // The process thread now waits for a stop cause: a stop signal or a
     // `ProcessStopRequestIdx` from an elephant's runtime fatality.
-    const signal_fd = posix.signalfd(-1, &signal_mask, linux.SFD.CLOEXEC) catch |err| {
-        std.debug.print("could not create the signal descriptor: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    defer _ = linux.close(signal_fd);
-
-    switch (try awaitStopCause(&ctrl, signal_fd)) {
+    switch (try ctrl.awaitStopCause(&guard, &ctrl.init_ring)) {
         .signal => |signo| std.debug.print("stop requested by signal {d}\n", .{signo}),
         .process_stop => |ring_idx| std.debug.print(
             "stop requested by {s}#{d}\n",
@@ -289,67 +276,13 @@ fn runShard(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     ctrl.joinThreads();
 }
 
-/// Why the process thread left its park.
-const StopCause = union(enum) {
-    /// A stop signal arrived; `signo` is its number.
-    signal: u32,
-    /// An elephant requested the process stop; the value is the sender's ring
-    /// index, the operator's breadcrumb beside the elephant's own log entry.
-    process_stop: u16,
-};
-
-/// Blocks until a stop cause arrives on the signalfd or the init ring
-/// (designs/SNAPSHOTS.md §2.4). The park does not spin: `poll` sleeps on both
-/// descriptors.
-///
-/// The init ring is idle after `waitForInitialized`, so its only expected
-/// completion is `ProcessStopRequestIdx`; anything else is dropped with a log
-/// line rather than trusted.
-fn awaitStopCause(ctrl: *lifetime.Controller, signal_fd: posix.fd_t) !StopCause {
-    var fds = [2]posix.pollfd{
-        // The signal descriptor first: a stop signal outranks a stop request.
-        .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = ctrl.init_ring.ring.fd, .events = posix.POLL.IN, .revents = 0 },
-    };
-
-    while (true) {
-        _ = try posix.poll(&fds, -1);
-
-        // A broken descriptor would make `poll` return at once forever.
-        const broken = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
-        if (fds[0].revents & broken != 0) return error.SignalFdClosed;
-        if (fds[1].revents & broken != 0) return error.InitRingClosed;
-
-        if (fds[0].revents & posix.POLL.IN != 0) {
-            var info: linux.signalfd_siginfo = undefined;
-            const n = try posix.read(signal_fd, std.mem.asBytes(&info));
-            if (n != @sizeOf(linux.signalfd_siginfo)) return error.SignalReadShort;
-            return .{ .signal = info.signo };
-        }
-
-        if (fds[1].revents & posix.POLL.IN != 0) {
-            while (ctrl.init_ring.ring.popCQE()) |cqe| {
-                const task_idx = cqe.taskIdx();
-                if (task_idx == messages.ProcessStopRequestIdx) {
-                    if (cqe.res < 0 or cqe.res > std.math.maxInt(u16)) {
-                        std.debug.print("process-stop request has an invalid sender: {d}\n", .{cqe.res});
-                        continue;
-                    }
-                    return .{ .process_stop = @intCast(cqe.res) };
-                }
-                std.debug.print("dropping unexpected init-ring completion {d}\n", .{task_idx});
-            }
-        }
-    }
-}
-
 /// Upper bound for the number of working threads in one process.
 const max_threads = 4096;
 
 /// Blocks on the init ring until every worker reports `INITIALIZED`. A timeout
 /// applies; on expiry the roles that did not report are named and the process
 /// exits fatally.
-fn waitForInitialized(ctrl: *lifetime.Controller, total: u16, reported: *[max_threads]bool) !void {
+fn waitForInitialized(ctrl: *resources.Controller, total: u16, reported: *[max_threads]bool) !void {
     // A one-shot multishot timer is the portable deadline: `pushTimeout` with
     // a zero `len` is rejected by the kernel in this zigring version.
     ctrl.init_deadline_spec = .{
@@ -377,7 +310,7 @@ fn waitForInitialized(ctrl: *lifetime.Controller, total: u16, reported: *[max_th
     }
 }
 
-fn reportMissing(ctrl: *lifetime.Controller, total: u16, reported: *const [max_threads]bool) void {
+fn reportMissing(ctrl: *resources.Controller, total: u16, reported: *const [max_threads]bool) void {
     std.debug.print("startup timed out; missing reports:", .{});
     var ring_idx: u16 = 0;
     while (ring_idx < total) : (ring_idx += 1) {
@@ -392,7 +325,7 @@ fn reportMissing(ctrl: *lifetime.Controller, total: u16, reported: *const [max_t
 /// This runs before `broadcastStartWork`, and both messages are pushed from the
 /// init ring into the same front ring, so io_uring's per-source ordering is what
 /// lets the front arm its peer accept on the descriptor it just stored.
-fn postPeerListener(ctrl: *lifetime.Controller, total: u16, peer_fd: posix.fd_t) !void {
+fn postPeerListener(ctrl: *resources.Controller, total: u16, peer_fd: posix.fd_t) !void {
     var ring_idx: u16 = 0;
     while (ring_idx < total) : (ring_idx += 1) {
         if (std.meta.activeTag(ctrl.roleOf(ring_idx)) != .front) continue;
@@ -420,7 +353,7 @@ fn postPeerListener(ctrl: *lifetime.Controller, total: u16, peer_fd: posix.fd_t)
 /// Sends `START_WORK(socket_fd)` into every worker ring. The main ring has
 /// already observed one `INITIALIZED` per worker, and io_uring preserves the
 /// order inside each ring, so this single message is a safe launch barrier.
-fn broadcastStartWork(ctrl: *lifetime.Controller, total: u16, listen_fd: posix.fd_t) !void {
+fn broadcastStartWork(ctrl: *resources.Controller, total: u16, listen_fd: posix.fd_t) !void {
     var ring_idx: u16 = 0;
     while (ring_idx < total) : (ring_idx += 1) {
         try ctrl.init_ring.ring.pushMsgRingFd(
@@ -435,7 +368,7 @@ fn broadcastStartWork(ctrl: *lifetime.Controller, total: u16, listen_fd: posix.f
 
 /// The process-side shutdown: demand, wait for all fronts and elephants, count
 /// ticks, report what has not stopped, then return so the process can exit.
-fn shutdown(ctrl: *lifetime.Controller, total: u16) !void {
+fn shutdown(ctrl: *resources.Controller, total: u16) !void {
     var ring_idx: u16 = 0;
     while (ring_idx < total) : (ring_idx += 1) {
         // The role follows from the ring index, which is the launch slot; the
@@ -483,7 +416,7 @@ fn shutdown(ctrl: *lifetime.Controller, total: u16) !void {
     }
 }
 
-fn reportNotStopped(ctrl: *lifetime.Controller, total: u16, stopped: *const [max_threads]bool) void {
+fn reportNotStopped(ctrl: *resources.Controller, total: u16, stopped: *const [max_threads]bool) void {
     std.debug.print("shutdown timed out; still running:", .{});
     var ring_idx: u16 = 0;
     while (ring_idx < total) : (ring_idx += 1) {
@@ -506,7 +439,7 @@ const cluster_transport = @import("cluster_transport.zig");
 
 const StopFixture = struct {
     cfg: config.Config = undefined,
-    ctrl: lifetime.Controller = undefined,
+    ctrl: resources.Controller = undefined,
 
     fn init(self: *StopFixture) !void {
         self.cfg = .{
@@ -533,18 +466,13 @@ const StopFixture = struct {
     }
 };
 
-fn emptySignalFd() !posix.fd_t {
-    const mask = posix.sigemptyset();
-    return posix.signalfd(-1, &mask, linux.SFD.CLOEXEC);
-}
-
 test "awaitStopCause reports a process-stop request with its sender" {
     var f: StopFixture = undefined;
     try f.init();
     defer f.deinit();
 
-    const signal_fd = try emptySignalFd();
-    defer _ = linux.close(signal_fd);
+    var guard = try f.ctrl.openStopGuard();
+    defer f.ctrl.closeStopGuard(&guard);
 
     try f.ctrl.init_ring.ring.pushMsgRingFd(
         f.ctrl.init_ring.ring.fd,
@@ -553,7 +481,7 @@ test "awaitStopCause reports a process-stop request with its sender" {
         .{},
     );
 
-    const cause = try awaitStopCause(&f.ctrl, signal_fd);
+    const cause = try f.ctrl.awaitStopCause(&guard, &f.ctrl.init_ring);
     try std.testing.expect(std.meta.activeTag(cause) == .process_stop);
     try std.testing.expectEqual(@as(u16, 2), cause.process_stop);
 }
@@ -563,14 +491,8 @@ test "awaitStopCause reports a blocked stop signal" {
     try f.init();
     defer f.deinit();
 
-    var mask = posix.sigemptyset();
-    posix.sigaddset(&mask, posix.SIG.TERM);
-    var previous_mask: posix.sigset_t = undefined;
-    posix.sigprocmask(posix.SIG.BLOCK, &mask, &previous_mask);
-    defer posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
-
-    // The signal stays pending in the thread mask; ignoring it keeps a failed
-    // read from terminating the whole test run when the mask is restored.
+    // Ignoring TERM keeps a failed read from terminating the whole test run
+    // when `closeStopGuard` restores the mask.
     const ignore: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
@@ -580,12 +502,13 @@ test "awaitStopCause reports a blocked stop signal" {
     posix.sigaction(posix.SIG.TERM, &ignore, &previous_action);
     defer posix.sigaction(posix.SIG.TERM, &previous_action, null);
 
-    const signal_fd = try posix.signalfd(-1, &mask, linux.SFD.CLOEXEC);
-    defer _ = linux.close(signal_fd);
+    // The guard itself blocks the stop signals and holds the descriptor.
+    var guard = try f.ctrl.openStopGuard();
+    defer f.ctrl.closeStopGuard(&guard);
 
     try posix.raise(posix.SIG.TERM);
 
-    const cause = try awaitStopCause(&f.ctrl, signal_fd);
+    const cause = try f.ctrl.awaitStopCause(&guard, &f.ctrl.init_ring);
     try std.testing.expect(std.meta.activeTag(cause) == .signal);
     try std.testing.expectEqual(@as(u32, @backingInt(posix.SIG.TERM)), cause.signal);
 }
@@ -595,8 +518,8 @@ test "awaitStopCause drops a foreign init-ring completion" {
     try f.init();
     defer f.deinit();
 
-    const signal_fd = try emptySignalFd();
-    defer _ = linux.close(signal_fd);
+    var guard = try f.ctrl.openStopGuard();
+    defer f.ctrl.closeStopGuard(&guard);
 
     try f.ctrl.init_ring.ring.pushMsgRingFd(
         f.ctrl.init_ring.ring.fd,
@@ -611,7 +534,7 @@ test "awaitStopCause drops a foreign init-ring completion" {
         .{},
     );
 
-    const cause = try awaitStopCause(&f.ctrl, signal_fd);
+    const cause = try f.ctrl.awaitStopCause(&guard, &f.ctrl.init_ring);
     try std.testing.expect(std.meta.activeTag(cause) == .process_stop);
     try std.testing.expectEqual(@as(u16, 1), cause.process_stop);
     try std.testing.expect(f.ctrl.init_ring.ring.popCQE() == null);
@@ -696,15 +619,15 @@ fn pickLoopbackPort() !u16 {
 /// has one `peer_port` for the whole replication group.
 const HarnessNode = struct {
     cfg: config.Config = undefined,
-    ctrl: lifetime.Controller = undefined,
+    ctrl: resources.Controller = undefined,
     peers: [2][]const u8 = .{ "", "" },
     bind: []const u8 = "127.0.0.1",
     dir: []u8 = &.{},
     inited: bool = false,
     started: bool = false,
     stopped: bool = false,
-    listen_fd: posix.fd_t = -1,
-    peer_fd: posix.fd_t = -1,
+    listen_sock: res_handle.SocketHandle = .{},
+    peer_sock: res_handle.SocketHandle = .{},
     total: u16 = 2,
     peer_port: u16 = 0,
 
@@ -768,10 +691,10 @@ const HarnessNode = struct {
         var reported: [max_threads]bool = @splat(false);
         try waitForInitialized(&self.ctrl, self.total, &reported);
 
-        self.listen_fd = try self.ctrl.createServerSocket();
-        self.peer_fd = try self.ctrl.createPeerServerSocket();
-        try postPeerListener(&self.ctrl, self.total, self.peer_fd);
-        try broadcastStartWork(&self.ctrl, self.total, self.listen_fd);
+        self.listen_sock = try self.ctrl.createServerSocket();
+        self.peer_sock = try self.ctrl.createPeerServerSocket();
+        try postPeerListener(&self.ctrl, self.total, self.ctrl.borrowSocket(&self.peer_sock));
+        try broadcastStartWork(&self.ctrl, self.total, self.ctrl.borrowSocket(&self.listen_sock));
     }
 
     fn stopSoft(self: *HarnessNode) !void {
@@ -812,14 +735,8 @@ const HarnessNode = struct {
                 self.stopSoft() catch return;
                 self.join();
             }
-            if (self.listen_fd >= 0) {
-                _ = std.os.linux.close(self.listen_fd);
-                self.listen_fd = -1;
-            }
-            if (self.peer_fd >= 0) {
-                _ = std.os.linux.close(self.peer_fd);
-                self.peer_fd = -1;
-            }
+            self.ctrl.closeSocket(&self.listen_sock);
+            self.ctrl.closeSocket(&self.peer_sock);
             self.ctrl.deinit();
             self.inited = false;
         }
@@ -1039,7 +956,7 @@ test "stage K: the greet establishes the link on both shards" {
     const e1 = nodeEntry(&pair.node1, 0).?;
     try std.testing.expectEqual(cluster_transport.LinkState.up, entryState(e0));
     try std.testing.expectEqual(cluster_transport.LinkState.up, entryState(e1));
-    try std.testing.expect(e0.fd >= 0 and e1.fd >= 0);
+    try std.testing.expect(e0.fd.isHeld() and e1.fd.isHeld());
     try std.testing.expect(volatileLoad(?u64, &e0.connect_task) == null);
     try std.testing.expect(volatileLoad(?u64, &e0.verdict_task) == null);
     try std.testing.expect(volatileLoad(?u64, &e0.retry_task) == null);
@@ -1051,7 +968,7 @@ test "stage K: the greet establishes the link on both shards" {
     try pair.node1.stopSoft();
     try std.testing.expectEqual(cluster_transport.LinkState.none, entryState(e0));
     try std.testing.expectEqual(cluster_transport.LinkState.none, entryState(e1));
-    try std.testing.expect(e0.fd < 0 and e1.fd < 0);
+    try std.testing.expect(!e0.fd.isHeld() and !e1.fd.isHeld());
 }
 
 test "stage K: the keepalive pulses round trip and both links stay up" {
@@ -1103,8 +1020,8 @@ test "stage K: a duplicate greet while the link is up is answered host_index_squ
     const e1 = nodeEntry(&pair.node1, 0).?;
     const epoch0 = entryEpoch(e0);
     const epoch1 = entryEpoch(e1);
-    const fd0 = e0.fd;
-    const fd1 = e1.fd;
+    const fd0 = res_handle.borrow(&e0.fd);
+    const fd1 = res_handle.borrow(&e1.fd);
 
     const intruder = try connectTcp(pair.node1.bind, pair.node1.peer_port);
     defer _ = std.os.linux.close(intruder);
@@ -1119,8 +1036,8 @@ test "stage K: a duplicate greet while the link is up is answered host_index_squ
     try std.testing.expectEqual(cluster_transport.LinkState.up, entryState(e1));
     try std.testing.expectEqual(epoch0, entryEpoch(e0));
     try std.testing.expectEqual(epoch1, entryEpoch(e1));
-    try std.testing.expectEqual(fd0, e0.fd);
-    try std.testing.expectEqual(fd1, e1.fd);
+    try std.testing.expectEqual(fd0, res_handle.borrow(&e0.fd));
+    try std.testing.expectEqual(fd1, res_handle.borrow(&e1.fd));
     try std.testing.expect(volatileLoad(cluster_transport.LinkState, &e1.candidate_state) == .none);
 
     try pair.node0.stopSoft();
@@ -1201,7 +1118,7 @@ test "stage K: a dead link closes the higher side and the lower host redials at 
     // has a retry timer, so the re-established pair is its own dial. (The
     // keepalive-miss arm of the same death is unit-tested in `src/index.zig`:
     // over loopback a one-sided shutdown is the only silent death available.)
-    const higher_fd = e1.fd;
+    const higher_fd = res_handle.borrow(&e1.fd);
     try std.testing.expect(higher_fd >= 0);
     _ = std.os.linux.shutdown(higher_fd, @intCast(posix.SHUT.RD));
 
@@ -1254,7 +1171,7 @@ test "stage K: soft teardown closes the links before the drain report" {
     // index closes every link before that report (§3.7).
     try std.testing.expectEqual(cluster_transport.LinkState.none, entryState(e0));
     try std.testing.expectEqual(cluster_transport.LinkState.none, entryState(e1));
-    try std.testing.expect(e0.fd < 0 and e1.fd < 0);
+    try std.testing.expect(!e0.fd.isHeld() and !e1.fd.isHeld());
     try std.testing.expect(volatileLoad(?u64, &e0.keepalive_task) == null);
     try std.testing.expect(volatileLoad(?u64, &e0.recv_task) == null);
     try std.testing.expect(volatileLoad(?u64, &e1.keepalive_task) == null);
@@ -1290,7 +1207,7 @@ test "stage K: hard teardown closes the links immediately and both shards exit" 
 
     try std.testing.expectEqual(cluster_transport.LinkState.none, entryState(e0));
     try std.testing.expectEqual(cluster_transport.LinkState.none, entryState(e1));
-    try std.testing.expect(e0.fd < 0 and e1.fd < 0);
+    try std.testing.expect(!e0.fd.isHeld() and !e1.fd.isHeld());
 
     pair.node0.join();
     pair.node1.join();

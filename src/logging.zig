@@ -22,7 +22,8 @@ const blog = @import("blog");
 const zigring = @import("zigring");
 const slots = @import("slots.zig");
 const config = @import("config.zig");
-const lifetime = @import("lifetime.zig");
+const resources = @import("resources.zig");
+const res_handle = @import("resources_handle.zig");
 
 pub const Logger = blog.Logger(blog.BufferPool, Sink);
 
@@ -40,7 +41,7 @@ pub const Sink = union(enum) {
     };
     const File = struct {
         sink: IouringSink,
-        fd: std.posix.fd_t,
+        fd: res_handle.OwnedFd,
     };
 
     pretty: *Pretty,
@@ -68,7 +69,7 @@ pub const Sink = union(enum) {
         }
     }
 
-    pub fn init(self: *Self, lt: *lifetime.Controller, cfg: config.Logging, ring: *lifetime.RingStuff) !void {
+    pub fn init(self: *Self, lt: *resources.Controller, cfg: config.Logging, ring: *resources.RingStuff) !void {
         switch (cfg.method) {
             .pretty => |pretty| {
                 const branch = try lt.allocator.create(Sink.Pretty);
@@ -106,7 +107,7 @@ pub const Sink = union(enum) {
                 const branch = try lt.allocator.create(Sink.File);
                 branch.* = .{
                     .sink = .{
-                        .fd = f,
+                        .fd = res_handle.borrow(&f),
                         .stream = &ring.sqstream,
                         .slots = &ring.slots,
                     },
@@ -119,7 +120,7 @@ pub const Sink = union(enum) {
         }
     }
 
-    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator, ctrl: *resources.Controller) void {
         switch (self.*) {
             .pretty => |pretty| {
                 pretty.sink.deinit();
@@ -130,7 +131,7 @@ pub const Sink = union(enum) {
                 allocator.destroy(json);
             },
             .file => |file| {
-                _ = std.os.linux.close(file.fd);
+                _ = ctrl.closeHeld(&file.fd);
                 allocator.destroy(file);
             },
         }
@@ -167,12 +168,11 @@ pub const IouringSink = struct {
 
 test "test logging" {
     var cfg: config.Config = .{ .wal = .{ .plain = .{ .dir = "wal" } } };
-    var lt: lifetime.Controller = undefined;
+    var lt: resources.Controller = undefined;
     try lt.init(std.testing.allocator, &cfg);
     defer lt.deinit();
     var logger = try lt.getInitLogger();
-    defer std.testing.allocator.destroy(logger);
-    defer logger.deinit(lt.allocator);
+    defer lt.releaseLogger(logger);
 
     logger.logger.warn("hello", .{ .reply = "world" });
 }

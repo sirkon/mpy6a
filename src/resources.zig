@@ -1,9 +1,12 @@
-//! Process lifetime: the shared state every thread of the shard is built on,
-//! and the single entry point working threads start from.
+//! Resource management: the shared state every thread of the shard is built
+//! on, and the single entry point working threads start from.
 //!
 //! `Controller` owns everything that is not thread-local: the array of rings,
 //! the array of index inboxes, the cross-thread task slots, the ring factory,
-//! the init ring and the thread handles. A working thread starts in
+//! the init ring, the thread handles and every descriptor or mapping the shard
+//! holds. Descriptor ownership transitions live on `resources_handle.zig`;
+//! this file wraps them in resource methods, so logic files acquire and
+//! release resources only through the controller. A working thread starts in
 //! `runThread`, which derives the thread's role from the rolling counter,
 //! creates the thread-local ring and logger and dispatches into `front.zig`,
 //! `index.zig` or `elephant.zig` according to that role. The role stays on the
@@ -36,6 +39,7 @@ const state = @import("state.zig");
 const replay_queue = @import("replay_queue.zig");
 const wal = @import("wal.zig");
 const cluster_transport = @import("cluster_transport.zig");
+const res_handle = @import("resources_handle.zig");
 
 /// Where one snapshot procedure's job stands, as the index thread left it.
 ///
@@ -50,9 +54,8 @@ pub const SnapshotPhase = enum { create_sent, dump_sent, close_sent, cleanup_sen
 /// Heap on the controller's allocator, freed by the terminal elephant through
 /// `Controller.releaseSnapshotJob`. `clone` is valid from the handler pass
 /// until the dump, and reading it before the clone or after the dump's arena
-/// reset is a bug. `fd` and `old_fd` are `-1` when not held: the sender of a
-/// descriptor sets its field to `-1` after handing it over, and whoever closes
-/// one does the same.
+/// reset is a bug. `fd` and `old_fd` are empty when not held: whoever hands a
+/// descriptor over empties its field, and whoever closes one does the same.
 pub const SnapshotJob = struct {
     /// Owns the clone until the dump resets it; also owns any dump bytes the
     /// elephant appends.
@@ -68,10 +71,10 @@ pub const SnapshotJob = struct {
     /// The snapshot slot, which is also the procedure's temp ring.
     k: u32,
     phase: SnapshotPhase,
-    /// The new WAL descriptor; `-1` when not held.
-    fd: posix.fd_t,
-    /// The old WAL descriptor from the swap; `-1` when not held.
-    old_fd: posix.fd_t,
+    /// The new WAL descriptor; empty when not held.
+    fd: res_handle.FileHandle = .{},
+    /// The old WAL descriptor from the swap; empty when not held.
+    old_fd: res_handle.FileHandle = .{},
     /// The new WAL path, heap on the controller's allocator.
     wal_path: [:0]u8,
     /// The snapshot path, heap on the controller's allocator.
@@ -121,14 +124,8 @@ pub const LinkTable = struct {
     pub fn deinit(self: *Self) void {
         for (self.entries) |maybe| {
             const entry = maybe orelse continue;
-            if (entry.fd >= 0) {
-                _ = std.os.linux.close(entry.fd);
-                entry.fd = -1;
-            }
-            if (entry.candidate_fd >= 0) {
-                _ = std.os.linux.close(entry.candidate_fd);
-                entry.candidate_fd = -1;
-            }
+            _ = res_handle.close(&entry.fd);
+            _ = res_handle.close(&entry.candidate_fd);
             entry.deinit();
             self.allocator.destroy(entry);
         }
@@ -181,6 +178,27 @@ fn parsePeerAddresses(cluster: config.Cluster, own: u16, addrs: [][4]u8) !void {
     }
 }
 
+/// Why the process thread left its park.
+pub const StopCause = union(enum) {
+    /// A stop signal arrived; `signo` is its number.
+    signal: u32,
+    /// An elephant requested the process stop; the value is the sender's ring
+    /// index, the operator's breadcrumb beside the elephant's own log entry.
+    process_stop: u16,
+};
+
+/// The process thread's stop plumbing: the signal mask it installed and the
+/// descriptor that turns blocked stop signals into readable events.
+///
+/// `mask` is the mask in effect before `openStopGuard`; it is restored by
+/// `closeStopGuard`, which the owner calls once every worker has stopped.
+pub const StopGuard = struct {
+    /// The mask to restore on close.
+    mask: posix.sigset_t,
+    /// The `signalfd` fed by the blocked stop signals.
+    signal_fd: res_handle.OwnedFd,
+};
+
 /// The controller that owns all shared process resources.
 pub const Controller = struct {
     const Self = @This();
@@ -199,7 +217,7 @@ pub const Controller = struct {
     /// One inbox per index thread, indexed by the index's own inbox index.
     inboxes: []IndexInbox,
 
-    /// Ring of the main lifetime controller thread.
+    /// Ring of the main controller thread.
     ring_factory: zigring.Factory,
     init_ring: RingStuff,
 
@@ -364,17 +382,17 @@ pub const Controller = struct {
         for (self.inboxes) |*inbox| inbox.deinit();
 
         // Live WAL writers outlive their index thread only in a failed
-        // shutdown; release whichever are still registered.
-        for (self.wal_writers) |maybe_writer| {
+        // shutdown; release whichever are still registered. Their thread rings
+        // are already gone, so nothing is drained here: only the descriptor is
+        // released and the object freed.
+        for (self.wal_writers, 0..) |maybe_writer, pair| {
             const writer = maybe_writer orelse continue;
-            _ = std.os.linux.close(writer.fd);
+            _ = self.closeHeld(&writer.fd);
             self.allocator.destroy(writer);
+            self.wal_writers[pair] = null;
         }
         self.allocator.free(self.wal_writers);
-        if (self.wal_battery) |bytes| {
-            wal.closeBattery(self.allocator, self.cfg.wal, bytes, std.heap.pageSize());
-            self.wal_battery = null;
-        }
+        self.releaseWalBattery();
 
         // The links are torn down before the ring array goes, and only after
         // every thread has stopped: an entry's buffers and any descriptor a
@@ -443,10 +461,7 @@ pub const Controller = struct {
         defer self.rings[ring_idx].deinit();
 
         const logger = self.getLogger(ring_idx) catch |err| fatal("logger creation", ring_idx, err);
-        defer {
-            logger.deinit(self.allocator);
-            self.allocator.destroy(logger);
-        }
+        defer self.releaseLogger(logger);
 
         switch (role) {
             // An index creates its LLQ and publishes it before reporting.
@@ -495,16 +510,24 @@ pub const Controller = struct {
     }
 
     /// Returns a logger and its buffer pool for the thread that owns the ring
-    /// at `ring_idx`. The logging stuff is owned by the caller and needs both
-    /// deinit and destroy.
+    /// at `ring_idx`. The logging stuff is owned by the caller, which releases
+    /// it with `releaseLogger`.
     pub fn getLogger(self: *Self, ring_idx: u32) !*LoggerStuff {
         return self.getLoggerWithRing(&self.rings[ring_idx]);
     }
 
-    /// Returns a logger for the initialization thread. The logging stuff is owned
-    /// by the initialization thread itself and needs both deinit and destroy.
+    /// Returns a logger for the initialization thread. The logging stuff is
+    /// owned by the initialization thread itself, which releases it with
+    /// `releaseLogger`.
     pub fn getInitLogger(self: *Self) !*LoggerStuff {
         return self.getLoggerWithRing(&self.init_ring);
+    }
+
+    /// Releases a logger built by `getLogger`/`getInitLogger`: closes its sink,
+    /// frees the pool and destroys the object.
+    pub fn releaseLogger(self: *Self, logger: *LoggerStuff) void {
+        logger.deinit(self);
+        self.allocator.destroy(logger);
     }
 
     fn getLoggerWithRing(self: *Self, ring: *RingStuff) !*LoggerStuff {
@@ -519,7 +542,7 @@ pub const Controller = struct {
         return logger;
     }
 
-    pub fn createLogFile(self: *Self, base_path: []const u8) !std.posix.fd_t {
+    pub fn createLogFile(self: *Self, base_path: []const u8) !res_handle.FileHandle {
         const allocator = self.allocator;
 
         const log_file = try std.fmt.allocPrintSentinel(allocator, "{s}.{d}.log", .{ base_path, zigring.monotonicNs() }, 0);
@@ -536,7 +559,91 @@ pub const Controller = struct {
         _ = std.os.linux.unlink(symlink_path);
         _ = std.os.linux.symlink(log_file, symlink_path);
 
-        return @intCast(fd_raw);
+        return res_handle.adopt(@intCast(fd_raw));
+    }
+
+    /// Creates the new WAL file of a snapshot procedure under its final name.
+    ///
+    /// The truncate is load-bearing: a same-tag retry would otherwise reopen a
+    /// file holding the failed attempt's flushed prefix, and that stale prefix
+    /// would survive the plain-mode walk as if it were content. One
+    /// `fdatasync` before the caller's reply makes the empty length durable.
+    pub fn openSnapshotWal(self: *Self, path: [:0]const u8) !res_handle.FileHandle {
+        _ = self;
+        const fd_raw = std.os.linux.open(path, .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .TRUNC = true,
+        }, 0o644);
+        const errno = std.os.linux.errno(fd_raw);
+        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
+        const fd: posix.fd_t = @intCast(fd_raw);
+        var held = res_handle.adopt(fd);
+
+        res_handle.syncAll(fd) catch |err| {
+            _ = res_handle.close(&held);
+            return err;
+        };
+
+        return held;
+    }
+
+    /// Writes one snapshot dump under its final name: create/truncate, write,
+    /// `fdatasync`, close. The data is durable before a refused close is
+    /// reported, so the caller's error means the bytes reached the device.
+    pub fn writeSnapshotDump(self: *Self, path: [:0]const u8, bytes: []const u8) !void {
+        _ = self;
+        const fd_raw = std.os.linux.open(path, .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .TRUNC = true,
+        }, 0o644);
+        const errno = std.os.linux.errno(fd_raw);
+        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
+
+        const fd: posix.fd_t = @intCast(fd_raw);
+        var held = res_handle.adopt(fd);
+        res_handle.writeAll(fd, bytes) catch |err| {
+            _ = res_handle.close(&held);
+            return err;
+        };
+        res_handle.syncAll(fd) catch |err| {
+            _ = res_handle.close(&held);
+            return err;
+        };
+
+        const closed = res_handle.close(&held);
+        if (closed != .SUCCESS) return std.posix.unexpectedErrno(closed);
+    }
+
+    /// Removes one file and reports the errno, so the caller decides whether
+    /// `NOENT` is success.
+    pub fn unlinkFile(self: *Self, path: [:0]const u8) std.os.linux.E {
+        _ = self;
+        return std.os.linux.errno(std.os.linux.unlink(path));
+    }
+
+    /// Reads `path` whole, raw: the snapshot's bytes before `loadIndexState`.
+    pub fn readWholeFile(self: *Self, path: []const u8) ![]u8 {
+        const path_z = try self.allocator.dupeSentinel(u8, path, 0);
+        defer self.allocator.free(path_z);
+
+        const fd_raw = std.os.linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
+        const errno = std.os.linux.errno(fd_raw);
+        if (errno != .SUCCESS) return switch (errno) {
+            .NOENT => error.FileNotFound,
+            else => std.posix.unexpectedErrno(errno),
+        };
+        const fd: posix.fd_t = @intCast(fd_raw);
+        var held = res_handle.adopt(fd);
+        defer _ = res_handle.close(&held);
+
+        const size = try res_handle.fileSize(fd);
+        const bytes = try self.allocator.alloc(u8, @intCast(size));
+        errdefer self.allocator.free(bytes);
+
+        try res_handle.readFully(fd, bytes, 0);
+        return bytes;
     }
 
     /// The battery area of pair `pair`, acquiring the whole battery on first
@@ -558,13 +665,59 @@ pub const Controller = struct {
         defer self.wal_battery_lock.unlock();
         if (self.wal_battery != null) return;
 
-        self.wal_battery = try wal.openBattery(
-            self.allocator,
-            self.cfg.wal,
-            self.wal_pairs + self.cfg.snapshots.slots,
-            self.wal_area_stride,
-            std.heap.pageSize(),
-        );
+        const areas = self.wal_pairs + self.cfg.snapshots.slots;
+        const stride = self.wal_area_stride;
+        const total = wal.batterySize(areas, stride);
+        const alignment: std.mem.Alignment =
+            .fromByteUnits(wal.areaGranule(self.cfg.wal.lba(), std.heap.pageSize()));
+
+        self.wal_battery = switch (self.cfg.wal) {
+            .plain => blk: {
+                const raw = self.allocator.rawAlloc(total, alignment, @returnAddress()) orelse
+                    return error.OutOfMemory;
+                const bytes = raw[0..total];
+                @memset(bytes, 0);
+                break :blk bytes;
+            },
+            .pmem => |pmem| blk: {
+                const path = try self.allocator.dupeSentinel(u8, pmem.device, 0);
+                defer self.allocator.free(path);
+
+                const fd_raw = std.os.linux.open(path, .{ .ACCMODE = .RDWR }, 0);
+                const open_errno = std.os.linux.errno(fd_raw);
+                if (open_errno != .SUCCESS) return std.posix.unexpectedErrno(open_errno);
+                const fd: posix.fd_t = @intCast(fd_raw);
+                defer _ = std.os.linux.close(fd);
+
+                const size = try res_handle.fileSize(fd);
+                if (size < total) return error.WalBatteryTooSmall;
+
+                break :blk try posix.mmap(
+                    null,
+                    total,
+                    .{ .READ = true, .WRITE = true },
+                    .{ .TYPE = .SHARED },
+                    fd,
+                    0,
+                );
+            },
+        };
+    }
+
+    /// Releases the battery the controller holds and forgets it. The mode the
+    /// bytes were acquired in decides the release: ordinary memory goes back to
+    /// the allocator, a PMEM mapping is unmapped.
+    fn releaseWalBattery(self: *Self) void {
+        const bytes = self.wal_battery orelse return;
+        switch (self.cfg.wal) {
+            .plain => self.allocator.rawFree(
+                bytes,
+                .fromByteUnits(wal.areaGranule(self.cfg.wal.lba(), std.heap.pageSize())),
+                @returnAddress(),
+            ),
+            .pmem => _ = std.os.linux.munmap(bytes.ptr, bytes.len),
+        }
+        self.wal_battery = null;
     }
 
     /// The battery area slot of one pair, thread-major.
@@ -611,20 +764,24 @@ pub const Controller = struct {
         defer self.allocator.free(path);
 
         const fd = try self.walOpenFile(path, true);
-        errdefer _ = std.os.linux.close(fd);
+        var opened = res_handle.adopt(fd);
+        errdefer _ = self.closeHeld(&opened);
 
         const writer = try self.allocator.create(wal.WalWriteFile);
         errdefer self.allocator.destroy(writer);
 
         writer.* = wal.WalWriteFile.init(
-            fd,
+            opened,
             wal.Area.init(area, self.cfg.wal.buffers(), self.cfg.wal.lba()),
             self.cfg.wal,
             host_idx,
             index_idx,
             tag,
         );
-        try writer.walk(try wal.fileSize(fd));
+        // The writer owns the descriptor from here on.
+        self.disownFd(&opened);
+        errdefer _ = self.closeHeld(&writer.fd);
+        try writer.walk(try res_handle.fileSize(fd));
         self.wal_writers[pair] = writer;
         return writer;
     }
@@ -655,7 +812,8 @@ pub const Controller = struct {
         fd: posix.fd_t,
     ) !*wal.WalWriteFile {
         _ = self.walPairOf(host_idx, index_idx);
-        errdefer _ = std.os.linux.close(fd);
+        var opened = res_handle.adopt(fd);
+        errdefer _ = self.closeHeld(&opened);
 
         const area = try self.walArea(wal.tempAreaIdx(slot_k, self.wal_pairs));
         wal.mintArea(area, self.cfg.wal.buffers(), self.cfg.wal.lba(), head_state, self.cfg.wal.isPmem());
@@ -664,17 +822,59 @@ pub const Controller = struct {
         errdefer self.allocator.destroy(writer);
 
         writer.* = wal.WalWriteFile.init(
-            fd,
+            opened,
             wal.Area.init(area, self.cfg.wal.buffers(), self.cfg.wal.lba()),
             self.cfg.wal,
             host_idx,
             index_idx,
             head_state,
         );
+        // The writer owns the descriptor from here on.
+        self.disownFd(&opened);
         writer.head = head_state;
 
         // `wal_writers[pair]` keeps the old writer: the caller owns this one.
         return writer;
+    }
+
+    /// Retires a writer: drains its queue, releases the descriptor and
+    /// destroys the object.
+    ///
+    /// `pair` names the registry slot to clear when this writer still occupies
+    /// it; `null` means the writer was never registered — the adopted writer of
+    /// a rollback, for instance. The close's errno was never observed here, so
+    /// it is not returned.
+    pub fn closeWalWrite(self: *Self, pair: ?usize, writer: *wal.WalWriteFile) void {
+        writer.drain();
+        _ = self.closeHeld(&writer.fd);
+        if (pair) |idx| {
+            if (self.wal_writers[idx] == writer) self.wal_writers[idx] = null;
+        }
+        self.allocator.destroy(writer);
+    }
+
+    /// Takes the retiring writer's descriptor and installs its replacement in
+    /// the pair's registry slot.
+    ///
+    /// The swap's final step: the old writer is quiet and its file becomes the
+    /// job's terminal-close subject, so its handle leaves the object rather
+    /// than being closed here.
+    pub fn retireWalWrite(
+        self: *Self,
+        pair: usize,
+        writer: *wal.WalWriteFile,
+        replacement: ?*wal.WalWriteFile,
+    ) res_handle.FileHandle {
+        const held = writer.fd;
+        self.wal_writers[pair] = replacement;
+        self.allocator.destroy(writer);
+        return held;
+    }
+
+    /// Destroys a writer object that never held a descriptor and never served:
+    /// the pre-composite unwind's half-built writer.
+    pub fn releaseWalWrite(self: *Self, writer: *wal.WalWriteFile) void {
+        self.allocator.destroy(writer);
     }
 
     /// The pair area's control line: the adoption mark's only home
@@ -1149,11 +1349,11 @@ pub const Controller = struct {
         if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
         const fd: posix.fd_t = @intCast(fd_raw);
 
-        self.writeAll(fd, out.items) catch |err| {
+        res_handle.writeAll(fd, out.items) catch |err| {
             _ = std.os.linux.close(fd);
             return err;
         };
-        self.syncAll(fd) catch |err| {
+        res_handle.syncAll(fd) catch |err| {
             _ = std.os.linux.close(fd);
             return err;
         };
@@ -1182,21 +1382,13 @@ pub const Controller = struct {
         };
         defer _ = std.os.linux.close(fd);
 
-        const size = try wal.fileSize(fd);
+        const size = try res_handle.fileSize(fd);
         if (size == 0) return try self.allocator.alloc(u8, 0);
 
         const bytes = try self.allocator.alloc(u8, @intCast(size));
         errdefer self.allocator.free(bytes);
 
-        var got: usize = 0;
-        while (got < bytes.len) {
-            const at: posix.off_t = @intCast(got);
-            const res = std.os.linux.pread(fd, bytes[got..].ptr, bytes.len - got, at);
-            const errno = std.os.linux.errno(res);
-            if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-            if (res == 0) return error.EndOfStream;
-            got += res;
-        }
+        try res_handle.readFully(fd, bytes, 0);
         return bytes;
     }
 
@@ -1215,27 +1407,6 @@ pub const Controller = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.RegistryCorrupt,
         };
-    }
-
-    /// Writes every byte of `bytes` into `fd`.
-    fn writeAll(self: *Self, fd: posix.fd_t, bytes: []const u8) !void {
-        _ = self;
-        var done: usize = 0;
-        while (done < bytes.len) {
-            const res = std.os.linux.write(fd, bytes[done..].ptr, bytes.len - done);
-            const errno = std.os.linux.errno(res);
-            if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-            if (res == 0) return error.WriteZero;
-            done += res;
-        }
-    }
-
-    /// The rewrite's one barrier: the staging file reaches the device before
-    /// the rename and the completion message.
-    fn syncAll(self: *Self, fd: posix.fd_t) !void {
-        _ = self;
-        const errno = std.os.linux.errno(std.os.linux.fdatasync(fd));
-        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
     }
 
     /// Returned when `getRingIdx` is not used properly.
@@ -1326,10 +1497,120 @@ pub const Controller = struct {
         stuff.ready = true;
     }
 
+    /// Closes a descriptor owned by the caller; `-1` is a no-op.
+    pub fn closeFd(self: *Self, fd: posix.fd_t) void {
+        _ = self;
+        if (fd >= 0) _ = std.os.linux.close(fd);
+    }
+
+    /// Closes a descriptor and reports the errno; `-1` reports success.
+    pub fn closeFdReporting(self: *Self, fd: posix.fd_t) std.os.linux.E {
+        _ = self;
+        if (fd < 0) return .SUCCESS;
+        return std.os.linux.errno(std.os.linux.close(fd));
+    }
+
+    /// Retires a descriptor through the ring so its completion is
+    /// attributable. A slot or push failure falls back to a direct close.
+    pub fn closeViaRing(self: *Self, ring: *RingStuff, task: slots.TaskCtx, fd: posix.fd_t) void {
+        _ = self;
+        if (fd < 0) return;
+        const task_idx = ring.slots.add(task) catch {
+            _ = std.os.linux.close(fd);
+            return;
+        };
+        ring.ring.pushClose(task_idx, fd, .{}) catch {
+            ring.slots.del(task_idx);
+            _ = std.os.linux.close(fd);
+        };
+    }
+
+    /// Adopts a descriptor number as an owned handle.
+    pub fn adoptFd(self: *Self, fd: posix.fd_t) res_handle.FileHandle {
+        _ = self;
+        return res_handle.adopt(fd);
+    }
+
+    /// Hands the owned descriptor to the caller; the handle empties.
+    pub fn takeFd(self: *Self, held: *res_handle.FileHandle) posix.fd_t {
+        _ = self;
+        return res_handle.take(held);
+    }
+
+    /// Drops the handle because the called method took ownership of the
+    /// number; nothing is closed here.
+    pub fn disownFd(self: *Self, held: *res_handle.FileHandle) void {
+        _ = self;
+        _ = res_handle.take(held);
+    }
+
+    /// Closes an owned handle and reports the errno; a no-op while empty.
+    pub fn closeHeld(self: *Self, held: *res_handle.FileHandle) std.os.linux.E {
+        _ = self;
+        return res_handle.close(held);
+    }
+
+    /// Reads a socket handle's number without taking ownership; valid for a
+    /// borrowed descriptor only.
+    pub fn borrowSocket(self: *Self, sock: *const res_handle.SocketHandle) posix.fd_t {
+        _ = self;
+        return res_handle.borrow(sock);
+    }
+
+    /// Adopts a socket number as an owned handle.
+    pub fn adoptSocket(self: *Self, fd: posix.fd_t) res_handle.SocketHandle {
+        _ = self;
+        return res_handle.adopt(fd);
+    }
+
+    /// Hands the owned socket to the caller; the handle empties.
+    pub fn takeSocket(self: *Self, sock: *res_handle.SocketHandle) posix.fd_t {
+        _ = self;
+        return res_handle.take(sock);
+    }
+
+    /// Drops the handle because the called method took ownership of the
+    /// number; nothing is closed here.
+    pub fn disownSocket(self: *Self, sock: *res_handle.SocketHandle) void {
+        _ = self;
+        _ = res_handle.take(sock);
+    }
+
+    /// Moves ownership between two socket handles: `dst` receives the number
+    /// and `src` empties. The caller must have released `dst` first.
+    pub fn moveSocket(self: *Self, dst: *res_handle.SocketHandle, src: *res_handle.SocketHandle) void {
+        _ = self;
+        res_handle.move(dst, src);
+    }
+
+    /// Closes an owned socket; a no-op while empty.
+    pub fn closeSocket(self: *Self, sock: *res_handle.SocketHandle) void {
+        _ = self;
+        _ = res_handle.close(sock);
+    }
+
+    /// Retires an owned socket through the ring so its completion is
+    /// attributable; the handle empties and a slot or push failure falls back
+    /// to a direct close.
+    pub fn closeSocketViaRing(
+        self: *Self,
+        ring: *RingStuff,
+        task: slots.TaskCtx,
+        sock: *res_handle.SocketHandle,
+    ) void {
+        self.closeViaRing(ring, task, self.takeSocket(sock));
+    }
+
+    /// Opens a non-blocking client socket for a peer dial.
+    pub fn dialTcp(self: *Self) !res_handle.SocketHandle {
+        _ = self;
+        return res_handle.adopt(try zigring.createTCPClientSocket(null));
+    }
+
     /// Creates, binds and listens on the server socket described by the
     /// config. The descriptor is owned by the controller's process thread and
     /// is shared with all fronts through `START_WORK`.
-    pub fn createServerSocket(self: *Self) !std.posix.fd_t {
+    pub fn createServerSocket(self: *Self) !res_handle.SocketHandle {
         return self.createListener(self.cfg.bind, self.cfg.port);
     }
 
@@ -1337,13 +1618,13 @@ pub const Controller = struct {
     /// which exists exactly when the replication group spans more than one
     /// host. The descriptor is owned by the process thread too and is handed
     /// to the fronts through a `PeerServerSocket` slot before `START_WORK`.
-    pub fn createPeerServerSocket(self: *Self) !std.posix.fd_t {
+    pub fn createPeerServerSocket(self: *Self) !res_handle.SocketHandle {
         const cluster = self.cfg.cluster orelse return error.NoCluster;
         return self.createListener(self.cfg.bind, cluster.peer_port);
     }
 
     /// Binds `bind:port` and listens with the configured backlog.
-    fn createListener(self: *Self, bind: []const u8, port: u16) !std.posix.fd_t {
+    fn createListener(self: *Self, bind: []const u8, port: u16) !res_handle.SocketHandle {
         const cfg = self.cfg;
 
         // The config names an IPv4 endpoint; `localhost` is accepted as the
@@ -1372,7 +1653,84 @@ pub const Controller = struct {
             return posix.unexpectedErrno(std.os.linux.errno(listen_res));
         }
 
-        return fd;
+        return res_handle.adopt(fd);
+    }
+
+    /// Blocks the stop signals in the calling thread, saves the mask in effect
+    /// and creates the descriptor that reports them. The process thread calls
+    /// this before any worker starts: pthreads inherit the mask, so no worker
+    /// can swallow one.
+    pub fn openStopGuard(self: *Self) !StopGuard {
+        _ = self;
+        var mask = posix.sigemptyset();
+        posix.sigaddset(&mask, posix.SIG.INT);
+        posix.sigaddset(&mask, posix.SIG.TERM);
+        posix.sigaddset(&mask, posix.SIG.HUP);
+
+        var previous: posix.sigset_t = undefined;
+        posix.sigprocmask(posix.SIG.BLOCK, &mask, &previous);
+
+        const fd = posix.signalfd(-1, &mask, std.os.linux.SFD.CLOEXEC) catch |err| {
+            posix.sigprocmask(posix.SIG.SETMASK, &previous, null);
+            return err;
+        };
+        return .{ .mask = previous, .signal_fd = res_handle.adopt(fd) };
+    }
+
+    /// Blocks until a stop cause arrives on the guard's signal descriptor or
+    /// the init ring (designs/SNAPSHOTS.md §2.4). The park does not spin:
+    /// `poll` sleeps on both descriptors; that readiness read is use, the
+    /// descriptor itself is owned by the guard.
+    ///
+    /// The init ring is idle after `waitForInitialized`, so its only expected
+    /// completion is `ProcessStopRequestIdx`; anything else is dropped with a
+    /// log line rather than trusted.
+    pub fn awaitStopCause(self: *Self, guard: *const StopGuard, ring: *RingStuff) !StopCause {
+        _ = self;
+        const signal_fd = res_handle.borrow(&guard.signal_fd);
+        var fds = [2]posix.pollfd{
+            // The signal descriptor first: a stop signal outranks a stop request.
+            .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = ring.ring.fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+
+        while (true) {
+            _ = try posix.poll(&fds, -1);
+
+            // A broken descriptor would make `poll` return at once forever.
+            const broken = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
+            if (fds[0].revents & broken != 0) return error.SignalFdClosed;
+            if (fds[1].revents & broken != 0) return error.InitRingClosed;
+
+            if (fds[0].revents & posix.POLL.IN != 0) {
+                var info: std.os.linux.signalfd_siginfo = undefined;
+                const n = try posix.read(signal_fd, std.mem.asBytes(&info));
+                if (n != @sizeOf(std.os.linux.signalfd_siginfo)) return error.SignalReadShort;
+                return .{ .signal = info.signo };
+            }
+
+            if (fds[1].revents & posix.POLL.IN != 0) {
+                while (ring.ring.popCQE()) |cqe| {
+                    const task_idx = cqe.taskIdx();
+                    if (task_idx == messages.ProcessStopRequestIdx) {
+                        if (cqe.res < 0 or cqe.res > std.math.maxInt(u16)) {
+                            std.debug.print("process-stop request has an invalid sender: {d}\n", .{cqe.res});
+                            continue;
+                        }
+                        return .{ .process_stop = @intCast(cqe.res) };
+                    }
+                    std.debug.print("dropping unexpected init-ring completion {d}\n", .{task_idx});
+                }
+            }
+        }
+    }
+
+    /// Closes the guard's descriptor and restores the mask that was in effect
+    /// before `openStopGuard`.
+    pub fn closeStopGuard(self: *Self, guard: *StopGuard) void {
+        _ = self;
+        _ = res_handle.close(&guard.signal_fd);
+        posix.sigprocmask(posix.SIG.SETMASK, &guard.mask, null);
     }
 
     /// Initializes an input inbox for the given index thread. The producer ring
@@ -1773,8 +2131,6 @@ pub const Controller = struct {
             .tag = tag,
             .k = k,
             .phase = .create_sent,
-            .fd = -1,
-            .old_fd = -1,
             .wal_path = wal_path,
             .snapshot_path = snapshot_path,
         };
@@ -2053,9 +2409,9 @@ pub const LoggerStuff = struct {
     sink: logging.Sink,
     logger: logging.Logger,
 
-    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Self, ctrl: *Controller) void {
         self.logger.deinit();
-        self.sink.deinit(allocator);
+        self.sink.deinit(ctrl.allocator, ctrl);
         self.pool.deinit();
     }
 };
@@ -2304,7 +2660,7 @@ test "a link entry is allocated on the first promotion only" {
     try std.testing.expectEqual(cluster_transport.LinkState.none, entry.state);
     try std.testing.expectEqual(@as(u8, 2), entry.host_idx);
     try std.testing.expectEqual(@as(u16, 0), entry.index_idx);
-    try std.testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
+    try std.testing.expect(!entry.fd.isHeld());
     try std.testing.expectEqual(@as(u16, cfg.cluster.?.inflight_frames), entry.inflight);
     try std.testing.expect(first_table.get(2) == entry);
 
@@ -2328,7 +2684,7 @@ test "deinit releases a link entry's buffers and closes a held descriptor" {
     const pipe_res = std.os.linux.pipe(&fds);
     try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pipe_res));
     defer _ = std.os.linux.close(fds[1]);
-    entry.fd = fds[0];
+    entry.fd = res_handle.adopt(fds[0]);
 
     // A failed shutdown leaves a link's descriptor open; the controller
     // releases it after the threads have stopped.
@@ -2342,8 +2698,9 @@ test "the peer listener binds the cluster's peer port" {
     try ctrl.init(std.testing.allocator, &cfg);
     defer ctrl.deinit();
 
-    const fd = try ctrl.createPeerServerSocket();
-    defer _ = std.os.linux.close(fd);
+    var listener = try ctrl.createPeerServerSocket();
+    defer ctrl.closeSocket(&listener);
+    const fd = ctrl.borrowSocket(&listener);
 
     // The bind and listen succeeded: the descriptor answers a local connect.
     var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = 0 };
@@ -3015,7 +3372,7 @@ test "adoption leaves the old writer open on the pair and writes on its temp rin
     const opened = try fixture.create(0, 0, 0x60);
     _ = std.os.linux.close(opened);
     const old = try fixture.ctrl.walOpenWrite(0, 0, 0x60);
-    const old_fd = old.fd;
+    const old_fd = res_handle.borrow(&old.fd);
 
     // The snapshot procedure's adopt: the elephant handed the new descriptor
     // over, and the window's writer runs on temp ring 0. The old writer is not
@@ -3045,8 +3402,7 @@ test "adoption leaves the old writer open on the pair and writes on its temp rin
     try std.testing.expectError(error.WalOpen, fixture.ctrl.walOpenWrite(0, 0, 0x61));
 
     // The window's writer is the caller's: nothing else releases it.
-    _ = std.os.linux.close(writer.fd);
-    fixture.ctrl.allocator.destroy(writer);
+    fixture.ctrl.closeWalWrite(null, writer);
 }
 
 test "adoption publishes the temp ring's ordinal-0 terminator from the clone state" {
@@ -3084,10 +3440,8 @@ test "adoption publishes the temp ring's ordinal-0 terminator from the clone sta
     try std.testing.expectEqual(@as(u128, 0x40), at_append.last_state);
 
     // Both writers are the caller's: nothing else releases them.
-    _ = std.os.linux.close(writer.fd);
-    fixture.ctrl.allocator.destroy(writer);
-    _ = std.os.linux.close(fresh.fd);
-    fixture.ctrl.allocator.destroy(fresh);
+    fixture.ctrl.closeWalWrite(null, writer);
+    fixture.ctrl.closeWalWrite(null, fresh);
 }
 
 test "the battery is one zeroed plain area per pair and per temp ring" {
@@ -3301,7 +3655,7 @@ fn readRawFile(path: []const u8) ![]u8 {
     const fd: posix.fd_t = @intCast(fd_raw);
     defer _ = std.os.linux.close(fd);
 
-    const size = try wal.fileSize(fd);
+    const size = try res_handle.fileSize(fd);
     const bytes = try std.testing.allocator.alloc(u8, @intCast(size));
     errdefer std.testing.allocator.free(bytes);
 
@@ -3631,8 +3985,8 @@ test "mint renders the pinned names and the teardown releases the job" {
     try std.testing.expectEqual(tag, job.tag);
     try std.testing.expectEqual(@as(u32, 3), job.k);
     try std.testing.expectEqual(SnapshotPhase.create_sent, job.phase);
-    try std.testing.expectEqual(@as(posix.fd_t, -1), job.fd);
-    try std.testing.expectEqual(@as(posix.fd_t, -1), job.old_fd);
+    try std.testing.expect(!job.fd.isHeld());
+    try std.testing.expect(!job.old_fd.isHeld());
 
     // Both names live under the originating index's directory and carry the
     // pair's identity with the tag, zero-padded to 32 lowercase hex digits.
@@ -4184,7 +4538,7 @@ const FileSink = struct {
         var done: usize = 0;
         while (done < data.len) {
             const at = base + @as(posix.off_t, @intCast(done));
-            const res = std.os.linux.pwrite(writer.fd, data[done..].ptr, data.len - done, at);
+            const res = std.os.linux.pwrite(res_handle.borrow(&writer.fd), data[done..].ptr, data.len - done, at);
             const errno = std.os.linux.errno(res);
             if (errno != .SUCCESS) {
                 writer.fault(errno);
@@ -4247,8 +4601,7 @@ test "the bring-tail recovers the inter-write cut's surplus record" {
     try new.write(13, new.head, &op13);
 
     // The crash: the new writer dies, the mark survives, the process goes.
-    _ = std.os.linux.close(new.fd);
-    f.ctrl.allocator.destroy(new);
+    f.ctrl.closeWalWrite(null, new);
     try f.reopen();
 
     const adoption = try f.ctrl.runAdoptionRule(0, 0);
@@ -4323,8 +4676,7 @@ test "the bring-tail's empty delivery is a no-op" {
     const new = try f.ctrl.walAdoptWrite(0, 0, 0, y, try pmemCreateFile(&f, 0, 0, x));
     FileSink.install(new);
     try f.ctrl.publishAdoptionMark(0, 0, 0, x);
-    _ = std.os.linux.close(new.fd);
-    f.ctrl.allocator.destroy(new);
+    f.ctrl.closeWalWrite(null, new);
     try f.reopen();
 
     const adoption = try f.ctrl.runAdoptionRule(0, 0);
@@ -4332,7 +4684,7 @@ test "the bring-tail's empty delivery is a no-op" {
 
     const reopened = try f.ctrl.walOpenWrite(0, 0, old_tag);
     FileSink.install(reopened);
-    const size_before = try wal.fileSize(reopened.fd);
+    const size_before = try res_handle.fileSize(res_handle.borrow(&reopened.fd));
     try std.testing.expectEqual(@as(u128, 10), reopened.head);
 
     var tail = Controller.TailSink.init(std.testing.allocator);
@@ -4341,9 +4693,182 @@ test "the bring-tail's empty delivery is a no-op" {
 
     try std.testing.expectEqual(@as(usize, 0), tail.records.items.len);
     try std.testing.expectEqual(@as(u128, 10), reopened.head);
-    try std.testing.expectEqual(size_before, try wal.fileSize(reopened.fd));
+    try std.testing.expectEqual(size_before, try res_handle.fileSize(res_handle.borrow(&reopened.fd)));
 
     // And the writer still serves.
     var op11 = tailOp(11);
     try reopened.write(11, reopened.head, &op11);
+}
+
+// The ownership guard (designs/refactor-lifetime-controller.md §M7). Logic
+// files may use descriptors but never acquire, release or commit them: that
+// is the controller's job. The guard reads the sources themselves, so a new
+// call site cannot slip in under review. It scans up to the first line
+// beginning with `test `, below which the fixtures stand in for the OS and
+// may call whatever they need.
+
+/// Every logic file under the guard, with its source embedded at compile time.
+/// `@embedFile` resolves against `src/`, the directory of this file, and
+/// `build.zig` compiles each of these files separately, so none is optional.
+const watched_sources = [_]struct { name: []const u8, text: []const u8 }{
+    .{ .name = "front.zig", .text = @embedFile("front.zig") },
+    .{ .name = "index.zig", .text = @embedFile("index.zig") },
+    .{ .name = "snapshot.zig", .text = @embedFile("snapshot.zig") },
+    .{ .name = "wal.zig", .text = @embedFile("wal.zig") },
+    .{ .name = "logging.zig", .text = @embedFile("logging.zig") },
+    .{ .name = "elephant.zig", .text = @embedFile("elephant.zig") },
+    .{ .name = "main.zig", .text = @embedFile("main.zig") },
+    .{ .name = "cluster_transport.zig", .text = @embedFile("cluster_transport.zig") },
+};
+
+/// Acquire, release and commit calls that belong to this file. Using a
+/// descriptor (`read`, `write`, `pread`, `pwrite`, `statx`, `getpeername`,
+/// `poll`) and submitting it to the ring stay in the logic; opening, closing,
+/// mapping, unlinking, binding and syncing move here.
+const forbidden_calls = [_][]const u8{
+    "std.os.linux.open",
+    "std.os.linux.close",
+    "std.os.linux.mmap",
+    "std.os.linux.munmap",
+    "std.os.linux.unlink",
+    "std.os.linux.rename",
+    "std.os.linux.mkdir",
+    "std.os.linux.socket",
+    "std.os.linux.bind",
+    "std.os.linux.listen",
+    "std.os.linux.signalfd",
+    "std.os.linux.symlink",
+    "std.os.linux.socketpair",
+    "std.os.linux.fdatasync",
+    "std.os.linux.fsync",
+    "posix.open",
+    "posix.close",
+    "posix.mmap",
+    "posix.munmap",
+    "posix.unlink",
+    "posix.rename",
+    "posix.mkdir",
+    "posix.socket",
+    "posix.bind",
+    "posix.listen",
+    "posix.signalfd",
+    "zigring.createTCPClientSocket",
+    "zigring.createServerSocket",
+    "zigring.createPeerServerSocket",
+    "zigring.pushClose",
+};
+
+/// An object that owns a descriptor and has to die through the controller.
+const OwnedDestroy = struct {
+    victim: []const u8,
+    spelled: []const u8,
+};
+
+const owned_destroys = [_]OwnedDestroy{
+    .{ .victim = "old_writer", .spelled = "allocator.destroy(old_writer)" },
+    .{ .victim = "new_writer", .spelled = "allocator.destroy(new_writer)" },
+    .{ .victim = "logger", .spelled = "allocator.destroy(logger)" },
+    .{ .victim = "job", .spelled = "allocator.destroy(job)" },
+};
+
+/// A source line the guard refused.
+const GuardHit = struct {
+    line: usize,
+    token: []const u8,
+};
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// True when `line` carries `token` at `at` as a whole name, so `posix.open`
+/// does not match `posix.openat` and `std.os.linux.socket` does not match
+/// `std.os.linux.socketpair`.
+fn tokenAt(line: []const u8, at: usize, token: []const u8) bool {
+    if (at + token.len > line.len) return false;
+    if (!std.mem.eql(u8, line[at .. at + token.len], token)) return false;
+    if (at > 0 and isIdentByte(line[at - 1])) return false;
+    const end = at + token.len;
+    if (end < line.len and isIdentByte(line[end])) return false;
+    return true;
+}
+
+fn holdsToken(line: []const u8, token: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, token)) |at| {
+        if (tokenAt(line, at, token)) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
+/// The destruction of an owning object on the line, if any. The argument may
+/// be padded with spaces, but it has to be one of the watched names, not a
+/// longer identifier that merely starts with one.
+fn destroyedOwner(line: []const u8) ?[]const u8 {
+    const call = "allocator.destroy(";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, call)) |at| {
+        const arg = std.mem.trimStart(u8, line[at + call.len ..], " \t");
+        for (owned_destroys) |entry| {
+            if (!std.mem.startsWith(u8, arg, entry.victim)) continue;
+            const tail = std.mem.trimStart(u8, arg[entry.victim.len..], " \t");
+            if (tail.len > 0 and tail[0] == ')') return entry.spelled;
+        }
+        from = at + 1;
+    }
+    return null;
+}
+
+/// The first forbidden operation above the first `test ` line, if any.
+fn firstForbidden(text: []const u8) ?GuardHit {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var number: usize = 0;
+    while (lines.next()) |line| {
+        number += 1;
+        if (std.mem.startsWith(u8, line, "test ")) return null;
+        for (forbidden_calls) |token| {
+            if (holdsToken(line, token)) return .{ .line = number, .token = token };
+        }
+        if (destroyedOwner(line)) |spelled| return .{ .line = number, .token = spelled };
+    }
+    return null;
+}
+
+test "logic files reach resource management only through the controller" {
+    for (watched_sources) |source| {
+        const hit = firstForbidden(source.text) orelse continue;
+        std.debug.print(
+            "{s}:{d}: `{s}` above the first `test ` line; acquire and release belong to resources.zig " ++
+                "(designs/refactor-lifetime-controller.md §M7)\n",
+            .{ source.name, hit.line, hit.token },
+        );
+        return error.ResourceManagementOutsideController;
+    }
+}
+
+test "the guard tells a forbidden call from its neighbours and from fixtures" {
+    const testing = std.testing;
+
+    try testing.expect(firstForbidden("const fd = try std.os.linux.open(path, .{}, 0);\n") != null);
+    try testing.expect(firstForbidden("_ = std.os.linux.close(fd);\n") != null);
+    try testing.expect(firstForbidden("const s = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);\n") != null);
+    try testing.expect(firstForbidden("const sock = try zigring.createTCPClientSocket();\n") != null);
+    try testing.expect(firstForbidden("zigring.pushClose(&ring.sqstream, task, fd);\n") != null);
+    try testing.expect(firstForbidden("self.allocator.destroy(job);\n") != null);
+    try testing.expect(firstForbidden("self.allocator.destroy( job );\n") != null);
+
+    // Below the first `test ` line the OS stand-ins have their rights.
+    try testing.expect(firstForbidden("test \"x\" {\n    _ = std.os.linux.close(fd);\n}\n") == null);
+
+    // Neighbours that only share a prefix are not the forbidden calls.
+    try testing.expect(firstForbidden("const fd = try posix.openat(dir, name, .{}, 0);\n") == null);
+    try testing.expect(firstForbidden("ctx.ctrl.closeFd(fd);\n") == null);
+    try testing.expect(firstForbidden("_ = ctrl.closeHeld(&pair.fd);\n") == null);
+    try testing.expect(firstForbidden("self.allocator.destroy(jobs);\n") == null);
+
+    // A hit reports the line and the name it found.
+    const hit = firstForbidden("// setup\nconst fd = try std.os.linux.openat(path);\n_ = posix.close(fd);\n").?;
+    try testing.expectEqual(@as(usize, 3), hit.line);
+    try testing.expectEqualStrings("posix.close", hit.token);
 }

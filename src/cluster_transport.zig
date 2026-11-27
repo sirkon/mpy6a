@@ -11,6 +11,7 @@ const std = @import("std");
 const posix = std.posix;
 const blog = @import("blog");
 const reorder_buffer = @import("reorder_buffer.zig");
+const res_handle = @import("resources_handle.zig");
 
 /// Bumped on any incompatible change of the greet or the frame layout.
 pub const VERSION: u16 = 1;
@@ -168,8 +169,8 @@ pub const LinkState = enum(u8) { none, greeting, parked, up };
 ///
 /// The entry is allocated on the first promotion of the link and lives until
 /// the controller is torn down; a connection replacement resets it instead of
-/// reallocating. `fd` is `-1` when the entry holds no socket, and whichever
-/// side closes a descriptor clears the field.
+/// reallocating. `fd` is empty when the entry holds no socket, and whichever
+/// side closes a descriptor clears the handle.
 pub const LinkEntry = struct {
     const Self = @This();
 
@@ -187,8 +188,8 @@ pub const LinkEntry = struct {
     /// completion is attributable and ignorable.
     epoch: u32 = 0,
 
-    /// The socket, `-1` when none is held.
-    fd: posix.fd_t = -1,
+    /// The socket; empty when none is held.
+    fd: res_handle.SocketHandle = .{},
     /// The version the greet or the reply carried; the local one until then.
     version: u16 = VERSION,
 
@@ -244,7 +245,7 @@ pub const LinkEntry = struct {
     /// the established link to resolve. `candidate_state` is `.parked` while
     /// the probe runs and `.greeting` while the candidate's verdict is in
     /// flight; the socket stays in `candidate_fd` until that send closes it.
-    candidate_fd: posix.fd_t = -1,
+    candidate_fd: res_handle.SocketHandle = .{},
     candidate_version: u16 = VERSION,
     candidate_state: LinkState = .none,
     /// The candidate's seven-byte verdict, kept here because the kernel reads
@@ -1916,7 +1917,7 @@ test "a link entry owns its reorder window and its bounded send ring" {
     try expectEqual(@as(u16, 3), entry.index_idx);
     try expectEqual(LinkState.none, entry.state);
     try expectEqual(@as(u32, 0), entry.epoch);
-    try expectEqual(@as(posix.fd_t, -1), entry.fd);
+    try expect(!entry.fd.isHeld());
     try expectEqual(VERSION, entry.version);
 
     // The window is `cluster.reorder_window` slots, `2 * window` backing slots
@@ -1948,7 +1949,7 @@ test "a connection reset clears the counters, the reservation and the task map" 
     defer entry.deinit();
 
     entry.state = .up;
-    entry.fd = 7;
+    entry.fd = res_handle.adopt(7);
     entry.seq_abs = 9;
     entry.pushed_absolute = 5;
     entry.delivered = 2;
@@ -1986,7 +1987,7 @@ test "a connection reset clears the counters, the reservation and the task map" 
     try expectEqual(@as(u64, 0), entry.reorder.wave);
 
     // The descriptor and the state are the caller's, not the reset's.
-    try expectEqual(@as(posix.fd_t, 7), entry.fd);
+    try expectEqual(@as(posix.fd_t, 7), res_handle.borrow(&entry.fd));
     try expectEqual(LinkState.up, entry.state);
 }
 test "every consensus payload round-trips" {

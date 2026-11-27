@@ -4,7 +4,7 @@
 //! reserved values can collide with the ones the `Slots` allocators hand out.
 //!
 //! Nothing here does any work. It only fixes the numbers and the types that
-//! `front.zig`, `index.zig`, `elephant.zig`, `lifetime.zig` and `main.zig`
+//! `front.zig`, `index.zig`, `elephant.zig`, `resources.zig` and `main.zig`
 //! agree on, so the handshake and the shutdown choreography can be read as one
 //! protocol.
 //!

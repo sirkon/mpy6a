@@ -1,14 +1,15 @@
 //! Index thread: consensus-side worker and child of one front.
 //!
 //! An index owns one `IndexInbox` (its LLQ) and one io_uring ring. Phase A
-//! (ring, inbox, `INITIALIZED`) is handled by `lifetime.Controller.runThread`;
+//! (ring, inbox, `INITIALIZED`) is handled by `resources.Controller.runThread`;
 //! this file owns everything after that: the service loop, routing of accepted
 //! sessions and the shutdown choreography from docs/startup-en-reworked.md.
 
 const std = @import("std");
 const posix = std.posix;
 const zigring = @import("zigring");
-const lifetime = @import("lifetime.zig");
+const resources = @import("resources.zig");
+const res_handle = @import("resources_handle.zig");
 const config = @import("config.zig");
 const idxinbox = @import("index_inbox.zig");
 const messages = @import("messages.zig");
@@ -43,10 +44,10 @@ const LoopConfig = idxinbox.LoopConfig;
 /// and the snapshot dispatch share. It lives in `run`'s frame; tests drive the
 /// same functions with synthetic states.
 const Frame = struct {
-    ctrl: *lifetime.Controller,
-    ring: *lifetime.RingStuff,
+    ctrl: *resources.Controller,
+    ring: *resources.RingStuff,
     front_ring: *zigring.Ring,
-    logger: *lifetime.LoggerStuff,
+    logger: *resources.LoggerStuff,
     ring_idx: u16,
     /// The index's own number: the `index_idx` of every pair it hosts.
     index_idx: u16,
@@ -74,7 +75,7 @@ const Frame = struct {
 /// Runs the index thread to completion. `role` is the role the thread derived
 /// from its `ring_idx` before reporting `INITIALIZED`; the service loop ends
 /// when a shutdown demand has been satisfied.
-pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.LoggerStuff) void {
+pub fn run(ctrl: *resources.Controller, role: resources.Role, logger: *resources.LoggerStuff) void {
     const ring = &ctrl.rings[role.index.ring_idx];
     const inbox = &ctrl.inboxes[role.index.inbox_idx];
     const front_ring = &ctrl.rings[role.index.front_idx].ring;
@@ -190,19 +191,23 @@ pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.Lo
                 // A stopped thread takes no front work at all: the session is
                 // refused by closing its descriptor at once, the skeleton's own
                 // shape. The refusal's wire form is the consensus design's.
+                var accepted = frame.ctrl.adoptSocket(create.fd);
                 if (frame.snap.serve != .serving) {
                     log.warn("index refused a session: the WAL stopped this thread", .{
                         .ring_idx = role.index.ring_idx,
-                        .fd = create.fd,
+                        .fd = frame.ctrl.borrowSocket(&accepted),
                         .wal_serve = @tagName(frame.snap.serve),
                     });
-                    _ = std.os.linux.close(create.fd);
+                    frame.ctrl.closeSocket(&accepted);
                     continue;
                 }
                 // The skeleton owns no session state yet: take ownership of the
                 // descriptor, log it, and close it again.
-                log.info("index received session", .{ .ring_idx = role.index.ring_idx, .fd = create.fd });
-                _ = std.os.linux.close(create.fd);
+                log.info("index received session", .{
+                    .ring_idx = role.index.ring_idx,
+                    .fd = frame.ctrl.borrowSocket(&accepted),
+                });
+                frame.ctrl.closeSocket(&accepted);
             },
             .session_op => {
                 // Refused before a WAL is ever reached (§3.5). A frozen window
@@ -368,7 +373,7 @@ fn stepCQE(frame: *Frame, cqe: zigring.CQE) void {
 }
 
 /// The link table of this index thread, or null when the transport is dark.
-fn linkTable(frame: *Frame) ?*lifetime.LinkTable {
+fn linkTable(frame: *Frame) ?*resources.LinkTable {
     if (frame.ctrl.cfg.cluster == null) return null;
     if (frame.index_idx >= frame.ctrl.link_tables.len) return null;
     return &frame.ctrl.link_tables[frame.index_idx];
@@ -379,10 +384,6 @@ fn linkTable(frame: *Frame) ?*lifetime.LinkTable {
 fn linkEntry(frame: *Frame, host_idx: u8) ?*cluster_transport.LinkEntry {
     const table = linkTable(frame) orelse return null;
     return table.get(host_idx);
-}
-
-fn closeFd(fd: posix.fd_t) void {
-    if (fd >= 0) _ = std.os.linux.close(fd);
 }
 
 fn setDeadlineSpec(spec: *std.os.linux.kernel_timespec, ns: i64) void {
@@ -426,14 +427,14 @@ fn startDial(frame: *Frame, host_idx: u8) void {
         });
         return;
     };
-    if (entry.state != .none or entry.fd >= 0) return;
+    if (entry.state != .none or entry.fd.isHeld()) return;
 
     entry.epoch +%= 1;
     entry.retry_pending = false;
     entry.verdict_filled = 0;
     entry.state = .greeting;
 
-    const fd = zigring.createTCPClientSocket(null) catch |err| {
+    entry.fd = frame.ctrl.dialTcp() catch |err| {
         entry.state = .none;
         frame.logger.logger.warn("peer dial socket failed", .{
             .ring_idx = frame.ring_idx,
@@ -443,7 +444,7 @@ fn startDial(frame: *Frame, host_idx: u8) void {
         armRetry(frame, entry);
         return;
     };
-    entry.fd = fd;
+    const fd = frame.ctrl.borrowSocket(&entry.fd);
 
     setDeadlineSpec(&entry.connect_deadline_spec, cluster.handshake_timeout.value());
     const deadline_idx = frame.ring.slots.add(.{ .connect_deadline = .{
@@ -572,7 +573,7 @@ fn onConnect(
     if (entry.connect_task != cqe.taskIdx()) return;
     entry.connect_task = null;
     if (entry.epoch != epoch) return;
-    if (entry.state != .greeting or entry.fd < 0) return;
+    if (entry.state != .greeting or !entry.fd.isHeld()) return;
 
     cancelTask(frame, entry.connect_deadline_task);
     entry.connect_deadline_task = null;
@@ -596,7 +597,7 @@ fn onConnect(
         return;
     };
     entry.greet_task = task_idx;
-    frame.ring.ring.pushSend(entry.fd, task_idx, &entry.greet, cluster_transport.GREET_LEN, .{}) catch |err| {
+    frame.ring.ring.pushSend(frame.ctrl.borrowSocket(&entry.fd), task_idx, &entry.greet, cluster_transport.GREET_LEN, .{}) catch |err| {
         frame.ring.slots.del(task_idx);
         entry.greet_task = null;
         failDial(frame, entry, @errorName(err));
@@ -630,7 +631,7 @@ fn onGreetSend(
     if (entry.greet_task != cqe.taskIdx()) return;
     entry.greet_task = null;
     if (entry.epoch != epoch) return;
-    if (entry.state != .greeting or entry.fd < 0) return;
+    if (entry.state != .greeting or !entry.fd.isHeld()) return;
 
     if (cqe.res != cluster_transport.GREET_LEN) {
         failDial(frame, entry, "greet send failed");
@@ -648,7 +649,7 @@ fn onGreetSend(
         return;
     };
     entry.verdict_task = read_idx;
-    frame.ring.ring.pushRecv(entry.fd, read_idx, entry.reply[0..cluster_transport.REPLY_LEN], .{}) catch |err| {
+    frame.ring.ring.pushRecv(frame.ctrl.borrowSocket(&entry.fd), read_idx, entry.reply[0..cluster_transport.REPLY_LEN], .{}) catch |err| {
         frame.ring.slots.del(read_idx);
         entry.verdict_task = null;
         failDial(frame, entry, @errorName(err));
@@ -681,7 +682,7 @@ fn onVerdictRead(
     if (entry.verdict_task != cqe.taskIdx()) return;
     entry.verdict_task = null;
     if (entry.epoch != epoch) return;
-    if (entry.state != .greeting or entry.fd < 0) return;
+    if (entry.state != .greeting or !entry.fd.isHeld()) return;
 
     if (cqe.res < 0) {
         failDial(frame, entry, "verdict read failed");
@@ -702,7 +703,7 @@ fn onVerdictRead(
             return;
         };
         entry.verdict_task = read_idx;
-        frame.ring.ring.pushRecv(entry.fd, read_idx, entry.reply[entry.verdict_filled..], .{}) catch |err| {
+        frame.ring.ring.pushRecv(frame.ctrl.borrowSocket(&entry.fd), read_idx, entry.reply[entry.verdict_filled..], .{}) catch |err| {
             frame.ring.slots.del(read_idx);
             entry.verdict_task = null;
             failDial(frame, entry, @errorName(err));
@@ -788,13 +789,14 @@ fn onRetryTimer(
     if (entry.retry_task != cqe.taskIdx()) return;
     entry.retry_task = null;
     if (entry.epoch != epoch) return;
-    if (entry.state != .none or entry.fd >= 0) return;
+    if (entry.state != .none or entry.fd.isHeld()) return;
     startDial(frame, entry.host_idx);
 }
 
 /// The front handed a promoted peer socket over (§3.2). The index re-validates
 /// what it was told and answers with the seven-byte greeting (§3.3).
 fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink")) void {
+    var accepted = frame.ctrl.adoptSocket(link.fd);
     // §3.7: a hand-over that raced the drain is closed at once, never greeted,
     // so the final drain cannot install a link after every link was closed.
     if (frame.links_closed) {
@@ -802,12 +804,12 @@ fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink"))
             .ring_idx = frame.ring_idx,
             .host_idx = link.host_idx,
         });
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(&accepted);
         return;
     }
     const cfg = frame.ctrl.cfg;
     const table = linkTable(frame) orelse {
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(&accepted);
         return;
     };
     const own_host: u8 = @intCast(cfg.host_index);
@@ -821,9 +823,9 @@ fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink"))
             .version = link.version,
         });
         if (host_valid) {
-            rejectLink(frame, table, link, .version_mismatch);
+            rejectLink(frame, table, link, &accepted, .version_mismatch);
         } else {
-            closeFd(link.fd);
+            frame.ctrl.closeSocket(&accepted);
         }
         return;
     }
@@ -832,11 +834,11 @@ fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink"))
             .ring_idx = frame.ring_idx,
             .host_idx = link.host_idx,
         });
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(&accepted);
         return;
     }
     if (!link.source_ok) {
-        rejectLink(frame, table, link, .peer_address_mismatch);
+        rejectLink(frame, table, link, &accepted, .peer_address_mismatch);
         return;
     }
     if (link.index_idx != frame.index_idx) {
@@ -844,7 +846,7 @@ fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink"))
             .ring_idx = frame.ring_idx,
             .index_idx = link.index_idx,
         });
-        rejectLink(frame, table, link, .unknown_index);
+        rejectLink(frame, table, link, &accepted, .unknown_index);
         return;
     }
     if (frame.snap.serve != .serving or frame.soft_draining) {
@@ -852,11 +854,11 @@ fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink"))
             .ring_idx = frame.ring_idx,
             .host_idx = link.host_idx,
         });
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(&accepted);
         return;
     }
 
-    acceptLink(frame, table, link);
+    acceptLink(frame, table, link, &accepted);
 }
 
 /// A candidate that failed a check is answered with the failing verdict and
@@ -864,8 +866,9 @@ fn onPeerLink(frame: *Frame, link: @FieldType(cross_task.CrossTask, "PeerLink"))
 /// way: only a candidate that passed every check earns the switch predicate.
 fn rejectLink(
     frame: *Frame,
-    table: *lifetime.LinkTable,
+    table: *resources.LinkTable,
     link: @FieldType(cross_task.CrossTask, "PeerLink"),
+    accepted: *res_handle.SocketHandle,
     verdict: cluster_transport.Verdict,
 ) void {
     const entry = table.acquire(link.host_idx, frame.index_idx) catch |err| {
@@ -874,7 +877,7 @@ fn rejectLink(
             .host_idx = link.host_idx,
             .err = @errorName(err),
         });
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(accepted);
         return;
     };
     if (entry.state != .none) {
@@ -882,11 +885,11 @@ fn rejectLink(
             .ring_idx = frame.ring_idx,
             .host_idx = link.host_idx,
         });
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(accepted);
         return;
     }
 
-    entry.fd = link.fd;
+    frame.ctrl.moveSocket(&entry.fd, accepted);
     entry.version = link.version;
     entry.state = .greeting;
     cluster_transport.encodeReply(.{
@@ -901,22 +904,27 @@ fn rejectLink(
 /// A candidate that passed every check is answered `ok`; the link goes `up` on
 /// that send's completion. A candidate for a pair that already holds a link is
 /// parked instead and handed to the switch predicate (§3.4).
-fn acceptLink(frame: *Frame, table: *lifetime.LinkTable, link: @FieldType(cross_task.CrossTask, "PeerLink")) void {
+fn acceptLink(
+    frame: *Frame,
+    table: *resources.LinkTable,
+    link: @FieldType(cross_task.CrossTask, "PeerLink"),
+    accepted: *res_handle.SocketHandle,
+) void {
     const entry = table.acquire(link.host_idx, frame.index_idx) catch |err| {
         frame.logger.logger.err("peer link entry allocation failed", .{
             .ring_idx = frame.ring_idx,
             .host_idx = link.host_idx,
             .err = @errorName(err),
         });
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(accepted);
         return;
     };
     if (entry.state != .none) {
-        parkCandidate(frame, entry, link);
+        parkCandidate(frame, entry, link, accepted);
         return;
     }
 
-    entry.fd = link.fd;
+    frame.ctrl.moveSocket(&entry.fd, accepted);
     entry.version = link.version;
     entry.state = .greeting;
     cluster_transport.encodeReply(.{
@@ -936,6 +944,7 @@ fn parkCandidate(
     frame: *Frame,
     entry: *cluster_transport.LinkEntry,
     link: @FieldType(cross_task.CrossTask, "PeerLink"),
+    accepted: *res_handle.SocketHandle,
 ) void {
     if (entry.state != .up or entry.candidate_state != .none) {
         frame.logger.logger.warn("duplicate peer link rejected", .{
@@ -943,11 +952,11 @@ fn parkCandidate(
             .host_idx = link.host_idx,
             .link_state = @tagName(entry.state),
         });
-        closeFd(link.fd);
+        frame.ctrl.closeSocket(accepted);
         return;
     }
 
-    entry.candidate_fd = link.fd;
+    frame.ctrl.moveSocket(&entry.candidate_fd, accepted);
     entry.candidate_version = link.version;
     entry.candidate_state = .parked;
     entry.probe_pending = true;
@@ -1003,8 +1012,6 @@ fn probeCandidate(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
 /// nothing decides the switch and the established link keeps serving. The peer
 /// retries the dial with the backoff in force.
 fn dropCandidate(frame: *Frame, entry: *cluster_transport.LinkEntry, reason: []const u8) void {
-    const fd = entry.candidate_fd;
-    entry.candidate_fd = -1;
     entry.candidate_state = .none;
     entry.probe_pending = false;
     cancelTask(frame, entry.predicate_task);
@@ -1015,7 +1022,7 @@ fn dropCandidate(frame: *Frame, entry: *cluster_transport.LinkEntry, reason: []c
         .host_idx = entry.host_idx,
         .reason = reason,
     });
-    closeFd(fd);
+    frame.ctrl.closeSocket(&entry.candidate_fd);
 }
 
 /// The probe's acknowledgement landed: the established link is alive, so the
@@ -1029,7 +1036,6 @@ fn resolveProbe(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
     entry.predicate_task = null;
     if (entry.candidate_state != .parked) return;
 
-    const fd = entry.candidate_fd;
     entry.candidate_state = .greeting;
     cluster_transport.encodeReply(.{
         .version = cluster_transport.VERSION,
@@ -1042,26 +1048,30 @@ fn resolveProbe(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
         .host_idx = entry.host_idx,
         .epoch = entry.epoch,
     } }) catch |err| {
-        entry.candidate_fd = -1;
         entry.candidate_state = .none;
         frame.logger.logger.warn("duplicate peer link rejected", .{
             .ring_idx = frame.ring_idx,
             .host_idx = entry.host_idx,
             .err = @errorName(err),
         });
-        closeFd(fd);
+        frame.ctrl.closeSocket(&entry.candidate_fd);
         return;
     };
-    frame.ring.ring.pushSend(fd, task_idx, &entry.candidate_reply, cluster_transport.REPLY_LEN, .{}) catch |err| {
+    frame.ring.ring.pushSend(
+        frame.ctrl.borrowSocket(&entry.candidate_fd),
+        task_idx,
+        &entry.candidate_reply,
+        cluster_transport.REPLY_LEN,
+        .{},
+    ) catch |err| {
         frame.ring.slots.del(task_idx);
-        entry.candidate_fd = -1;
         entry.candidate_state = .none;
         frame.logger.logger.warn("duplicate peer link rejected", .{
             .ring_idx = frame.ring_idx,
             .host_idx = entry.host_idx,
             .err = @errorName(err),
         });
-        closeFd(fd);
+        frame.ctrl.closeSocket(&entry.candidate_fd);
         return;
     };
     entry.candidate_reply_task = task_idx;
@@ -1088,10 +1098,8 @@ fn onPulse(frame: *Frame, entry: *cluster_transport.LinkEntry, cqe: zigring.CQE)
         });
     }
 
-    const fd = entry.candidate_fd;
-    entry.candidate_fd = -1;
     entry.candidate_state = .none;
-    closePeerFd(frame, entry.host_idx, entry.epoch, fd);
+    closePeerFd(frame, entry.host_idx, entry.epoch, &entry.candidate_fd);
 }
 
 /// The predicate's clock ran out: no acknowledgement means the established
@@ -1218,9 +1226,7 @@ fn promoteCandidate(
     entry: *cluster_transport.LinkEntry,
     reason: []const u8,
 ) void {
-    const fd = entry.candidate_fd;
     const version = entry.candidate_version;
-    entry.candidate_fd = -1;
     entry.candidate_state = .none;
     entry.probe_pending = false;
     cancelTask(frame, entry.predicate_task);
@@ -1230,7 +1236,7 @@ fn promoteCandidate(
     entry.state = .none;
     entry.resetConnection();
 
-    entry.fd = fd;
+    frame.ctrl.moveSocket(&entry.fd, &entry.candidate_fd);
     entry.version = version;
     entry.state = .greeting;
     cluster_transport.encodeReply(.{
@@ -1257,7 +1263,7 @@ fn armGreetingSend(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
         killLink(frame, entry, @errorName(err));
         return;
     };
-    frame.ring.ring.pushSend(entry.fd, task_idx, &entry.reply, cluster_transport.REPLY_LEN, .{}) catch |err| {
+    frame.ring.ring.pushSend(frame.ctrl.borrowSocket(&entry.fd), task_idx, &entry.reply, cluster_transport.REPLY_LEN, .{}) catch |err| {
         frame.ring.slots.del(task_idx);
         killLink(frame, entry, @errorName(err));
         return;
@@ -1326,7 +1332,7 @@ fn armReceive(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
         killLink(frame, entry, @errorName(err));
         return;
     };
-    frame.ring.ring.pushRecv(entry.fd, task_idx, dst, .{}) catch |err| {
+    frame.ring.ring.pushRecv(frame.ctrl.borrowSocket(&entry.fd), task_idx, dst, .{}) catch |err| {
         frame.ring.slots.del(task_idx);
         killLink(frame, entry, @errorName(err));
         return;
@@ -1482,7 +1488,7 @@ fn sendFrame(
         .host_idx = entry.host_idx,
         .epoch = entry.epoch,
     } });
-    frame.ring.ring.pushSend(entry.fd, task_idx, buf.ptr, len, .{}) catch |err| {
+    frame.ring.ring.pushSend(frame.ctrl.borrowSocket(&entry.fd), task_idx, buf.ptr, len, .{}) catch |err| {
         frame.ring.slots.del(task_idx);
         return err;
     };
@@ -1566,11 +1572,9 @@ fn closeLinks(frame: *Frame) void {
         cancelTask(frame, entry.candidate_reply_task);
         entry.candidate_reply_task = null;
 
-        if (entry.candidate_fd >= 0) {
-            const fd = entry.candidate_fd;
-            entry.candidate_fd = -1;
+        if (entry.candidate_fd.isHeld()) {
             entry.candidate_state = .none;
-            closePeerFd(frame, entry.host_idx, entry.epoch, fd);
+            closePeerFd(frame, entry.host_idx, entry.epoch, &entry.candidate_fd);
         }
 
         closeEntryFd(frame, entry);
@@ -1611,27 +1615,16 @@ fn killLink(frame: *Frame, entry: *cluster_transport.LinkEntry, reason: []const 
 }
 
 fn closeEntryFd(frame: *Frame, entry: *cluster_transport.LinkEntry) void {
-    const fd = entry.fd;
-    entry.fd = -1;
-    closePeerFd(frame, entry.host_idx, entry.epoch, fd);
+    closePeerFd(frame, entry.host_idx, entry.epoch, &entry.fd);
 }
 
 /// Retires one descriptor with a dedicated close, so its completion is
 /// attributable and never confused with a reused number.
-fn closePeerFd(frame: *Frame, host_idx: u8, epoch: u32, fd: posix.fd_t) void {
-    if (fd < 0) return;
-
-    const task_idx = frame.ring.slots.add(.{ .peer_close = .{
+fn closePeerFd(frame: *Frame, host_idx: u8, epoch: u32, sock: *res_handle.SocketHandle) void {
+    frame.ctrl.closeSocketViaRing(frame.ring, .{ .peer_close = .{
         .host_idx = host_idx,
         .epoch = epoch,
-    } }) catch {
-        _ = std.os.linux.close(fd);
-        return;
-    };
-    frame.ring.ring.pushClose(task_idx, fd, .{}) catch {
-        frame.ring.slots.del(task_idx);
-        _ = std.os.linux.close(fd);
-    };
+    } }, sock);
 }
 
 fn onPeerClose(frame: *Frame, host_idx: u8, epoch: u32, cqe: zigring.CQE) void {
@@ -1693,9 +1686,9 @@ fn recordFits(lba: u32, op_len: usize) bool {
 /// The due-ness check is the caller's job; `popReplayHead` itself does no time
 /// math.
 fn drainReplay(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     st: *state.IndexState,
-    logger: *lifetime.LoggerStuff,
+    logger: *resources.LoggerStuff,
     ring_idx: u16,
 ) void {
     const log = &logger.logger;
@@ -1706,7 +1699,7 @@ fn drainReplay(
             return;
         }) orelse return;
 
-        if (retry_time > lifetime.nowRealtimeNs()) return;
+        if (retry_time > resources.nowRealtimeNs()) return;
 
         const reactivated = ctrl.popReplayHead(st) catch |err| {
             log.err("index replay drain failed", .{ .ring_idx = ring_idx, .err = @errorName(err) });
@@ -1728,7 +1721,7 @@ fn drainReplay(
 /// shutdown report has no stream state of its own, and `pushMsgRing` leaves the
 /// stream window's cursors alone, so the two submission paths cannot diverge
 /// here. The WAL never takes this route.
-fn reportDrained(ring: *lifetime.RingStuff, front_ring: *zigring.Ring, ring_idx: u16) void {
+fn reportDrained(ring: *resources.RingStuff, front_ring: *zigring.Ring, ring_idx: u16) void {
     while (true) {
         if (ring.ring.pushMsgRing(front_ring, messages.IndexDrainedIdx, ring_idx, .{})) |_| {
             return;
@@ -1757,7 +1750,7 @@ const e2e_tag: u128 = 0x2000;
 /// op is applied after — `applyIndexOp`'s contract, and the reason the sink
 /// receives the state separately.
 const Replay = struct {
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     st: *state.IndexState,
     applied: usize = 0,
 
@@ -1808,7 +1801,7 @@ test "plain-mode records replay into a fresh data set after a reopen" {
         },
     };
 
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
@@ -1843,10 +1836,10 @@ test "plain-mode records replay into a fresh data set after a reopen" {
         const writer = try ctrl.walOpenWrite(0, 0, e2e_tag);
         writer.attachStream(&ring.sqstream, &ring.slots);
         for (written, 0..) |state_idx, i| try writer.write(state_idx, writer.head, &ops[i]);
-        // `close` retries a parked submission and awaits the flush in flight,
-        // so the file holds every record once it returns.
-        try writer.close();
         try testing.expect(!writer.faulted);
+        // `closeWalWrite` retries a parked submission and awaits the flush in
+        // flight, so the file holds every record once it returns.
+        ctrl.closeWalWrite(0, writer);
     }
 
     var fresh: state.IndexState = undefined;
@@ -1917,9 +1910,9 @@ fn testConfig(dir: []const u8, hosts: u32, elephants: u16, snapshots: config.Sna
 }
 
 fn testFrame(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     ring_idx: u16,
-    logger: *lifetime.LoggerStuff,
+    logger: *resources.LoggerStuff,
     data_sets: []state.IndexState,
 ) Frame {
     return .{
@@ -1937,9 +1930,8 @@ fn testFrame(
     };
 }
 
-fn dropTestLogger(ctrl: *lifetime.Controller, logger: *lifetime.LoggerStuff) void {
-    logger.deinit(ctrl.allocator);
-    ctrl.allocator.destroy(logger);
+fn dropTestLogger(ctrl: *resources.Controller, logger: *resources.LoggerStuff) void {
+    ctrl.releaseLogger(logger);
 }
 
 /// Spins until the ring yields one completion or the deadline passes.
@@ -1960,7 +1952,7 @@ test "the cross-task arm releases the slot it read" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 0, .{});
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
 
@@ -1976,7 +1968,7 @@ test "the cross-task arm releases the slot it read" {
     var frame = testFrame(&ctrl, 1, logger, &.{});
 
     // A synthetic in-flight procedure: `SnapshotDone` is its terminal reply.
-    var job: lifetime.SnapshotJob = undefined;
+    var job: resources.SnapshotJob = undefined;
     frame.snap.procedure = &job;
 
     const full = ctrl.cross_slots.freeCount();
@@ -2058,7 +2050,7 @@ test "the drain routes the snapshot tick to the tick pass" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 0, .{});
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2081,7 +2073,7 @@ test "the drain routes the snapshot tick to the tick pass" {
 /// Opens the pair at `host` with the given tag and writes `records` one after
 /// another, creating the WAL file the elephant normally creates.
 fn testWriter(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     host: u8,
     tag: u128,
     records: u32,
@@ -2108,7 +2100,7 @@ fn testWriter(
 
 /// Creates the WAL file the elephant would have created and opens its writer:
 /// the window's old side, registered on its pair.
-fn openPairWriter(ctrl: *lifetime.Controller, host: u8, index: u16, tag: u128) !*wal.WalWriteFile {
+fn openPairWriter(ctrl: *resources.Controller, host: u8, index: u16, tag: u128) !*wal.WalWriteFile {
     try ctrl.ensureIndexDir(index);
     const dir = try ctrl.indexDirPath(index);
     defer ctrl.allocator.free(dir);
@@ -2122,7 +2114,7 @@ fn openPairWriter(ctrl: *lifetime.Controller, host: u8, index: u16, tag: u128) !
 /// The window's new side: the file created the elephant's way, then adopted on
 /// temp ring `k`, chained from the clone state.
 fn adoptWindowWriter(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     host: u8,
     index: u16,
     k: u32,
@@ -2142,24 +2134,23 @@ fn adoptWindowWriter(
 /// caller's, the pair's writer stays registered.
 fn dropWindow(frame: *Frame) void {
     if (frame.snap.window) |*window| {
-        _ = std.os.linux.close(window.new.fd);
-        frame.ctrl.allocator.destroy(window.new);
+        frame.ctrl.closeWalWrite(null, window.new);
         window.pending.deinit(frame.ctrl.allocator);
         frame.snap.window = null;
     }
 }
 
 /// Releases a test's job the way its terminal elephant would.
-fn dropTestJob(ctrl: *lifetime.Controller, job: *lifetime.SnapshotJob) void {
+fn dropTestJob(ctrl: *resources.Controller, job: *resources.SnapshotJob) void {
     ctrl.snapshot_slots.at(job.k).status = .idle;
     ctrl.snapshot_slots.release(job.k);
-    if (job.fd != -1) _ = std.os.linux.close(job.fd);
-    if (job.old_fd != -1) _ = std.os.linux.close(job.old_fd);
+    _ = res_handle.close(&job.fd);
+    _ = res_handle.close(&job.old_fd);
     ctrl.releaseSnapshotJob(job);
 }
 
 /// The pair's control line, as the restart rule reads it.
-fn pairControlLine(ctrl: *lifetime.Controller) *wal.BufferHeader {
+fn pairControlLine(ctrl: *resources.Controller) *wal.BufferHeader {
     return wal.controlLineOf(
         ctrl.wal_battery.?[0..ctrl.wal_area_stride],
         ctrl.cfg.wal.buffers(),
@@ -2175,7 +2166,7 @@ fn readFileBytes(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
     const fd: posix.fd_t = @intCast(fd_raw);
     defer _ = std.os.linux.close(fd);
 
-    const size = try wal.fileSize(fd);
+    const size = try res_handle.fileSize(fd);
     const bytes = try allocator.alloc(u8, @intCast(size));
     errdefer allocator.free(bytes);
 
@@ -2199,7 +2190,7 @@ test "the bounded drain waits for both writers' in-flight flushes" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2252,7 +2243,7 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2273,7 +2264,6 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
 
     const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
     defer dropTestJob(&ctrl, job);
-    job.fd = -1;
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
@@ -2299,7 +2289,7 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
     // An old-side fault had frozen the front before the completion arrived.
     old.faulted = true;
     frame.snap.serve = .frozen;
-    const old_fd = old.fd;
+    const old_fd = res_handle.borrow(&old.fd);
 
     frame.snap.onReply(frame.host(), .{ .SnapshotDumped = .{} });
     pumpWindow(&frame);
@@ -2322,11 +2312,11 @@ test "the completion pass drains, copies, rewires, clears, revives and closes" {
     // and the final close is dispatched.
     const line = pairControlLine(&ctrl);
     try testing.expectEqual(@as(u8, 0), line.snapshot_in_progress);
-    try testing.expectEqual(old_fd, job.old_fd);
+    try testing.expectEqual(old_fd, res_handle.borrow(&job.old_fd));
     try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(
         std.os.linux.fcntl(old_fd, std.os.linux.F.GETFD, 0),
     ));
-    try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.close_sent, job.phase);
     try testing.expect(frame.snap.window == null);
 
     const close_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
@@ -2402,7 +2392,7 @@ test "the drain retries a flush backpressure parked" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2456,7 +2446,7 @@ test "a reply-triggered drain waits for the committed batch cursor" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -2481,7 +2471,6 @@ test "a reply-triggered drain waits for the committed batch cursor" {
 
     const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
     defer dropTestJob(&ctrl, job);
-    job.fd = -1;
     job.phase = .dump_sent;
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
@@ -2534,21 +2523,21 @@ test "a reply-triggered drain waits for the committed batch cursor" {
     // exactly one completion forward, and the swap waits for the pump.
     try testing.expectEqual(before + 1, ctrl.rings[1].ring.cq_head.*);
     try testing.expectEqual(snapshot.Drain.swap, frame.snap.drain.?);
-    try testing.expectEqual(lifetime.SnapshotPhase.dump_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.dump_sent, job.phase);
     try testing.expectEqual(cross_task.SnapshotSlotStatus.in_flight, ctrl.snapshot_slots.at(k).status);
     try testing.expect(!ctrl.rings[2].ring.checkCQNotEmpty());
 
     // A duplicate completion of the same event is ignored, never re-entered.
     frame.snap.onReply(frame.host(), .{ .SnapshotDumped = .{} });
     try testing.expectEqual(snapshot.Drain.swap, frame.snap.drain.?);
-    try testing.expectEqual(lifetime.SnapshotPhase.dump_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.dump_sent, job.phase);
 
     // The pump finishes the swap outside the batch: each flush is consumed
     // once and exactly one final close is sent.
     drainPump(&frame);
     try testing.expect(frame.snap.drain == null);
     try testing.expect(frame.snap.window == null);
-    try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.close_sent, job.phase);
     // The retired old writer is gone; the surviving one carries the event and
     // the single flush the pump consumed.
     try testing.expectEqual(new, ctrl.wal_writers[0].?);
@@ -2598,7 +2587,7 @@ const StartupPmem = struct {
     dir: []u8,
     device: []u8,
     cfg: config.Config,
-    ctrl: lifetime.Controller,
+    ctrl: resources.Controller,
     live: bool = false,
 
     fn init(self: *StartupPmem, hosts: u32) !void {
@@ -2732,7 +2721,7 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
     var saved_k: u32 = 0;
 
     {
-        var ctrl: lifetime.Controller = undefined;
+        var ctrl: resources.Controller = undefined;
         try ctrl.init(allocator, &cfg);
         defer ctrl.deinit();
         try ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
@@ -2825,7 +2814,7 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
         stepCQE(&frame, dumped_cqe);
         pumpWindow(&frame);
         try testing.expect(frame.snap.window == null);
-        try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
+        try testing.expectEqual(resources.SnapshotPhase.close_sent, job.phase);
 
         // F3, the real handler: the old fd's close and the terminal reply.
         const close_cqe = cqeBefore(&ctrl.rings[elephant_ring].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
@@ -2890,7 +2879,7 @@ test "the end-to-end plain-mode procedure commits, swaps and replays" {
     // The restart: a fresh Controller over the same files replays the WAL over
     // the snapshot and reconstructs every session the procedure wrote.
     {
-        var ctrl: lifetime.Controller = undefined;
+        var ctrl: resources.Controller = undefined;
         try ctrl.init(allocator, &cfg);
         defer ctrl.deinit();
         try ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
@@ -2940,7 +2929,7 @@ const J2FileSink = struct {
         const base: posix.off_t = @intCast(ordinal * @as(u64, writer.lba));
         var done: usize = 0;
         while (done < data.len) {
-            const res = std.os.linux.pwrite(writer.fd, data[done..].ptr, data.len - done, base + @as(posix.off_t, @intCast(done)));
+            const res = std.os.linux.pwrite(res_handle.borrow(&writer.fd), data[done..].ptr, data.len - done, base + @as(posix.off_t, @intCast(done)));
             const errno = std.os.linux.errno(res);
             if (errno != .SUCCESS) {
                 writer.fault(errno);
@@ -2956,7 +2945,7 @@ const J2FileSink = struct {
     }
 };
 
-fn j2Area(ctrl: *lifetime.Controller, area_idx: usize) wal.Area {
+fn j2Area(ctrl: *resources.Controller, area_idx: usize) wal.Area {
     const start = area_idx * ctrl.wal_area_stride;
     return wal.Area.init(
         ctrl.wal_battery.?[start..][0..ctrl.wal_area_stride],
@@ -2969,7 +2958,7 @@ fn j2Area(ctrl: *lifetime.Controller, area_idx: usize) wal.Area {
 /// `file_tag`: records `from..=to`, chained from `start_floor`. The writer is
 /// a plain local, never registered on the controller.
 fn writeJ2Chain(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     host: u8,
     index: u16,
     area_idx: usize,
@@ -2985,7 +2974,7 @@ fn writeJ2Chain(
     defer ctrl.allocator.free(path);
 
     const fd = try createWalFile(path);
-    var writer = wal.WalWriteFile.init(fd, j2Area(ctrl, area_idx), ctrl.cfg.wal, host, index, start_floor);
+    var writer = wal.WalWriteFile.init(res_handle.adopt(fd), j2Area(ctrl, area_idx), ctrl.cfg.wal, host, index, start_floor);
     J2FileSink.install(&writer);
 
     var s = from;
@@ -2999,7 +2988,7 @@ fn writeJ2Chain(
 }
 
 /// Builds a data set by applying one `create` per state, in order.
-fn j2State(ctrl: *lifetime.Controller, states: []const u128) !state.IndexState {
+fn j2State(ctrl: *resources.Controller, states: []const u128) !state.IndexState {
     var st: state.IndexState = undefined;
     try ctrl.initIndexState(&st);
     errdefer ctrl.deinitIndexState(&st);
@@ -3013,7 +3002,7 @@ fn j2State(ctrl: *lifetime.Controller, states: []const u128) !state.IndexState {
 
 /// Dumps the sessions of `states` under `snapshot.<host>.<index>.<tag>`.
 fn writeJ2Snapshot(
-    ctrl: *lifetime.Controller,
+    ctrl: *resources.Controller,
     host: u8,
     index: u16,
     tag: u128,
@@ -3163,7 +3152,7 @@ fn runJ2Row(row: J2Row) !void {
     // The winning line is the old one before the commit and the new one after.
     const entries = (try f.ctrl.loadRegistry(index)).?;
     defer f.ctrl.freeRegistry(entries);
-    const winner = lifetime.Controller.lastLineFor(entries, host).?;
+    const winner = resources.Controller.lastLineFor(entries, host).?;
     const expected_tag: u128 = switch (row) {
         .create_to_mark, .mark_to_commit => old_tag,
         else => x,
@@ -3257,7 +3246,7 @@ test "the freeze ladder drains the window, revives at the swap and stops on rela
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -3283,7 +3272,6 @@ test "the freeze ladder drains the window, revives at the swap and stops on rela
     const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
     var job_live = true;
     defer if (job_live) dropTestJob(&ctrl, job);
-    job.fd = -1;
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
@@ -3307,7 +3295,7 @@ test "the freeze ladder drains the window, revives at the swap and stops on rela
     pumpWindow(&frame);
     try testing.expect(frame.snap.window == null);
     try testing.expectEqual(snapshot.Serve.serving, frame.snap.serve);
-    try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.close_sent, job.phase);
 
     var el = snapshot.Elephant{ .ctrl = &ctrl, .log = &logger.logger, .ring_idx = 2 };
     const close_cqe = cqeBefore(&ctrl.rings[2].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
@@ -3339,7 +3327,7 @@ test "a stop mid-window completes the procedure on the control plane" {
     defer testing.allocator.free(dir);
 
     var cfg = testConfig(dir, 1, 1, .{ .slots = 2 });
-    var ctrl: lifetime.Controller = undefined;
+    var ctrl: resources.Controller = undefined;
     try ctrl.init(testing.allocator, &cfg);
     defer ctrl.deinit();
     try ctrl.initRing(1, 1);
@@ -3363,7 +3351,6 @@ test "a stop mid-window completes the procedure on the control plane" {
     const job = try ctrl.mintSnapshotJob(0, 0, 0x100, k, 1);
     var job_live = true;
     defer if (job_live) dropTestJob(&ctrl, job);
-    job.fd = -1;
     ctrl.snapshot_slots.at(k).* = .{ .status = .in_flight, .job = @intFromPtr(job) };
 
     var frame = testFrame(&ctrl, 1, logger, &sets);
@@ -3383,7 +3370,7 @@ test "a stop mid-window completes the procedure on the control plane" {
     frame.snap.onReply(frame.host(), .{ .SnapshotDumped = .{} });
     pumpWindow(&frame);
     try testing.expect(frame.snap.window == null);
-    try testing.expectEqual(lifetime.SnapshotPhase.close_sent, job.phase);
+    try testing.expectEqual(resources.SnapshotPhase.close_sent, job.phase);
 
     // The final close lands and the terminal reply clears the flag. The stop
     // stands: no swap revives a stopped thread.
@@ -3429,7 +3416,7 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
     defer if (fixed_registry) |bytes| allocator.free(bytes);
 
     {
-        var ctrl: lifetime.Controller = undefined;
+        var ctrl: resources.Controller = undefined;
         try ctrl.init(allocator, &cfg);
         defer ctrl.deinit();
         try ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
@@ -3516,7 +3503,7 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
         // Unwind B: the window reverts, the new writer closes and cleanup is
         // dispatched. The committed line never changed.
         try testing.expect(frame.snap.window == null);
-        try testing.expectEqual(lifetime.SnapshotPhase.cleanup_sent, job.phase);
+        try testing.expectEqual(resources.SnapshotPhase.cleanup_sent, job.phase);
         try testing.expect(pairControlLine(&ctrl).snapshot_in_progress == 0);
 
         const cleanup_cqe = cqeBefore(&ctrl.rings[elephant_ring].ring, zigring.monotonicNs() + 5 * std.time.ns_per_s) orelse
@@ -3546,7 +3533,7 @@ test "a failed registry rename leaves the old line winning and recovery-correct"
     // Recovery is correct on the previous pair: every durable event was
     // written to it too (new first, then old), so nothing is lost.
     {
-        var ctrl: lifetime.Controller = undefined;
+        var ctrl: resources.Controller = undefined;
         try ctrl.init(allocator, &cfg);
         defer ctrl.deinit();
         try ctrl.compensators.put("marker", .{ .bind = "10.0.0.1", .port = 20301 });
@@ -3589,8 +3576,8 @@ fn clusterTestConfig(dir: []const u8) config.Config {
 /// The Stage F fixture: a live transport, one index ring and one link entry.
 const LinkFixture = struct {
     cfg: config.Config = undefined,
-    ctrl: lifetime.Controller = undefined,
-    logger: *lifetime.LoggerStuff = undefined,
+    ctrl: resources.Controller = undefined,
+    logger: *resources.LoggerStuff = undefined,
     sets: [2]state.IndexState = undefined,
     frame: Frame = undefined,
 
@@ -3812,7 +3799,7 @@ test "the send path encodes a frame and advances the sequence" {
     const entry = try f.entry();
     const fds = try socketPair();
     defer _ = std.os.linux.close(fds[1]);
-    entry.fd = fds[0];
+    entry.fd = res_handle.adopt(fds[0]);
     entry.state = .up;
 
     try sendFrame(&f.frame, entry, cluster_transport.OP_PULSE_ACK, &.{}, null);
@@ -3848,7 +3835,7 @@ test "the send path reports backpressure when every buffer is busy" {
     const entry = try f.entry();
     const fds = try socketPair();
     defer _ = std.os.linux.close(fds[1]);
-    entry.fd = fds[0];
+    entry.fd = res_handle.adopt(fds[0]);
     entry.state = .up;
 
     var seq: u16 = 0;
@@ -4004,7 +3991,7 @@ test "a peer link with a bad source is rejected with peer_address_mismatch" {
         return error.GreetingCqeTimeout;
     onGreetingSend(&f.frame, entry, entry.epoch, cqe);
     try testing.expectEqual(cluster_transport.LinkState.none, entry.state);
-    try testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
+    try testing.expect(!entry.fd.isHeld());
 }
 
 /// Sets up an established link between the entry and a live socket pair: the
@@ -4012,7 +3999,7 @@ test "a peer link with a bad source is rejected with peer_address_mismatch" {
 fn establishedLink(f: *LinkFixture) !struct { entry: *cluster_transport.LinkEntry, fds: [2]posix.fd_t } {
     const entry = try f.entry();
     const fds = try socketPair();
-    entry.fd = fds[0];
+    entry.fd = res_handle.adopt(fds[0]);
     entry.state = .up;
     return .{ .entry = entry, .fds = fds };
 }
@@ -4048,7 +4035,7 @@ test "a duplicate candidate parks without a receive arm and probes the link" {
     // parked with its socket and without a receive arm of its own.
     try testing.expectEqual(cluster_transport.LinkState.up, entry.state);
     try testing.expectEqual(cluster_transport.LinkState.parked, entry.candidate_state);
-    try testing.expectEqual(cand[0], entry.candidate_fd);
+    try testing.expectEqual(cand[0], res_handle.borrow(&entry.candidate_fd));
     try testing.expectEqual(@as(?u64, null), entry.recv_task);
     try testing.expect(entry.predicate_task != null);
 
@@ -4128,10 +4115,10 @@ test "an acknowledged probe rejects the candidate and keeps the link" {
             stepCQE(&f.frame, cqe);
         }
     }
-    try testing.expectEqual(@as(posix.fd_t, -1), entry.candidate_fd);
+    try testing.expect(!entry.candidate_fd.isHeld());
     try testing.expectEqual(cluster_transport.LinkState.none, entry.candidate_state);
     try testing.expectEqual(cluster_transport.LinkState.up, entry.state);
-    try testing.expect(entry.fd >= 0);
+    try testing.expect(entry.fd.isHeld());
 }
 
 test "a timed-out probe installs the candidate at absolute zero" {
@@ -4185,9 +4172,9 @@ test "a timed-out probe installs the candidate at absolute zero" {
     });
 
     // The candidate owns the link now and the old connection is retired.
-    try testing.expectEqual(cand[0], entry.fd);
-    try testing.expect(entry.fd != old_fd);
-    try testing.expectEqual(@as(posix.fd_t, -1), entry.candidate_fd);
+    try testing.expectEqual(cand[0], res_handle.borrow(&entry.fd));
+    try testing.expect(res_handle.borrow(&entry.fd) != old_fd);
+    try testing.expect(!entry.candidate_fd.isHeld());
     try testing.expectEqual(cluster_transport.LinkState.none, entry.candidate_state);
     try testing.expectEqual(old_epoch +% 1, entry.epoch);
     try testing.expectEqual(cluster_transport.LinkState.greeting, entry.state);
@@ -4295,7 +4282,7 @@ test "a keepalive tick without an acknowledgement kills the link" {
     // §3.6's teardown ran: the descriptor is retired, the stream returns to
     // absolute zero and the ticker is canceled.
     try testing.expectEqual(cluster_transport.LinkState.none, entry.state);
-    try testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
+    try testing.expect(!entry.fd.isHeld());
     try testing.expectEqual(@as(?u64, null), entry.keepalive_task);
     try testing.expect(!entry.keepalive_pending);
     try testing.expectEqual(@as(u64, 0), entry.seq_abs);
@@ -4413,8 +4400,8 @@ test "the drain closes every link and reaps the close completions" {
     // state returns to absolute zero; the ticker is gone.
     try testing.expect(f.frame.links_closed);
     try testing.expectEqual(cluster_transport.LinkState.none, entry.state);
-    try testing.expectEqual(@as(posix.fd_t, -1), entry.fd);
-    try testing.expectEqual(@as(posix.fd_t, -1), entry.candidate_fd);
+    try testing.expect(!entry.fd.isHeld());
+    try testing.expect(!entry.candidate_fd.isHeld());
     try testing.expectEqual(cluster_transport.LinkState.none, entry.candidate_state);
     try testing.expectEqual(@as(?u64, null), entry.keepalive_task);
     try testing.expectEqual(@as(u64, 0), entry.seq_abs);

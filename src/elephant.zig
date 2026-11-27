@@ -10,7 +10,7 @@
 //! keeps the loop and the four non-snapshot variants.
 
 const std = @import("std");
-const lifetime = @import("lifetime.zig");
+const resources = @import("resources.zig");
 const messages = @import("messages.zig");
 const logging = @import("logging.zig");
 const cross_task = @import("cross_task.zig");
@@ -18,7 +18,7 @@ const snapshot = @import("snapshot.zig");
 
 /// Runs the elephant thread to completion. `role` is the role the thread derived
 /// from its `ring_idx` before reporting `INITIALIZED`.
-pub fn run(ctrl: *lifetime.Controller, role: lifetime.Role, logger: *lifetime.LoggerStuff) void {
+pub fn run(ctrl: *resources.Controller, role: resources.Role, logger: *resources.LoggerStuff) void {
     const ring = &ctrl.rings[role.elephant.ring_idx];
     const log = &logger.logger;
 
@@ -73,16 +73,21 @@ fn handleOther(
         },
         .SoftShutdown => {},
         .ServerSocket => |socket| {
-            // The socket is broadcast to fronts only; an elephant that sees it
-            // closes its copy rather than leaking the descriptor.
-            _ = std.os.linux.close(socket.fd);
+            // The listener is broadcast to fronts only and ownership stays with
+            // `runShard`; every thread shares one descriptor table, so there is
+            // no copy an elephant could close. No production sender emits this
+            // variant.
+            log.warn("elephant got a server socket it does not own", .{
+                .ring_idx = own_ring_idx,
+                .fd = socket.fd,
+            });
         },
         .IndexDrained => {},
         else => log.warn("elephant read a cross-task message it does not handle", .{ .ring_idx = own_ring_idx }),
     }
 }
 
-fn reportDone(ring: *lifetime.RingStuff, ctrl: *lifetime.Controller, ring_idx: u16) void {
+fn reportDone(ring: *resources.RingStuff, ctrl: *resources.Controller, ring_idx: u16) void {
     while (true) {
         if (ring.ring.pushMsgRingFd(ctrl.init_ring.ring.fd, messages.ShutdownDoneIdx, ring_idx, .{})) |_| {
             return;

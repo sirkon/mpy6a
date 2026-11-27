@@ -4,7 +4,7 @@
 //! `BufferHeader` control line, the record framing, the block framing and its
 //! CRC, the pair/area partition math, the path convention, the writer's
 //! admission and copy pipeline over a plain battery, the stream-driven flush
-//! with its stop and its `close`, and PMEM mode — the battery's publishes
+//! with its stop and its `drain`, and PMEM mode — the battery's publishes
 //! through `barrier.zig` and the recovery walk a reopen resumes from. The read
 //! path lands in the later stages; the format core stays pure — no descriptor,
 //! no battery, no ring — and only the writer reaches the ring.
@@ -19,7 +19,8 @@ const posix = std.posix;
 const blog = @import("blog");
 const zigring = @import("zigring");
 const config = @import("config.zig");
-const lifetime = @import("lifetime.zig");
+const resources = @import("resources.zig");
+const res_handle = @import("resources_handle.zig");
 const slots = @import("slots.zig");
 const barrier = @import("barrier.zig");
 
@@ -116,7 +117,7 @@ pub fn modeOf(wal_cfg: config.Wal) Mode {
 /// The framed length of a record carrying a `data_len`-byte op:
 /// `state_idx` (16 LE bytes) + `uvarint(data_len)` + `data_len`.
 pub fn framedLen(data_len: usize) usize {
-    return 16 + lifetime.uvarintLen(data_len) + data_len;
+    return 16 + resources.uvarintLen(data_len) + data_len;
 }
 
 /// Frames one record: `state_idx` as 16 little-endian bytes, the op's length as
@@ -124,14 +125,14 @@ pub fn framedLen(data_len: usize) usize {
 ///
 /// The floor is not stored — it is validation input, computed as the previous
 /// record's state — and the WAL never looks inside an op, so the frame is the
-/// whole format. The uvarint is the one `lifetime` implements; there is no
+/// whole format. The uvarint is the one `resources` implements; there is no
 /// second copy here. The caller owns the result.
 pub fn encodeRecord(allocator: std.mem.Allocator, state_idx: u128, data: []const u8) ![]u8 {
     const framed = try allocator.alloc(u8, framedLen(data.len));
     errdefer allocator.free(framed);
 
     std.mem.writeInt(u128, framed[0..16], state_idx, .little);
-    const len_len = try lifetime.putUvarint(framed[16..], data.len);
+    const len_len = try resources.putUvarint(framed[16..], data.len);
     @memcpy(framed[16 + len_len ..][0..data.len], data);
     return framed;
 }
@@ -150,7 +151,7 @@ pub fn decodeRecord(bytes: []const u8) !struct { state_idx: u128, op: []const u8
     const state_idx = std.mem.readInt(u128, bytes[0..16], .little);
     if (state_idx == 0) return error.InvalidStateIdx;
 
-    const op_len = try lifetime.readUvarint(bytes[16..]);
+    const op_len = try resources.readUvarint(bytes[16..]);
     const start = 16 + op_len.len;
     if (op_len.value > bytes.len - start) return error.CorruptInput;
 
@@ -334,87 +335,6 @@ pub fn batterySize(areas: usize, stride: usize) usize {
     return areas * stride;
 }
 
-/// Acquires the battery every area is carved from: `areas × stride` bytes,
-/// aligned to the area granule. `areas` is the pair count plus the snapshot
-/// slot count — the temp rings are geometrically identical areas.
-///
-/// Plain mode allocates ordinary memory and zeroes it — a DRAM battery starts
-/// with empty headers. PMEM mode maps `device` instead and never zeroes: its
-/// headers are the chain that survived the restart, and the temp rings are
-/// used as found until the adopt mints them.
-///
-/// The caller owns the result and releases it with `closeBattery`.
-pub fn openBattery(
-    allocator: std.mem.Allocator,
-    wal_cfg: config.Wal,
-    areas: usize,
-    stride: usize,
-    page_size: usize,
-) ![]u8 {
-    const total = batterySize(areas, stride);
-    const alignment: std.mem.Alignment = .fromByteUnits(areaGranule(wal_cfg.lba(), page_size));
-
-    switch (wal_cfg) {
-        .plain => {
-            const raw = allocator.rawAlloc(total, alignment, @returnAddress()) orelse
-                return error.OutOfMemory;
-            const bytes = raw[0..total];
-            @memset(bytes, 0);
-            return bytes;
-        },
-        .pmem => |pmem| {
-            const path = try allocator.dupeSentinel(u8, pmem.device, 0);
-            defer allocator.free(path);
-
-            const fd_raw = std.os.linux.open(path, .{ .ACCMODE = .RDWR }, 0);
-            const open_errno = std.os.linux.errno(fd_raw);
-            if (open_errno != .SUCCESS) return std.posix.unexpectedErrno(open_errno);
-            const fd: posix.fd_t = @intCast(fd_raw);
-            defer _ = std.os.linux.close(fd);
-
-            const size = try fileSize(fd);
-            if (size < total) return error.WalBatteryTooSmall;
-
-            return try posix.mmap(
-                null,
-                total,
-                .{ .READ = true, .WRITE = true },
-                .{ .TYPE = .SHARED },
-                fd,
-                0,
-            );
-        },
-    }
-}
-
-/// Releases a battery acquired by `openBattery`, matching its mode.
-pub fn closeBattery(
-    allocator: std.mem.Allocator,
-    wal_cfg: config.Wal,
-    bytes: []u8,
-    page_size: usize,
-) void {
-    switch (wal_cfg) {
-        .plain => allocator.rawFree(
-            bytes,
-            .fromByteUnits(areaGranule(wal_cfg.lba(), page_size)),
-            @returnAddress(),
-        ),
-        .pmem => _ = std.os.linux.munmap(bytes.ptr, bytes.len),
-    }
-}
-
-/// The byte size behind `fd` — a WAL file's length or the PMEM device's
-/// capacity. `statx` is the only stat family call the platform layer still
-/// offers on Linux; `AT.EMPTY_PATH` targets the descriptor itself.
-pub fn fileSize(fd: posix.fd_t) !u64 {
-    var stx: std.os.linux.Statx = undefined;
-    const res = std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .SIZE = true }, &stx);
-    const errno = std.os.linux.errno(res);
-    if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-    return stx.size;
-}
-
 /// One area as its two columnar arrays: the data array first, the header array
 /// after it. The 64-byte control line past the headers stays outside the view
 /// — no writer touches it (designs/SNAPSHOTS.md §2.2).
@@ -545,20 +465,6 @@ fn stateAt(block: []const u8, limit: usize, tag: u128) u128 {
     return last;
 }
 
-/// Reads exactly `dst.len` bytes at `offset`. The cold resume path has no
-/// continuation to defer to: a short read there is a torn file.
-fn readFully(fd: posix.fd_t, dst: []u8, offset: u64) !void {
-    var got: usize = 0;
-    while (got < dst.len) {
-        const at: posix.off_t = @intCast(offset + got);
-        const res = std.os.linux.pread(fd, dst[got..].ptr, dst.len - got, at);
-        const errno = std.os.linux.errno(res);
-        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-        if (res == 0) return error.EndOfStream;
-        got += res;
-    }
-}
-
 // ============================================================================
 // The writer
 // ============================================================================
@@ -643,7 +549,7 @@ pub const WalFlushSink = struct {
 
         const data = writer.bufferData(ordinal);
         self.stream.pushWriteOffset(
-            writer.fd,
+            res_handle.borrow(&writer.fd),
             task_idx,
             ordinal * @as(u64, writer.lba),
             data.ptr,
@@ -693,7 +599,7 @@ pub const WalFlushSink = struct {
 pub const WalWriteFile = struct {
     const Self = @This();
 
-    fd: posix.fd_t,
+    fd: res_handle.FileHandle,
     host_idx: u8,
     index_idx: u16,
     /// The file's name tag, opaque to the writer.
@@ -723,7 +629,7 @@ pub const WalWriteFile = struct {
     current: u64 = 0,
     /// Bytes already written into the current buffer.
     cursor: u32 = 0,
-    /// Set once `close` ran; the writer is unusable afterwards.
+    /// Set once `drain` ran; the writer is unusable afterwards.
     closed: bool = false,
     /// The last committed state at or before `flushed_upto`'s extent 0: the
     /// `last_state` a resume there continues from, so the zero-terminator a
@@ -740,9 +646,9 @@ pub const WalWriteFile = struct {
     persist_hook: ?*const fn (writer: *Self, header: *BufferHeader) void = null,
     /// The thread's logger, when it has one: the stop's diagnostic goes here
     /// (§3.5). Null where nothing logs.
-    logger: ?*lifetime.LoggerStuff = null,
+    logger: ?*resources.LoggerStuff = null,
     /// The thread's stream window, when flushes leave through the ring:
-    /// `close` awaits its last completion there. Null with the synchronous
+    /// `drain` awaits its last completion there. Null with the synchronous
     /// sink, where a submission completes inside its own call.
     stream: ?*zigring.StreamSQ = null,
     /// The ring sink's own state, installed by `attachStream` together with
@@ -751,7 +657,7 @@ pub const WalWriteFile = struct {
 
     /// Wires a pair's battery area into a writer over `fd`.
     pub fn init(
-        fd: posix.fd_t,
+        fd: res_handle.FileHandle,
         area: Area,
         wal_cfg: config.Wal,
         host_idx: u8,
@@ -903,7 +809,7 @@ pub const WalWriteFile = struct {
         const allocator = std.heap.page_allocator;
         const region = try allocator.alloc(u8, region_len);
         defer allocator.free(region);
-        try readFully(self.fd, region, block_start);
+        try res_handle.readFully(res_handle.borrow(&self.fd), region, block_start);
 
         var pos: usize = 0;
         var last = self.tag;
@@ -1198,7 +1104,7 @@ pub const WalWriteFile = struct {
     ) void {
         var frame: [16 + 10]u8 = undefined;
         std.mem.writeInt(u128, frame[0..16], state_idx, .little);
-        const len_len = lifetime.putUvarint(frame[16..], data.len) catch unreachable;
+        const len_len = resources.putUvarint(frame[16..], data.len) catch unreachable;
         // A zero-length record ends on its own length byte.
         const frame_carry = if (data.len == 0) state_idx else self.head;
         self.append(frame[0 .. 16 + len_len], true, crc, start_ordinal, deferred, self.head, frame_carry);
@@ -1415,14 +1321,15 @@ pub const WalWriteFile = struct {
         }
     }
 
-    /// Drains the flush queue and releases the descriptor (§1.1).
+    /// Drains the flush queue; releasing the descriptor belongs to the
+    /// controller (§1.1).
     ///
     /// A parked submission gets its retry, the flush still in flight is awaited
     /// on the caller's ring, and the queue's slots retire with it. Best effort
     /// under a fault: a stopped writer has no completion left to wait for. The
     /// battery stays where it is — it belongs to the index thread, not to the
     /// file (§A3).
-    pub fn close(self: *Self) WalError!void {
+    pub fn drain(self: *Self) void {
         if (self.closed) return;
         self.closed = true;
 
@@ -1432,10 +1339,6 @@ pub const WalWriteFile = struct {
             self.ring_sink.release();
             self.ring_sink.retire();
         }
-
-        const fd = self.fd;
-        self.fd = -1;
-        if (fd >= 0) _ = std.os.linux.close(fd);
     }
 };
 
@@ -1830,7 +1733,7 @@ pub const WalReadFile = struct {
         const process = try allocator.create(FileReadProcess);
         errdefer allocator.destroy(process);
 
-        const file_len = flushedLen(try fileSize(self.fd), self.lba);
+        const file_len = flushedLen(try res_handle.fileSize(self.fd), self.lba);
         const file_blocks = (file_len + BLOCK - 1) / BLOCK;
         process.* = .{
             .file = self,
@@ -1981,7 +1884,7 @@ test "the largest record a block holds is exactly BLOCK_CONTENT" {
     // 16 + uvarint + op == 1 MiB - 4: the op length that lands exactly, with
     // the three-byte uvarint such an op's length needs.
     const exact = BLOCK_CONTENT - 16 - 3;
-    try testing.expectEqual(@as(usize, 3), lifetime.uvarintLen(exact));
+    try testing.expectEqual(@as(usize, 3), resources.uvarintLen(exact));
     try testing.expectEqual(BLOCK_CONTENT, framedLen(exact));
     try testing.expectEqual(blockRemain(0), framedLen(exact));
 
@@ -2132,8 +2035,8 @@ test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
     const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(1) } };
     const stride = areaStride(4, 1024, page);
 
-    const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
-    defer closeBattery(testing.allocator, wal_cfg, bytes, page);
+    const bytes = try openTestBattery(testing.allocator, wal_cfg, 1, stride, page);
+    defer closeTestBattery(testing.allocator, wal_cfg, bytes, page);
 
     const area = Area.init(bytes, 4, 1024);
 
@@ -2173,7 +2076,7 @@ test "the mint kills a stale temp ring and publishes the ordinal-0 terminator" {
     try testing.expectEqual(@as(u8, 0x5A), area.data[0]);
 
     // A second mint over a ring the writer used re-kills every line it left.
-    var writer = WalWriteFile.init(-1, area, wal_cfg, 0, 0, 0x777);
+    var writer = WalWriteFile.init(.{}, area, wal_cfg, 0, 0, 0x777);
     var data: [3]u8 = .{ 1, 2, 3 };
     try writer.write(0x778, 0x777, &data);
     try testing.expectEqual(@as(u64, 0), area.headers[0].buffer_seq);
@@ -2196,8 +2099,8 @@ test "the walk never reaches the temp section" {
 
     // Two areas: a minted pair area, then a temp ring carrying a chain that
     // would look continuable if the walk crossed the area boundary.
-    const bytes = try openBattery(testing.allocator, wal_cfg, 2, stride, page);
-    defer closeBattery(testing.allocator, wal_cfg, bytes, page);
+    const bytes = try openTestBattery(testing.allocator, wal_cfg, 2, stride, page);
+    defer closeTestBattery(testing.allocator, wal_cfg, bytes, page);
 
     mintArea(bytes[0..stride], 4, 1024, 0x10, false);
     const temp = Area.init(bytes[stride..][0..stride], 4, 1024);
@@ -2228,8 +2131,8 @@ test "a plain battery is allocated zeroed and carved by stride" {
     const pairs: usize = 3;
     const stride = areaStride(4, 4096, page);
 
-    const bytes = try openBattery(testing.allocator, wal_cfg, pairs, stride, page);
-    defer closeBattery(testing.allocator, wal_cfg, bytes, page);
+    const bytes = try openTestBattery(testing.allocator, wal_cfg, pairs, stride, page);
+    defer closeTestBattery(testing.allocator, wal_cfg, bytes, page);
 
     try testing.expectEqual(batterySize(pairs, stride), bytes.len);
     try testing.expectEqual(@as(usize, 0), @intFromPtr(bytes.ptr) % areaGranule(4096, page));
@@ -2253,10 +2156,10 @@ test "a header publish overwrites the whole control line" {
     const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(4) } };
     const stride = areaStride(4, 4096, page);
 
-    const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
-    defer closeBattery(testing.allocator, wal_cfg, bytes, page);
+    const bytes = try openTestBattery(testing.allocator, wal_cfg, 1, stride, page);
+    defer closeTestBattery(testing.allocator, wal_cfg, bytes, page);
 
-    var writer = WalWriteFile.init(-1, Area.init(bytes, 4, 4096), wal_cfg, 0, 0, 0x1234);
+    var writer = WalWriteFile.init(.{}, Area.init(bytes, 4, 4096), wal_cfg, 0, 0, 0x1234);
 
     // A line that still carries a previous procedure's mark: the publish
     // rewrites it whole, so no ring line can ever expose migration state.
@@ -2311,11 +2214,11 @@ test "a fresh writer chains from its tag" {
 
     // The area's shape does not depend on the mode, so one plain allocation
     // serves the field wiring of both.
-    const bytes = try openBattery(testing.allocator, plain, 1, stride, page);
-    defer closeBattery(testing.allocator, plain, bytes, page);
+    const bytes = try openTestBattery(testing.allocator, plain, 1, stride, page);
+    defer closeTestBattery(testing.allocator, plain, bytes, page);
 
     const area = Area.init(bytes, 4, 1024);
-    const writer = WalWriteFile.init(-1, area, plain, 1, 2, 0xAA);
+    const writer = WalWriteFile.init(.{}, area, plain, 1, 2, 0xAA);
     try testing.expectEqual(@as(u128, 0xAA), writer.tag);
     try testing.expectEqual(@as(u128, 0xAA), writer.head);
     try testing.expectEqual(@as(u64, 0), writer.flushed_upto);
@@ -2323,7 +2226,7 @@ test "a fresh writer chains from its tag" {
     try testing.expect(!writer.flush_pending);
     try testing.expect(!writer.faulted);
     try testing.expect(!writer.pmem);
-    try testing.expect(WalWriteFile.init(-1, area, pmem, 1, 2, 0xAA).pmem);
+    try testing.expect(WalWriteFile.init(.{}, area, pmem, 1, 2, 0xAA).pmem);
 }
 
 test "the admission guards refuse without moving anything" {
@@ -2331,10 +2234,10 @@ test "the admission guards refuse without moving anything" {
     const wal_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = 4, .lba = config.kib(1) } };
     const stride = areaStride(4, 1024, page);
 
-    const bytes = try openBattery(testing.allocator, wal_cfg, 1, stride, page);
-    defer closeBattery(testing.allocator, wal_cfg, bytes, page);
+    const bytes = try openTestBattery(testing.allocator, wal_cfg, 1, stride, page);
+    defer closeTestBattery(testing.allocator, wal_cfg, bytes, page);
 
-    var writer = WalWriteFile.init(-1, Area.init(bytes, 4, 1024), wal_cfg, 0, 0, 0x10);
+    var writer = WalWriteFile.init(.{}, Area.init(bytes, 4, 1024), wal_cfg, 0, 0, 0x10);
     writer.publishTerminator(0, 0x10, 0);
     const before = writer.headers[0];
 
@@ -2356,6 +2259,70 @@ test "the admission guards refuse without moving anything" {
 // ============================================================================
 // The write path (stage C)
 // ============================================================================
+
+/// Acquires a battery for the fixtures below: `areas × stride` bytes aligned to
+/// the area granule. Plain mode allocates zeroed ordinary memory, PMEM mode
+/// maps `device` as found. Unlike the controller's battery, this one serves
+/// arbitrary geometries, so it keeps its own bodies.
+fn openTestBattery(
+    allocator: std.mem.Allocator,
+    wal_cfg: config.Wal,
+    areas: usize,
+    stride: usize,
+    page_size: usize,
+) ![]u8 {
+    const total = batterySize(areas, stride);
+    const alignment: std.mem.Alignment = .fromByteUnits(areaGranule(wal_cfg.lba(), page_size));
+
+    switch (wal_cfg) {
+        .plain => {
+            const raw = allocator.rawAlloc(total, alignment, @returnAddress()) orelse
+                return error.OutOfMemory;
+            const bytes = raw[0..total];
+            @memset(bytes, 0);
+            return bytes;
+        },
+        .pmem => |pmem| {
+            const path = try allocator.dupeSentinel(u8, pmem.device, 0);
+            defer allocator.free(path);
+
+            const fd_raw = std.os.linux.open(path, .{ .ACCMODE = .RDWR }, 0);
+            const open_errno = std.os.linux.errno(fd_raw);
+            if (open_errno != .SUCCESS) return std.posix.unexpectedErrno(open_errno);
+            const fd: posix.fd_t = @intCast(fd_raw);
+            defer _ = std.os.linux.close(fd);
+
+            const size = try res_handle.fileSize(fd);
+            if (size < total) return error.WalBatteryTooSmall;
+
+            return try posix.mmap(
+                null,
+                total,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .SHARED },
+                fd,
+                0,
+            );
+        },
+    }
+}
+
+/// Releases a battery acquired by `openTestBattery`, matching its mode.
+fn closeTestBattery(
+    allocator: std.mem.Allocator,
+    wal_cfg: config.Wal,
+    bytes: []u8,
+    page_size: usize,
+) void {
+    switch (wal_cfg) {
+        .plain => allocator.rawFree(
+            bytes,
+            .fromByteUnits(areaGranule(wal_cfg.lba(), page_size)),
+            @returnAddress(),
+        ),
+        .pmem => _ = std.os.linux.munmap(bytes.ptr, bytes.len),
+    }
+}
 
 /// One pair's battery with a writer wired on it. The descriptor is a
 /// placeholder: this stage's flushes end in the seam, not in the kernel.
@@ -2398,14 +2365,14 @@ const Pair = struct {
         const battery_cfg: config.Wal = .{ .plain = .{ .dir = "wal", .buffers = buffers, .lba = .{ .raw = lba } } };
         const page = std.heap.pageSize();
         const stride = areaStride(buffers, lba, page);
-        const bytes = try openBattery(testing.allocator, battery_cfg, 1, stride, page);
+        const bytes = try openTestBattery(testing.allocator, battery_cfg, 1, stride, page);
 
         var pair = Pair{
             .wal_cfg = wal_cfg,
             .battery_cfg = battery_cfg,
             .stride = stride,
             .bytes = bytes,
-            .writer = WalWriteFile.init(-1, Area.init(bytes, buffers, lba), wal_cfg, 0, 0, tag),
+            .writer = WalWriteFile.init(.{}, Area.init(bytes, buffers, lba), wal_cfg, 0, 0, tag),
         };
         // What adoption publishes before the registry append: the ordinal-0
         // zero-terminator, carrying the tag as its resume state.
@@ -2414,7 +2381,7 @@ const Pair = struct {
     }
 
     fn release(self: *Pair) void {
-        closeBattery(testing.allocator, self.battery_cfg, self.bytes, std.heap.pageSize());
+        closeTestBattery(testing.allocator, self.battery_cfg, self.bytes, std.heap.pageSize());
     }
 };
 
@@ -3100,9 +3067,9 @@ test "the ring sink takes one slot per admitted flush" {
     try pair.writer.flushRoom();
     try testing.expectEqual(reserved, pair.writer.ring_sink.reserved.?);
 
-    // `close` hands an unused reservation back, so a writer retired before its
-    // submission leaks no slot.
-    try pair.writer.close();
+    // `drain` hands an unused reservation back, so a writer retired before
+    // its submission leaks no slot.
+    pair.writer.drain();
     try testing.expect(pair.writer.ring_sink.reserved == null);
 }
 
@@ -3136,13 +3103,13 @@ test "a flush's OS error stops the writer" {
     try testing.expectError(error.WalFaulted, pair.writer.write(0x92, 0x91, data));
     try testing.expectEqual(@as(u128, 0x91), pair.writer.head);
 
-    // Best effort: a stopped writer has no completion to await, so closing it
-    // returns instead of waiting for one.
-    try pair.writer.close();
+    // Best effort: a stopped writer has no completion to await, so draining
+    // it returns instead of waiting for one.
+    pair.writer.drain();
     try testing.expect(pair.writer.closed);
 }
 
-test "close retries a parked submission and does not wait without a ring" {
+test "drain retries a parked submission and does not wait without a ring" {
     var pair = try Pair.acquire(4, 512, 0xB0);
     defer pair.release();
 
@@ -3161,10 +3128,10 @@ test "close retries a parked submission and does not wait without a ring" {
     try testing.expect(pair.writer.flush_pending);
     try testing.expectEqual(@as(usize, 1), TestSink.submits);
 
-    // `close` gives the parked submission its retry; with no ring behind the
+    // `drain` gives the parked submission its retry; with no ring behind the
     // sink there is no completion to await, so it must not wait for one.
     TestSink.refusal = null;
-    try pair.writer.close();
+    pair.writer.drain();
     try testing.expectEqual(@as(usize, 2), TestSink.submits);
     try testing.expectEqual(@as(u64, 1), TestSink.last_ordinal);
     try testing.expect(!pair.writer.flush_pending);
@@ -3230,9 +3197,8 @@ test "the write path runs on a PMEM-shaped battery" {
     try testing.expect(PublishLog.len > 0);
     try testing.expectEqual(@as(u32, 0), PublishLog.entries[PublishLog.len - 1].data_len);
 
-    // Closing a PMEM-shaped writer drains the queue and releases the descriptor,
-    // like a live one.
-    try pair.writer.close();
+    // Draining a PMEM-shaped writer empties the queue, like a live one.
+    pair.writer.drain();
     try testing.expect(pair.writer.closed);
 }
 
@@ -3294,7 +3260,7 @@ test "the walk resumes where the battery's chain stopped" {
     try pair.writer.write(0x301, 0x300, data);
     try pair.writer.write(0x302, 0x301, data);
 
-    var reopened = WalWriteFile.init(-1, Area.init(pair.bytes, 8, 512), pair.wal_cfg, 0, 0, 0x300);
+    var reopened = WalWriteFile.init(.{}, Area.init(pair.bytes, 8, 512), pair.wal_cfg, 0, 0, 0x300);
     try reopened.walk(0);
 
     // The live writer is mid-tail in buffer 2; the reopened one must land on the
@@ -3345,7 +3311,7 @@ test "a stale lap stops the walk and republishes the line it stopped on" {
 
     // A file that flushed nothing: the walk starts at ordinal 0 and finds the
     // line of a previous lap there, so it stops and delivers nothing.
-    var reopened = WalWriteFile.init(-1, Area.init(pair.bytes, 4, 512), pair.wal_cfg, 0, 0, 0x400);
+    var reopened = WalWriteFile.init(.{}, Area.init(pair.bytes, 4, 512), pair.wal_cfg, 0, 0, 0x400);
     try reopened.walk(0);
 
     try testing.expectEqual(@as(u64, 0), reopened.current);
@@ -3383,7 +3349,7 @@ test "a torn commit stops the walk before its successor" {
 
     pair.writer.headers[0] = adopted;
 
-    var reopened = WalWriteFile.init(-1, Area.init(pair.bytes, 4, 512), pair.wal_cfg, 0, 0, 0x500);
+    var reopened = WalWriteFile.init(.{}, Area.init(pair.bytes, 4, 512), pair.wal_cfg, 0, 0, 0x500);
     try reopened.walk(0);
 
     // The walk stops on the terminator the commit never replaced: the
@@ -3411,7 +3377,7 @@ test "a second generation's terminator reclaims the pair's ring" {
     // file's ring, before the registry append that makes the new file visible.
     pair.writer.publishTerminator(0, 0x700, 0);
 
-    var reopened = WalWriteFile.init(-1, Area.init(pair.bytes, 4, 512), pair.wal_cfg, 0, 0, 0x700);
+    var reopened = WalWriteFile.init(.{}, Area.init(pair.bytes, 4, 512), pair.wal_cfg, 0, 0, 0x700);
     try reopened.walk(0);
 
     // The new generation starts at its own tag: the previous file's committed
@@ -3451,7 +3417,7 @@ test "a committed buffer past the file's flush frontier keeps the frontier pair"
     // Reconciled against the live writer's own queue: with the frontier at
     // ordinal 0 the pair is the file's base, and the walk still lands on the
     // tail.
-    var reopened = WalWriteFile.init(-1, Area.init(pair.bytes, 8, 512), pair.wal_cfg, 0, 0, 0x800);
+    var reopened = WalWriteFile.init(.{}, Area.init(pair.bytes, 8, 512), pair.wal_cfg, 0, 0, 0x800);
     try reopened.walk(0);
     try testing.expectEqual(pair.writer.flushed_state, reopened.flushed_state);
     try testing.expectEqual(pair.writer.flushed_crc, reopened.flushed_crc);
@@ -3485,18 +3451,6 @@ fn recordOp(buf: []u8, state: u128, salt: u8) void {
 fn syntheticOffset(index: usize, lba: u32) u64 {
     const per_block = BLOCK / lba - 1;
     return @as(u64, index / per_block) * BLOCK + @as(u64, index % per_block) * lba;
-}
-
-/// Writes all of `bytes` at `offset`.
-fn pwriteAll(fd: posix.fd_t, bytes: []const u8, offset: u64) !void {
-    var put: usize = 0;
-    while (put < bytes.len) {
-        const at: posix.off_t = @intCast(offset + put);
-        const res = std.os.linux.pwrite(fd, bytes[put..].ptr, bytes.len - put, at);
-        const errno = std.os.linux.errno(res);
-        if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-        put += res;
-    }
 }
 
 /// Creates (or empties) one file of the fixture.
@@ -3546,7 +3500,7 @@ const Synth = struct {
             try Pair.acquirePmem(buffers, lba, tag)
         else
             try Pair.acquire(buffers, lba, tag);
-        self.pair.writer.fd = self.fd;
+        self.pair.writer.fd = res_handle.adopt(self.fd);
         self.pair.writer.sink = .{ .ctx = self, .room = room, .submit = submit };
     }
 
@@ -3709,7 +3663,7 @@ test "a read completion steps the process and retires its slot" {
     const io: FileReadProcess.Io = .{ .stream = &stream, .slots = &ring_slots };
 
     const request = (try process.advance()).?;
-    try readFully(reader.fd, request.dst, request.offset);
+    try res_handle.readFully(reader.fd, request.dst, request.offset);
 
     const task_idx = try ring_slots.add(.{ .file_read = .{
         .file_process = process,
@@ -3885,7 +3839,7 @@ test "a zero state ends the readout and is never delivered" {
     // longer matches, so the block is framed alone and the reserved empty
     // state stops the readout there.
     const blank: [16]u8 = @splat(0);
-    try pwriteAll(synth.fd, &blank, syntheticOffset(20, 65536));
+    try res_handle.pwriteAll(synth.fd, &blank, syntheticOffset(20, 65536));
 
     var reader = try synth.openRead(null);
     defer _ = std.os.linux.close(reader.fd);
@@ -3907,12 +3861,12 @@ test "a zero state ends the readout and is never delivered" {
 fn mutate(scratch: posix.fd_t, content: []const u8, len: usize, flip: ?usize) !void {
     const errno = std.os.linux.errno(std.os.linux.ftruncate(scratch, 0));
     if (errno != .SUCCESS) return std.posix.unexpectedErrno(errno);
-    try pwriteAll(scratch, content[0..len], 0);
+    try res_handle.pwriteAll(scratch, content[0..len], 0);
 
     const at = flip orelse return;
     if (at >= len) return;
     const flipped = [_]u8{content[at] ^ 0xFF};
-    try pwriteAll(scratch, &flipped, at);
+    try res_handle.pwriteAll(scratch, &flipped, at);
 }
 
 test "truncations and byte flips never panic, and stop" {
@@ -3923,10 +3877,10 @@ test "truncations and byte flips never panic, and stop" {
     var states: [46]u128 = undefined;
     try fillRecords(&synth, &states, 0x6000);
 
-    const size: usize = @intCast(try fileSize(synth.fd));
+    const size: usize = @intCast(try res_handle.fileSize(synth.fd));
     const content = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(content);
-    try readFully(synth.fd, content, 0);
+    try res_handle.readFully(synth.fd, content, 0);
 
     const scratch = try synth.scratch("mutated");
     defer _ = std.os.linux.close(scratch);
@@ -3984,10 +3938,10 @@ test "a plain reopen recovers its head from the file itself" {
 
     var states: [46]u128 = undefined;
     try fillRecords(&synth, &states, 0x7000);
-    const size = try fileSize(synth.fd);
+    const size = try res_handle.fileSize(synth.fd);
 
     var reopened = WalWriteFile.init(
-        synth.fd,
+        res_handle.adopt(synth.fd),
         Area.init(synth.pair.bytes, 8, 65536),
         plain_cfg,
         0,
@@ -4008,7 +3962,7 @@ test "a plain reopen recovers its head from the file itself" {
     const block_start: usize = @intCast((size - 1) / BLOCK * BLOCK);
     const region = try testing.allocator.alloc(u8, @intCast(size - block_start));
     defer testing.allocator.free(region);
-    try readFully(synth.fd, region, block_start);
+    try res_handle.readFully(synth.fd, region, block_start);
     try testing.expectEqual(blog.crc32c.hardwareCrc32C(region), reopened.flushed_crc);
 
     // The line the next record continues from carries the same fold.
@@ -4040,11 +3994,11 @@ test "a plain reopen stops at the padding a crash left half written" {
     synth.hold_from = 4;
     try synth.write(0xA002, big);
 
-    const size = try fileSize(synth.fd);
+    const size = try res_handle.fileSize(synth.fd);
     try testing.expectEqual(@as(u64, 4 * 65536), size);
 
     var reopened = WalWriteFile.init(
-        synth.fd,
+        res_handle.adopt(synth.fd),
         Area.init(synth.pair.bytes, 40, 65536),
         plain_cfg,
         0,
@@ -4079,11 +4033,11 @@ test "a plain reopen drops the record straddling the flush frontier" {
     recordOp(&op, 0x8002, 0);
     try synth.write(0x8002, &op);
 
-    const size = try fileSize(synth.fd);
+    const size = try res_handle.fileSize(synth.fd);
     try testing.expectEqual(@as(u64, 65536), size);
 
     var reopened = WalWriteFile.init(
-        synth.fd,
+        res_handle.adopt(synth.fd),
         Area.init(synth.pair.bytes, 8, 65536),
         plain_cfg,
         0,
@@ -4105,7 +4059,7 @@ test "a plain reopen drops the record straddling the flush frontier" {
     // The fold at the write offset is the first record's frame.
     const kept = try testing.allocator.alloc(u8, first_framed);
     defer testing.allocator.free(kept);
-    try readFully(synth.fd, kept, 0);
+    try res_handle.readFully(synth.fd, kept, 0);
 
     const line = reopened.headers[0];
     try testing.expectEqual(@as(u64, 0), line.buffer_seq);
@@ -4130,7 +4084,7 @@ test "a plain reopen drops the record straddling the flush frontier" {
     var expected: [op_len + 19]u8 = undefined;
     const frame = expected[0..framedLen(op_len)];
     std.mem.writeInt(u128, frame[0..16], 0x8003, .little);
-    const len_len = try lifetime.putUvarint(frame[16..], op_len);
+    const len_len = try resources.putUvarint(frame[16..], op_len);
     recordOp(&op, 0x8003, 0);
     @memcpy(frame[16 + len_len ..][0..op_len], &op);
 
